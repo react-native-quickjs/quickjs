@@ -1,0 +1,126 @@
+Subject: A stack object moves to the heap by taking over its shape reference and fields
+
+What this does
+  - `js_stack_migrate2` (the move of a stack object, and the stack object a field of it holds, to the heap) has a path for the case without a stack Array: each heap object is allocated with the room `qjs_aot_new_from_shape_cap` would give it, then takes the block's shape reference (no duplicate, no release), copies the block's fields once, leaves the block's fields undefined and its shape NULL (the state `qjs_aot_stack_release` leaves), and a field that held the child holds the heap child. The slot-claim check (`qjs_aot_object_filled`) runs as before.
+  - `QJS_AOT_NOMIGFAST=1` in the run's environment selects the old path in a kit build (QJS_KIT_TEST_KNOBS); the production build has neither the read nor the per-field check of the moved fields.
+
+Why we need it
+  A move cost 1,196 instructions in raytrace (two allocations that initialise every slot and are then overwritten, two release walks over the fields, a child test on every property, a shape duplicate and a release); it is now about 820, of which the claim check is a third. 117k moves per 10 runs.
+
+Failure
+  Out of memory in either allocation returns 0 with nothing moved, as before (the second failure frees the first object). Objects with more fields than the inline limit take the old path.
+
+Soundness
+  - The block's shape reference is transferred, so the shape's count is unchanged; the block ends with the NULL shape every consumer of a migrated block already sees.
+  - Both heap objects are allocated before anything is moved; the child's reference count is 1 for the caller plus one for the field of the parent that held it, as in the old path.
+  - The object is linked into the collector's list only after its shape and fields are in place.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -67110,0 +67111,68 @@
++#ifdef QJS_KIT_TEST_KNOBS
++static bool getenv_nomigfast(void)
++{
++    static int v = -1;
++    if (unlikely(v < 0))
++        v = getenv("QJS_AOT_NOMIGFAST") != NULL;
++    return v;
++}
++#else
++#define getenv_nomigfast() false
++#endif
++
++/* The heap object a stack block moves to, in two steps so that a failure leaves every block as it was. The first allocates it with the room qjs_aot_new_from_shape_cap would give (the
++   fields past the block's own are undefined); the second takes the block's shape reference (no duplicate, no release) and its fields, leaves the block's fields undefined and its shape
++   NULL as qjs_aot_stack_release does, and links the object into the collector's list. */
++static JSObject *js_aot_moved_alloc(JSContext *ctx, JSObject *src)
++{
++    JSRuntime *rt = ctx->rt;
++    JSShape *sh = src->shape;
++    uint32_t n = sh->prop_count, cap = js_aot_inline_room(sh, src->prop_inline_cap), i;
++    JSObject *h;
++    JSProperty *pr;
++    js_trigger_gc(rt, sizeof(JSObject));
++    h = js_malloc(ctx, offsetof(JSObject, u) + cap * sizeof(JSProperty));
++    if (unlikely(!h))
++        return NULL;
++    h->prop_inline_cap = cap;
++    h->class_id = JS_CLASS_OBJECT;
++    h->values_inline = 0;
++    h->arr_kind = JS_ARR_KIND_GENERIC;
++    h->extensible = true;
++    h->free_mark = 0;
++    h->is_exotic = 0;
++    h->fast_array = 0;
++    h->holey = 0;
++    h->is_constructor = 0;
++    h->is_uncatchable_error = 0;
++    h->tmp_mark = 0;
++    h->is_HTMLDDA = 0;
++    h->gv_watched = 0;
++    h->is_prototype = 0;
++    h->first_weak_ref = NULL;
++    pr = (JSProperty *)((uint8_t *)h + offsetof(JSObject, u));
++    h->prop = pr;
++    for (i = n; i < cap; i++)
++        pr[i].u.value = JS_UNDEFINED;
++    JS_REF_COUNT(h) = 1;
++    return h;
++}
++static void js_aot_moved_fill(JSContext *ctx, JSObject *h, JSObject *src, JSObject *child, JSValue hchild)
++{
++    JSShape *sh = src->shape;
++    int i, n = sh->prop_count;
++    for (i = 0; i < n; i++) {
++        JSValue v = src->prop[i].u.value;
++        if (child != NULL && JS_VALUE_HAS_REF_COUNT(v) && JS_VALUE_GET_PTR(v) == (void *)child)
++            v = JS_DupValue(ctx, hchild);
++#ifdef QJS_KIT_TEST_KNOBS
++        assert(JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT || JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) < JS_STACK_BIAS / 2);   /* the region's analysis keeps at most the one stack child in a field */
++#endif
++        h->prop[i].u.value = v;
++        src->prop[i].u.value = JS_UNDEFINED;
++    }
++    h->shape = sh;
++    src->shape = NULL;
++    add_gc_object(ctx->rt, &h->header, JS_GC_OBJ_TYPE_JS_OBJECT);
++}
++
+@@ -67116,0 +67185,38 @@
++    if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT && !getenv_nomigfast()) {   /* no Array pair: move the block's shape reference and fields straight into the new objects */
++        JSObject *hp = NULL, *hq = NULL;
++        c = JS_VALUE_GET_TAG(child) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(child) : NULL;
++        p = JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(obj) : NULL;
++        if ((c == NULL || c->shape->prop_count <= JS_OBJ_LEARNED_INLINE_MAX) && (p == NULL || p->shape->prop_count <= JS_OBJ_LEARNED_INLINE_MAX)) {
++            if (c != NULL) {
++                hq = js_aot_moved_alloc(ctx, c);
++                if (unlikely(!hq))
++                    return 0;
++            }
++            if (p != NULL) {
++                hp = js_aot_moved_alloc(ctx, p);
++                if (unlikely(!hp)) {
++                    if (hq != NULL)
++                        js_free(ctx, hq);
++                    return 0;
++                }
++            }
++            if (hq != NULL) {
++                js_aot_moved_fill(ctx, hq, c, NULL, JS_UNDEFINED);
++                hc = JS_MKPTR(JS_TAG_OBJECT, hq);
++            }
++            if (hp != NULL) {
++                js_aot_moved_fill(ctx, hp, p, c, hc);
++                ho = JS_MKPTR(JS_TAG_OBJECT, hp);
++            }
++            if (hq != NULL)
++                qjs_aot_object_filled(ctx, hc);
++            if (hp != NULL)
++                qjs_aot_object_filled(ctx, ho);
++            *hobj = ho;
++            *harr = JS_UNDEFINED;
++            *hchild = hc;
++            return 1;
++        }
++        c = NULL;
++        p = NULL;
++    }

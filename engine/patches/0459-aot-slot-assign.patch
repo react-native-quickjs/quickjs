@@ -1,0 +1,112 @@
+Subject: A stack object can take over the contents of another stack object of the same frame
+
+What this does
+  - `qjs_aot_slot_assign(ctx, dst, dstc, src, srcc)` moves the shape and the field values of the stack object `src` into the stack object `dst` (both blocks of one compiled region's C frame, both live). The fields `dst` held are released first. `src` is left a valid block whose fields are all undefined, so its own release frees nothing and drops its shape reference.
+  - A stack object one field of `src` holds (`srcc`, the one child a block may hold) is not left under a name the owner will reuse: its contents move into the block `dstc` (the child `dst` held, released the same way), and the field of `dst` then holds `dstc`.
+
+Why we need it
+  A compiled region that keeps a loop-carried variable (`best = info`) in one block of its frame cannot point the variable at the per-iteration object: the owner reuses that block on the next iteration. Today the object is moved to the heap on that edge; the variable's own block can take its contents instead.
+
+Failure
+  Returns 0 with nothing changed when the contents do not fit (a layout past the room of `dst` or `dstc`), when `src` holds a stack object other than `srcc` (or `srcc` is given and `src` does not hold it exactly once), when `dst` holds a stack object other than `dstc`, or when the children hold stack objects themselves. The caller then moves the object to the heap as before.
+
+Soundness
+  - Reference counts: the references in `src`'s fields move (they are not duplicated) and the references in `dst`'s old fields are dropped once; the child pointer held by `dst` is a block, not a counted reference, and is kept. The shape reference of `dst` is replaced by one of `src`'s shape.
+  - Both blocks stay valid stack blocks (biased count, not on the collector's lists); the helper allocates nothing.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -67250,0 +67251,90 @@
++/* Move the contents of the stack object `src` into the stack object `dst`, both blocks of one owner's frame and live. `dst` takes `src`'s shape and field values; the fields it held are released first.
++   A stack object a field of `src` holds (`srcc`, the one child a block may hold) is not left in the owner's frame under a name that will be reused: its contents move into the block `dstc` and the
++   field of `dst` holds `dstc`; `dstc` (the child `dst` held, released the same way) must be given when `srcc` is. `src` is left a valid block whose fields are all undefined (its own release
++   then frees nothing and drops its shape reference), and `srcc` likewise. 1 when moved; 0 with nothing changed when the contents do not fit (a layout past the room of `dst` or `dstc`), when
++   `src` holds another stack object than `srcc`, or when the children hold stack objects themselves. */
++static void js_stack_take_fields(JSContext *ctx, JSObject *d, JSObject *s, JSValue keep)
++{
++    int i, sn = s->shape->prop_count, dn = d->shape->prop_count;
++    JSShape *old = d->shape;
++    for (i = 0; i < dn; i++) {
++        JSValue v = d->prop[i].u.value;
++        if (!(JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(keep) == JS_TAG_OBJECT && JS_VALUE_GET_PTR(v) == JS_VALUE_GET_PTR(keep)) && JS_VALUE_HAS_REF_COUNT(v))
++            JS_FreeValue(ctx, v);
++        d->prop[i].u.value = JS_UNDEFINED;
++    }
++    d->shape = js_dup_shape(s->shape);
++    js_free_shape(ctx->rt, old);
++    for (i = 0; i < sn; i++) {
++        d->prop[i].u.value = s->prop[i].u.value;
++        s->prop[i].u.value = JS_UNDEFINED;
++    }
++}
++
++QJS_AOT_STUB int qjs_aot_slot_assign(JSContext *ctx, JSValue dst, JSValue dstc, JSValue src, JSValue srcc)
++{
++    JSObject *d, *s, *dc = NULL, *sc = NULL;
++    int i, sn, scn = 0;
++    if (JS_VALUE_GET_TAG(dst) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(src) != JS_TAG_OBJECT)
++        return 0;
++    d = JS_VALUE_GET_OBJ(dst);
++    s = JS_VALUE_GET_OBJ(src);
++    if (d == s || JS_REF_COUNT(d) < JS_STACK_BIAS / 2 || JS_REF_COUNT(s) < JS_STACK_BIAS / 2 || d->shape == NULL || s->shape == NULL)
++        return 0;
++    sn = s->shape->prop_count;
++    if (sn > d->prop_inline_cap)
++        return 0;
++    if (JS_VALUE_GET_TAG(srcc) == JS_TAG_OBJECT) {
++        if (JS_VALUE_GET_TAG(dstc) != JS_TAG_OBJECT)
++            return 0;
++        sc = JS_VALUE_GET_OBJ(srcc);
++        dc = JS_VALUE_GET_OBJ(dstc);
++        if (sc == dc || JS_REF_COUNT(sc) < JS_STACK_BIAS / 2 || JS_REF_COUNT(dc) < JS_STACK_BIAS / 2 || sc->shape == NULL || dc->shape == NULL)
++            return 0;
++        scn = sc->shape->prop_count;
++        if (scn > dc->prop_inline_cap)
++            return 0;
++        for (i = 0; i < scn; i++) {
++            JSValue v = sc->prop[i].u.value;
++            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2)
++                return 0;
++        }
++    }
++    {
++        int nsc = 0, dn = d->shape->prop_count;
++        for (i = 0; i < sn; i++) {
++            JSValue v = s->prop[i].u.value;
++            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2) {
++                if (JS_VALUE_GET_OBJ(v) != sc)
++                    return 0;
++                nsc++;
++            }
++        }
++        if ((sc != NULL) != (nsc == 1) || nsc > 1)
++            return 0;
++        /* a stack object in a field being released other than the child block that stays would have its bias decremented */
++        for (i = 0; i < dn; i++) {
++            JSValue v = d->prop[i].u.value;
++            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2 && JS_VALUE_GET_OBJ(v) != dc)
++                return 0;
++        }
++        if (dc != NULL) {
++            int dcn = dc->shape->prop_count;
++            for (i = 0; i < dcn; i++) {
++                JSValue v = dc->prop[i].u.value;
++                if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2)
++                    return 0;
++            }
++        }
++    }
++    if (dc != NULL)
++        js_stack_take_fields(ctx, dc, sc, JS_UNDEFINED);
++    js_stack_take_fields(ctx, d, s, dstc);
++    if (sc != NULL) {
++        for (i = 0; i < sn; i++)
++            if (JS_VALUE_GET_TAG(d->prop[i].u.value) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(d->prop[i].u.value) == sc)
++                d->prop[i].u.value = dstc;
++    }
++    return 1;
++}
++
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -258,0 +259 @@
++QJS_AOT_STUB int qjs_aot_slot_assign(JSContext *ctx, JSValue dst, JSValue dstc, JSValue src, JSValue srcc);

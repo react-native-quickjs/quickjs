@@ -1,0 +1,57 @@
+Subject: A stack object's release can read only the fields that may hold a reference
+
+What this does
+  - `qjs_aot_stack_release_m(ctx, obj, refmask)` releases a stack object that has no Array pair: only the fields whose bit is set in `refmask` are read and released, then the shape reference is dropped and `p->shape` is cleared. The other fields are not read and nothing is written back to them.
+  - `QJS_AOT_REGION_MASKCHECK=1` in the run's environment makes the call check the mask against every field of the object and abort on a counted reference outside it (a debugging aid for the generator's analysis; not used otherwise).
+  - `qjs_aot_stack_release` is unchanged and still serves every object with an Array pair, every exit, and every object whose fields the region cannot name.
+
+Why we need it
+  The release of a stack object was 104 instructions per object in raytrace (558,432 objects, 9.9% of the run): a loop over the shape's fields testing each for a counted reference and writing undefined back, though a Vector's three fields are doubles the region itself stored and guarded. The region compiler knows every store into a stack object and the type of each stored value, so it can name the fields that may hold a reference (none, for a Vector).
+
+Soundness
+  - The mask is a superset of the fields that can hold a reference, computed by the region compiler from every store into the object it followed (the construct's own stores, late adds, stores through aliases); any field with an untyped stored value, a late field with one, an object with more stores than it records, or one with an Array pair keeps the full release. The shape reference is always dropped, so a shape is freed exactly when it was.
+  - No write-back: the block is dead after the release (`sk_K = 0`); the region makes it again by copying an image or calling `qjs_aot_stack_object_init_cap`, both of which write every word of the header and body, and the exit paths read a block only while it is alive.
+  - The collector never sees the block (it is on no list), so stale words in a dead block are not read by anyone.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -67070,0 +67071,36 @@
++/* Release a stack object that has no Array pair when the caller knows which fields can hold a counted reference: bit i of `refmask` is set for field i that may. Only those fields are read
++   and released, then the shape reference is dropped; the fields are not written back and the block is dead until the region makes it again (every word of it is rewritten by that
++   init). QJS_AOT_REGION_MASKCHECK=1 in the run's environment checks the mask against all of the fields and aborts on a reference outside it. */
++QJS_AOT_STUB void qjs_aot_stack_release_m(JSContext *ctx, JSValue obj, uint32_t refmask)
++{
++    JSRuntime *rt = ctx->rt;
++    JSObject *p = JS_VALUE_GET_OBJ(obj);
++    JSShape *sh = p->shape;
++    uint32_t m = refmask;
++    assert(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && JS_REF_COUNT(p) >= JS_STACK_BIAS / 2);
++    {
++        static int chk = -1;
++        if (unlikely(chk < 0))
++            chk = getenv("QJS_AOT_REGION_MASKCHECK") != NULL;
++        if (unlikely(chk)) {
++            int j;
++            for (j = 0; j < sh->prop_count && j < 32; j++) {
++                if (!((refmask >> j) & 1) && JS_VALUE_HAS_REF_COUNT(p->prop[j].u.value)) {
++                    fprintf(stderr, "MASKCHECK: field %d of a stack object holds a reference outside the mask %x\n", j, refmask);
++                    abort();
++                }
++            }
++        }
++    }
++    while (m) {
++        int i = __builtin_ctz(m);
++        m &= m - 1;
++        if (i >= sh->prop_count)
++            break;
++        if (JS_VALUE_HAS_REF_COUNT(p->prop[i].u.value))
++            JS_FreeValueRT(rt, p->prop[i].u.value);
++    }
++    js_free_shape(rt, sh);
++    p->shape = NULL;
++}
++
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -253,0 +254 @@
++QJS_AOT_STUB void qjs_aot_stack_release_m(JSContext *ctx, JSValue obj, uint32_t refmask);

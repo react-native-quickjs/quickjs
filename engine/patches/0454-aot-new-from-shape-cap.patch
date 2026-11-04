@@ -1,0 +1,86 @@
+Subject: The unit can ask for a constructed object with room for the fields it gains after its constructor
+
+What this does
+  - `qjs_aot_new_from_shape_cap(ctx, shape, cap)` is `qjs_aot_new_from_shape` with a slot count: the object reserves `cap` slots instead of exactly the shape's field count, all undefined, so the properties added to it later (outside its constructor) fit without growing the array. The room is the property-array size the shape reaches when it holds `cap` fields (shapes double their array, and an add that changes the size needs the inline capacity to cover the new size). A `cap` that is not above the field count, or whose room is above `JS_OBJ_LEARNED_INLINE_MAX` (what the 5-bit inline capacity can name), reserves exactly the field count, which is what `qjs_aot_new_from_shape` did; that function is now the call with `cap` 0. There is one body.
+  - `qjs_aot_construct_this_cap(ctx, ctor, out, cap)` is `qjs_aot_construct_this` with the same kind of slot count: the object is allocated with `cap` rounded up to a power of two (the size a doubling array reaches) when that is above the constructor's learned inline capacity and not above `JS_OBJ_LEARNED_INLINE_MAX`, else with the learned capacity. `qjs_aot_construct_this` is the call with `cap` 0; one body.
+
+Why we need it
+  A compiled region that makes `new C()` objects itself gave them exactly the constructor's field count. raytrace's IntersectionInfo is made with one field (`color`) and gets five more by plain stores in the code that fills it; the first of those needs the property array to grow, which compiled code cannot do, so the region left on the first store of every such object (257 exits, then the region was switched off). With room for the final field count the stores are made in place. The learned inline capacity of a constructor (`inst_inline_cap`) is sampled when the constructor returns, so it never covers fields added later, and a factory's wrapper constructor shares one capacity between all its classes; the construct that goes through `qjs_aot_construct_this` needs the same hint.
+
+Soundness
+  The shape, its reference count, the object's flags and every slot value are as before; only the allocation size and the inline capacity field differ, and `js_prop_grow` already treats an inline capacity as the size of the block. The extra slots hold undefined, so nothing reads uninitialised memory when the array is later grown and copied.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -66788,2 +66788,4 @@
+-   qjs_aot_object_filled, which checks the slot claims of a contracted layout as the last add of a field would. */
+-QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
++   qjs_aot_object_filled, which checks the slot claims of a contracted layout as the last add of a field would.
++   `cap` is the number of slots to reserve: the fields the object gains after its constructor then fit without growing the array. A cap
++   that is not above the shape's field count, or above what an inline array can hold, reserves exactly the field count. */
++QJS_AOT_STUB JSValue qjs_aot_new_from_shape_cap(JSContext *ctx, void *shape, uint32_t cap)
+@@ -66795 +66797 @@
+-    int i, n = sh->prop_count;
++    uint32_t i, n = sh->prop_count;
+@@ -66806 +66808,15 @@
+-    /* what JS_NewObjectFromShapeCapExtra does for a plain object, without its class switch: one block holding the body and the n slots */
++    if (cap <= n || cap > JS_OBJ_LEARNED_INLINE_MAX) {
++        cap = n;
++    } else {
++        /* the property array of a shape doubles as fields are added, and an add that changes the shape's size needs the inline capacity to cover the
++           new size (the generated code cannot grow an array): the room is the size the shape has reached when it holds `cap` fields */
++        uint32_t size = sh->prop_size, cnt = n;
++
++        while (cnt < cap) {
++            cnt++;
++            if (cnt > size)
++                size = size * 2 > cnt ? size * 2 : cnt;
++        }
++        cap = size <= JS_OBJ_LEARNED_INLINE_MAX ? size : n;
++    }
++    /* what JS_NewObjectFromShapeCapExtra does for a plain object, without its class switch: one block holding the body and the cap slots */
+@@ -66808 +66824 @@
+-    p = js_malloc(ctx, offsetof(JSObject, u) + n * sizeof(JSProperty));
++    p = js_malloc(ctx, offsetof(JSObject, u) + cap * sizeof(JSProperty));
+@@ -66811 +66827 @@
+-    p->prop_inline_cap = n;
++    p->prop_inline_cap = cap;
+@@ -66830 +66846 @@
+-    for (i = 0; i < n; i++)
++    for (i = 0; i < cap; i++)
+@@ -66836,0 +66853,5 @@
++QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
++{
++    return qjs_aot_new_from_shape_cap(ctx, shape, 0);
++}
++
+@@ -67915 +67936,2 @@
+-int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
++int qjs_aot_construct_this_cap(JSContext *ctx, JSObject *ctor, JSValue *out,
++                               uint32_t cap)
+@@ -67925,0 +67948,10 @@
++    if (cap > cb->inst_inline_cap && cap <= JS_OBJ_LEARNED_INLINE_MAX) {
++        /* shapes double their property array, and an add that changes the size needs the inline capacity to cover it: a power of two */
++        uint32_t size = 1;
++
++        while (size < cap)
++            size *= 2;
++        cap = size;
++    } else {
++        cap = cb->inst_inline_cap;
++    }
+@@ -67927 +67959 @@
+-                                  JS_CLASS_OBJECT, cb->inst_inline_cap);
++                                  JS_CLASS_OBJECT, cap);
+@@ -67931,0 +67964,5 @@
++}
++
++int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
++{
++    return qjs_aot_construct_this_cap(ctx, ctor, out, 0);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -241,0 +242 @@
++QJS_AOT_STUB JSValue qjs_aot_new_from_shape_cap(JSContext *ctx, void *shape, uint32_t cap);
+@@ -551,0 +553 @@
++int qjs_aot_construct_this_cap(JSContext *ctx, JSObject *ctor, JSValue *out, uint32_t cap);

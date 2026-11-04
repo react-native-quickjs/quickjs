@@ -1,0 +1,81 @@
+Subject: A stack object can have room for the fields it gains after its constructor
+
+What this does
+  - `qjs_aot_stack_object_init_cap(buf, bytes, shape, cap)` is `qjs_aot_stack_object_init` with a slot count: the block holds `room` property slots instead of exactly the shape's field count, all undefined, where `room` is the property-array size the shape reaches when it holds `cap` fields. `qjs_aot_stack_object_init` is the call with `cap` 0 .
+  - The rounding is one static function, `js_aot_inline_room`, which `qjs_aot_new_from_shape_cap` now calls too, so a heap object and a stack object that are asked to hold the same number of fields get the same inline capacity. A `cap` not above the field count now reserves the shape's whole property array (`prop_size`, when it fits `JS_OBJ_LEARNED_INLINE_MAX`) instead of exactly the field count: the engine's add paths (`add_property`, the register-VM add cache, the compiled add) grow an object's array only when the shape's size changes, so an object with fewer inline slots than its shape's array has no slot for a later add that keeps the size (3 fields in an array of 4: the 4th field is written past the allocation). A room above `JS_OBJ_LEARNED_INLINE_MAX` is still the field count. `qjs_aot_stack_object_init` is therefore no longer byte-identical to the old block for a shape whose array is larger than its field count (3 fields: 4 slots).
+  - `qjs_aot_stack_migrate` makes the heap object with the room the stack block had (`qjs_aot_new_from_shape_cap(ctx, shape, prop_inline_cap)`), not the field count of the shape the object has at that moment.
+
+Why we need it
+  A compiled region that keeps an object in its own C frame gave it exactly the constructor's field count, so the first store of a field the object gains afterwards (raytrace's IntersectionInfo is made with one field and gets five more by plain stores) needed the property array to grow, which compiled code cannot do: the region left on the first such store of every object. With room for the final field count the stores are made in place, as for a heap object made by `qjs_aot_new_from_shape_cap`.
+
+Soundness
+  The block is sized from `room`, and `prop_inline_cap` names it, so an add that needs no larger array than the room writes inside the block and an add that needs more still takes the existing grow path (which the compiled code leaves the region for). Releasing and moving a stack object to the heap already walk the field count of the shape the object has at that moment, so they handle every shape between the constructor's and the final one. The slots beyond the field count hold undefined. A heap object made with exactly its field count has no slot for a later add whose shape keeps the same property-array size (the engine's add paths grow only when the size changes), so the object a stack object moves to must keep the room the block had: an object that is moved after some of its late fields and gains the rest afterwards otherwise writes past its allocation.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -66786,0 +66787,18 @@
++/* The inline slots an object of `sh` is given when it is to hold `cap` fields: the property array of a shape doubles as fields are added, and the engine's add paths grow an object's array
++   only when the shape's size changes, so an object must have room for the whole array its shape names (an add that keeps the size writes the next slot in place) and for the size the shape
++   reaches when it holds `cap` fields (the generated code cannot grow an array). A `cap` not above the field count is the shape's own array size; a room above what the inline capacity can
++   name is the field count. */
++static uint32_t js_aot_inline_room(JSShape *sh, uint32_t cap)
++{
++    uint32_t n = sh->prop_count, size = sh->prop_size, cnt = n;
++
++    if (cap <= n || cap > JS_OBJ_LEARNED_INLINE_MAX)
++        return size > n && size <= JS_OBJ_LEARNED_INLINE_MAX ? size : n;
++    while (cnt < cap) {
++        cnt++;
++        if (cnt > size)
++            size = size * 2 > cnt ? size * 2 : cnt;
++    }
++    return size <= JS_OBJ_LEARNED_INLINE_MAX ? size : n;
++}
++
+@@ -66808,14 +66826 @@
+-    if (cap <= n || cap > JS_OBJ_LEARNED_INLINE_MAX) {
+-        cap = n;
+-    } else {
+-        /* the property array of a shape doubles as fields are added, and an add that changes the shape's size needs the inline capacity to cover the
+-           new size (the generated code cannot grow an array): the room is the size the shape has reached when it holds `cap` fields */
+-        uint32_t size = sh->prop_size, cnt = n;
+-
+-        while (cnt < cap) {
+-            cnt++;
+-            if (cnt > size)
+-                size = size * 2 > cnt ? size * 2 : cnt;
+-        }
+-        cap = size <= JS_OBJ_LEARNED_INLINE_MAX ? size : n;
+-    }
++    cap = js_aot_inline_room(sh, cap);
+@@ -66967,2 +66972,3 @@
+-/* An ordinary object of `shape`, every field undefined, in `buf` (aligned, `bytes` long). JS_UNINITIALIZED when it does not fit. */
+-QJS_AOT_STUB JSValue qjs_aot_stack_object_init(void *buf, size_t bytes, void *shape)
++/* An ordinary object of `shape`, every field undefined, in `buf` (aligned, `bytes` long), with the room for `cap` fields (qjs_aot_new_from_shape_cap's rounding; a `cap` of 0 is the shape's own
++   field count). JS_UNINITIALIZED when it does not fit. */
++QJS_AOT_STUB JSValue qjs_aot_stack_object_init_cap(void *buf, size_t bytes, void *shape, uint32_t cap)
+@@ -66971 +66977 @@
+-    int n = sh->prop_count, i;
++    int n = sh->prop_count, i, room;
+@@ -66975 +66981,2 @@
+-    p = js_stack_block(buf, bytes, offsetof(JSObject, u) + n * sizeof(JSProperty));
++    room = (int)js_aot_inline_room(sh, cap);
++    p = js_stack_block(buf, bytes, offsetof(JSObject, u) + room * sizeof(JSProperty));
+@@ -66978 +66985 @@
+-    p->prop_inline_cap = n;
++    p->prop_inline_cap = room;
+@@ -66984 +66991 @@
+-    for (i = 0; i < n; i++)
++    for (i = 0; i < room; i++)
+@@ -66988,0 +66996,5 @@
++QJS_AOT_STUB JSValue qjs_aot_stack_object_init(void *buf, size_t bytes, void *shape)
++{
++    return qjs_aot_stack_object_init_cap(buf, bytes, shape, 0);
++}
++
+@@ -67076 +67088 @@
+-        ho = qjs_aot_new_from_shape(ctx, p->shape);
++        ho = qjs_aot_new_from_shape_cap(ctx, p->shape, p->prop_inline_cap);   /* the room the stack block had: fields the object gains after the move fit as they did before it */
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -250,0 +251 @@
++QJS_AOT_STUB JSValue qjs_aot_stack_object_init_cap(void *buf, size_t bytes, void *shape, uint32_t cap);

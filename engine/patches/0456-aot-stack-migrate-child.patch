@@ -1,0 +1,78 @@
+Subject: A stack object can hold a stack object in a field, and they move to the heap together
+
+What this does
+  - `qjs_aot_stack_migrate_child(ctx, obj, child, &hobj, &hchild)` moves a stack object and the stack object one of its fields holds (either may be undefined) to the heap. The heap child takes the child's fields (their references move, the child block is emptied and its shape reference dropped), the heap object takes the object's fields, and a field of the object that holds the child's block holds the heap child (one reference of its own; `*hchild` holds one for the caller). Outputs are written only on success; on an out-of-memory nothing has moved.
+  - `qjs_aot_stack_migrate` (object plus Array) and the new call are one static function, `js_stack_migrate2`, with the Array and the child as optional arguments, so the two migrations cannot drift apart. The existing call is that function with no child, so its behaviour is unchanged.
+
+Why we need it
+  A compiled region that keeps an object in its C frame also keeps the object a constructor stores into a field of it there (raytrace: `this.color = new Color(0,0,0)` in IntersectionInfo's initialize, one Color per IntersectionInfo, dropped unread on a miss). The two blocks are one unit: when the region leaves, or moves the container to the heap in a rare place, the container's field must not keep pointing into the frame.
+
+Soundness
+  - Reference counts: a stack block's count starts at `JS_STACK_BIAS`, and nothing drops it to zero, so the field's counted reference to the child block is a decrement or increment on a biased count and never reaches the free path; the collector's trial decrement leaves the block positive and it is not on the collector's lists (it is only reachable from a frame, and from the container's field while the container is itself a stack block, which is not reachable from the heap until it is migrated). The child's own fields are released exactly once: at its migration (they move) or at its release (`qjs_aot_stack_release` on the child block), never both, because migration empties the block first.
+  - Identity: the heap child is created once and both the container's field and the caller get references to that one object.
+  - Overwritten field: a field that no longer holds the child block (the program stored another value in it after the constructor's store) is left as it is. The child is still moved, because the code that made it may hold it in a register; it is then an object nothing in the heap refers to, and the caller drops it.
+  - The migration of a child alone (its container already gone) is the same call with an undefined object.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -67071,4 +67071,5 @@
+-/* Move a stack object and its stack array (either may be undefined) to the heap: the heap array takes the elements (their references move), the heap object takes
+-   the fields (the field that held the stack array holds the heap array), and the stack blocks are emptied and released. *hobj and *harr each hold one reference for
+-   the caller. 1, or 0 with nothing moved on an out-of-memory. */
+-QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr, JSValue *hobj, JSValue *harr)
++/* Move a stack object, its stack array and its stack child object (any may be undefined) to the heap: the heap array takes the elements (their references move), the heap child and the
++   heap object take the fields (a field of the object that held the stack array holds the heap array, a field that held the stack child holds the heap child), and the stack blocks are
++   emptied and released. A field that no longer holds the child (it was overwritten after the store) is left alone, and the child is moved all the same: the code that made it may still hold
++   it. *hobj, *harr and *hchild each hold one reference for the caller. 1, or 0 with nothing moved on an out-of-memory. */
++static int js_stack_migrate2(JSContext *ctx, JSValue obj, JSValue arr, JSValue child, JSValue *hobj, JSValue *harr, JSValue *hchild)
+@@ -67076,2 +67077,2 @@
+-    JSValue ha = JS_UNDEFINED, ho = JS_UNDEFINED;
+-    JSObject *a = NULL, *p = NULL;
++    JSValue ha = JS_UNDEFINED, hc = JS_UNDEFINED, ho = JS_UNDEFINED;
++    JSObject *a = NULL, *c = NULL, *p = NULL;
+@@ -67085,0 +67087,8 @@
++    if (JS_VALUE_GET_TAG(child) == JS_TAG_OBJECT) {
++        c = JS_VALUE_GET_OBJ(child);
++        hc = qjs_aot_new_from_shape_cap(ctx, c->shape, c->prop_inline_cap);
++        if (JS_IsException(hc)) {
++            JS_FreeValue(ctx, ha);
++            return 0;
++        }
++    }
+@@ -67090,0 +67100 @@
++            JS_FreeValue(ctx, hc);
+@@ -67101,0 +67112,7 @@
++    if (c != NULL) {
++        JSObject *h = JS_VALUE_GET_OBJ(hc);
++        for (i = 0; i < c->shape->prop_count; i++) {
++            h->prop[i].u.value = c->prop[i].u.value;
++            c->prop[i].u.value = JS_UNDEFINED;
++        }
++    }
+@@ -67107,0 +67125,2 @@
++            else if (c != NULL && JS_VALUE_HAS_REF_COUNT(v) && JS_VALUE_GET_PTR(v) == (void *)c)
++                v = JS_DupValue(ctx, hc);
+@@ -67112,0 +67132,3 @@
++    qjs_aot_stack_release(ctx, child, JS_UNDEFINED);   /* its fields moved: what is left is its shape reference */
++    if (c != NULL)
++        qjs_aot_object_filled(ctx, hc);
+@@ -67116,0 +67139 @@
++    *hchild = hc;
+@@ -67117,0 +67141,13 @@
++}
++
++QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr, JSValue *hobj, JSValue *harr)
++{
++    JSValue hc;
++    return js_stack_migrate2(ctx, obj, arr, JS_UNDEFINED, hobj, harr, &hc);
++}
++
++/* The same for a stack object and a stack object that a field of it holds (or held: see above), either may be undefined. */
++QJS_AOT_STUB int qjs_aot_stack_migrate_child(JSContext *ctx, JSValue obj, JSValue child, JSValue *hobj, JSValue *hchild)
++{
++    JSValue ha;
++    return js_stack_migrate2(ctx, obj, JS_UNDEFINED, child, hobj, &ha, hchild);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -254,0 +255 @@
++QJS_AOT_STUB int qjs_aot_stack_migrate_child(JSContext *ctx, JSValue obj, JSValue child, JSValue *hobj, JSValue *hchild);

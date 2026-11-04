@@ -1,0 +1,91 @@
+Subject: A function can be lent a stack object and move it to the heap, leaving a forward word for its owner
+
+What this does
+  - `qjs_aot_stack_migrate_lent(ctx, obj, &hobj, &hchild)` moves a stack object that its owner lent to the running function, and the one stack object a field of it holds (if any), to the heap with the same body the other migrations use (`js_stack_migrate2`). Each emptied block is left a forward block: biased count, shape NULL, and the first slot holds a counted reference to the heap object. `*hobj` and `*hchild` (undefined with no child) hold one reference each for the caller.
+  - `qjs_aot_stack_unlend(ctx, &slot)` is the callee's side: a slot that holds a live lent block is migrated and the slot is set to the heap object (it holds no reference of its own; the forward word keeps the object alive until the owner takes it); any other value is left alone.
+  - `qjs_aot_stack_forward(v)` gives the heap object a forward block holds, or `v` itself when it is not such a block. The reference stays with the block.
+
+Why we need it
+  A compiled region keeps an object in its C frame and may lend it to an out-of-line callee that only reads it (raytrace: the shadow and reflection Rays and their Vector). The callee can leave its compiled body at any guard and finish in the generic body, which must see a heap object. The owner's frame is still live when the callee returns, so it needs to learn that its block moved and where the object went.
+
+The invariant
+  A lent block that was migrated has the biased count (qjs_aot_stack_release changes neither the count nor the block's memory), a NULL shape, and in its first slot a counted reference to the heap object. The first slot exists: the block's property array holds at least the shape's field count, which the function requires to be non-zero. A live lent block has a shape, a released one has a NULL shape and an undefined first slot, so the forward test (stack count, NULL shape) is made only on blocks the owner lent, right after the call that received them.
+
+References after a successful call (heap object, and likewise the heap child)
+  - the forward word holds one; `*hobj` holds one for the caller, which drops it once the holders it creates (frame registers) have their own; the callee's argument slot holds none.
+  - The owner takes over the forward word's reference when it adopts the object after the call, on every path out of the call including the exception return, so no forward word is left unread; if the callee did not migrate, there is no forward word and nothing to adopt.
+
+Failure
+  Returns 0 with nothing moved and no forward word written on an out-of-memory (the migration allocates the heap objects first and writes after), and when the fields hold a second, different stack object (the owner's analysis makes at most one). The block is left a valid lent block, the caller propagates the failure as an exception.
+
+Soundness
+  - Reference counts: the block's count is biased and never reaches the free path.
+  - One stack child: a second distinct stack object in the fields would be left pointing into the owner's frame, so the function refuses to migrate in that case rather than half-moving.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -67191,0 +67192,59 @@ QJS_AOT_STUB int qjs_aot_stack_migrate_child(JSContext *ctx, JSValue obj, JSValu
++/* Move a stack object that its owner lent to the running function, and the stack object one of its fields holds (if any), to the heap. The owner's frame outlives this call and tests
++   its lent blocks when the call returns, so each emptied block is left as a forward block: biased count (the release below does not change it), shape NULL (qjs_aot_stack_release drops
++   it), and the first slot (inside the block: the property array holds at least the shape's fields) a counted reference to the heap object, which the owner takes over. References to the heap
++   object after the call: the forward word holds one, *hobj holds one for the caller (who drops it once its own holders have taken theirs), and nothing else; to the heap child likewise. 1; or 0
++   with nothing moved and no forward word written, on an out-of-memory or when a second, different stack object is found in the fields (the owner's analysis makes none; the block is left
++   a valid lent block). */
++QJS_AOT_STUB int qjs_aot_stack_migrate_lent(JSContext *ctx, JSValue obj, JSValue *hobj, JSValue *hchild)
++{
++    JSObject *p = JS_VALUE_GET_OBJ(obj), *c = NULL;
++    JSValue child = JS_UNDEFINED, ha;
++    int i, n = p->shape->prop_count;
++    assert(JS_REF_COUNT(p) >= JS_STACK_BIAS / 2 && n > 0);
++    for (i = 0; i < n; i++) {
++        JSValue v = p->prop[i].u.value;
++        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2) {
++            if (c != NULL && c != JS_VALUE_GET_OBJ(v))
++                return 0;
++            c = JS_VALUE_GET_OBJ(v);
++            child = v;
++        }
++    }
++    if (!js_stack_migrate2(ctx, obj, JS_UNDEFINED, child, hobj, &ha, hchild))
++        return 0;
++    p->prop[0].u.value = JS_DupValue(ctx, *hobj);
++    if (c != NULL)
++        c->prop[0].u.value = JS_DupValue(ctx, *hchild);
++    return 1;
++}
++
++/* The callee's side of a lent argument: when *slot holds a live stack block (the owner lent it), move it to the heap (qjs_aot_stack_migrate_lent) and put the heap object in *slot, which holds no
++   reference of its own (the forward word keeps the object alive until the owner takes it); anything else is left alone. 1, or 0 with nothing moved on an out-of-memory. */
++QJS_AOT_STUB int qjs_aot_stack_unlend(JSContext *ctx, JSValue *slot)
++{
++    JSValue v = *slot, ho, hc;
++    JSObject *p;
++    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
++        return 1;
++    p = JS_VALUE_GET_OBJ(v);
++    if (JS_REF_COUNT(p) < JS_STACK_BIAS / 2 || p->shape == NULL)
++        return 1;
++    if (!qjs_aot_stack_migrate_lent(ctx, v, &ho, &hc))
++        return 0;
++    JS_FreeValue(ctx, hc);
++    JS_FreeValue(ctx, ho);
++    *slot = p->prop[0].u.value;
++    return 1;
++}
++
++/* The heap object a lent stack block was moved to (the forward word qjs_aot_stack_migrate_lent leaves), or `v` itself when it is not such a block. The reference stays with the block. */
++QJS_AOT_STUB JSValue qjs_aot_stack_forward(JSValue v)
++{
++    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
++        JSObject *p = JS_VALUE_GET_OBJ(v);
++        if (JS_REF_COUNT(p) >= JS_STACK_BIAS / 2 && p->shape == NULL)
++            return p->prop[0].u.value;
++    }
++    return v;
++}
++
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -256,0 +257,3 @@ QJS_AOT_STUB int qjs_aot_stack_migrate_child(JSContext *ctx, JSValue obj, JSValu
++QJS_AOT_STUB int qjs_aot_stack_migrate_lent(JSContext *ctx, JSValue obj, JSValue *hobj, JSValue *hchild);
++QJS_AOT_STUB JSValue qjs_aot_stack_forward(JSValue v);
++QJS_AOT_STUB int qjs_aot_stack_unlend(JSContext *ctx, JSValue *slot);

@@ -1791,12 +1791,44 @@
       "sha256": "554acdaa8ebb4505d816b1e1254eb570326b1e833fe73f93dc9b0f733b6c60da"
     },
     {
+      "name": "0454-aot-new-from-shape-cap.patch",
+      "sha256": "d79a207c0bab3bbe873691408a1ec042bf85607ba3d45379a79c8f2c6c486964"
+    },
+    {
+      "name": "0455-aot-stack-object-room.patch",
+      "sha256": "5353dbbbb8a2526a79d11c002021edca124ff63019dd0a911c5177ca5ccaefab"
+    },
+    {
+      "name": "0456-aot-stack-migrate-child.patch",
+      "sha256": "d3f748a77648777acc519361faf0c4fb94042aa2d9422dea72f0d33622765000"
+    },
+    {
+      "name": "0457-aot-stack-release-mask.patch",
+      "sha256": "393123a20b9e985bb04d2601ad2df28e20c5a725802ebfeabc03319a917236ec"
+    },
+    {
+      "name": "0458-aot-stack-migrate-lent.patch",
+      "sha256": "30cec750a802f78d5dc1bbdd9312774db48f67892071362de9b3ad687fb64346"
+    },
+    {
+      "name": "0459-aot-slot-assign.patch",
+      "sha256": "0353ea335dfd98548d77fc97350f6576a64ba4822ffe89e3cb99972f8aa9147f"
+    },
+    {
+      "name": "0460-aot-slot-fill.patch",
+      "sha256": "ed63cfec7b3dfb4de6196afadeb8752727cc787dde96a7386068a216f97e9634"
+    },
+    {
+      "name": "0461-aot-migrate-take-over.patch",
+      "sha256": "fad247283e763b519eb0ff9e2cf25545e0d8f25fb19f2d07141f9725d3bc5e50"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "2c53f20d349dd5fd37536faaa6cac8edde27e1af2b9db0e24cf1f2fe50aa9253",
+    "quickjs.c": "ce8b3e5c19a1a64d2862bc88e64abab487750bd1b628958bb3b403f14e7e7d0c",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

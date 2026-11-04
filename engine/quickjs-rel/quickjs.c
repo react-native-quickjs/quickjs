@@ -66784,15 +66784,35 @@ QJS_AOT_STUB void *qjs_aot_class_shape(JSContext *ctx, JSValue proto, const uint
     return NULL;
 }
 
+/* The inline slots an object of `sh` is given when it is to hold `cap` fields: the property array of a shape doubles as fields are added, and the engine's add paths grow an object's array
+   only when the shape's size changes, so an object must have room for the whole array its shape names (an add that keeps the size writes the next slot in place) and for the size the shape
+   reaches when it holds `cap` fields (the generated code cannot grow an array). A `cap` not above the field count is the shape's own array size; a room above what the inline capacity can
+   name is the field count. */
+static uint32_t js_aot_inline_room(JSShape *sh, uint32_t cap)
+{
+    uint32_t n = sh->prop_count, size = sh->prop_size, cnt = n;
+
+    if (cap <= n || cap > JS_OBJ_LEARNED_INLINE_MAX)
+        return size > n && size <= JS_OBJ_LEARNED_INLINE_MAX ? size : n;
+    while (cnt < cap) {
+        cnt++;
+        if (cnt > size)
+            size = size * 2 > cnt ? size * 2 : cnt;
+    }
+    return size <= JS_OBJ_LEARNED_INLINE_MAX ? size : n;
+}
+
 /* A new ordinary object of a class shape (qjs_aot_class_shape), every field undefined. The caller writes the fields and then calls
-   qjs_aot_object_filled, which checks the slot claims of a contracted layout as the last add of a field would. */
-QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
+   qjs_aot_object_filled, which checks the slot claims of a contracted layout as the last add of a field would.
+   `cap` is the number of slots to reserve: the fields the object gains after its constructor then fit without growing the array. A cap
+   that is not above the shape's field count, or above what an inline array can hold, reserves exactly the field count. */
+QJS_AOT_STUB JSValue qjs_aot_new_from_shape_cap(JSContext *ctx, void *shape, uint32_t cap)
 {
     JSShape *sh = (JSShape *)shape;
     JSRuntime *rt = ctx->rt;
     JSObject *p;
     JSProperty *pr;
-    int i, n = sh->prop_count;
+    uint32_t i, n = sh->prop_count;
 
     if (unlikely(n > JS_OBJ_LEARNED_INLINE_MAX)) {
         JSValue obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL);
@@ -66803,12 +66823,13 @@ QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
             p->prop[i].u.value = JS_UNDEFINED;
         return obj;
     }
-    /* what JS_NewObjectFromShapeCapExtra does for a plain object, without its class switch: one block holding the body and the n slots */
+    cap = js_aot_inline_room(sh, cap);
+    /* what JS_NewObjectFromShapeCapExtra does for a plain object, without its class switch: one block holding the body and the cap slots */
     js_trigger_gc(rt, sizeof(JSObject));
-    p = js_malloc(ctx, offsetof(JSObject, u) + n * sizeof(JSProperty));
+    p = js_malloc(ctx, offsetof(JSObject, u) + cap * sizeof(JSProperty));
     if (unlikely(!p))
         return JS_EXCEPTION;   /* the generic path also drops the shape reference it was given; here none was taken yet */
-    p->prop_inline_cap = n;
+    p->prop_inline_cap = cap;
     p->class_id = JS_CLASS_OBJECT;
     p->values_inline = 0;
     p->arr_kind = JS_ARR_KIND_GENERIC;
@@ -66827,11 +66848,16 @@ QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
     p->shape = js_dup_shape(sh);
     pr = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
     p->prop = pr;
-    for (i = 0; i < n; i++)
+    for (i = 0; i < cap; i++)
         pr[i].u.value = JS_UNDEFINED;
     JS_REF_COUNT(p) = 1;
     add_gc_object(rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
     return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
+{
+    return qjs_aot_new_from_shape_cap(ctx, shape, 0);
 }
 
 /* What the engine's construct path does once per constructor before its first construct (the unit's layout chain for it, built against
@@ -66943,26 +66969,33 @@ static JSObject *js_stack_block(void *buf, size_t bytes, size_t body)
     return p;
 }
 
-/* An ordinary object of `shape`, every field undefined, in `buf` (aligned, `bytes` long). JS_UNINITIALIZED when it does not fit. */
-QJS_AOT_STUB JSValue qjs_aot_stack_object_init(void *buf, size_t bytes, void *shape)
+/* An ordinary object of `shape`, every field undefined, in `buf` (aligned, `bytes` long), with the room for `cap` fields (qjs_aot_new_from_shape_cap's rounding; a `cap` of 0 is the shape's own
+   field count). JS_UNINITIALIZED when it does not fit. */
+QJS_AOT_STUB JSValue qjs_aot_stack_object_init_cap(void *buf, size_t bytes, void *shape, uint32_t cap)
 {
     JSShape *sh = (JSShape *)shape;
-    int n = sh->prop_count, i;
+    int n = sh->prop_count, i, room;
     JSObject *p;
     if (n <= 0 || n > JS_OBJ_LEARNED_INLINE_MAX)
         return JS_UNINITIALIZED;
-    p = js_stack_block(buf, bytes, offsetof(JSObject, u) + n * sizeof(JSProperty));
+    room = (int)js_aot_inline_room(sh, cap);
+    p = js_stack_block(buf, bytes, offsetof(JSObject, u) + room * sizeof(JSProperty));
     if (p == NULL)
         return JS_UNINITIALIZED;
-    p->prop_inline_cap = n;
+    p->prop_inline_cap = room;
     p->class_id = JS_CLASS_OBJECT;
     p->arr_kind = JS_ARR_KIND_GENERIC;
     p->extensible = true;
     p->shape = js_dup_shape(sh);
     p->prop = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
-    for (i = 0; i < n; i++)
+    for (i = 0; i < room; i++)
         p->prop[i].u.value = JS_UNDEFINED;
     return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+QJS_AOT_STUB JSValue qjs_aot_stack_object_init(void *buf, size_t bytes, void *shape)
+{
+    return qjs_aot_stack_object_init_cap(buf, bytes, shape, 0);
 }
 
 /* An empty Array of the realm's array shape in `buf`, with room for `n` elements in the block itself (a push past `n` moves the elements to a heap block, as for
@@ -67035,26 +67068,178 @@ QJS_AOT_STUB void qjs_aot_stack_release(JSContext *ctx, JSValue obj, JSValue arr
     }
 }
 
-/* Move a stack object and its stack array (either may be undefined) to the heap: the heap array takes the elements (their references move), the heap object takes
-   the fields (the field that held the stack array holds the heap array), and the stack blocks are emptied and released. *hobj and *harr each hold one reference for
-   the caller. 1, or 0 with nothing moved on an out-of-memory. */
-QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr, JSValue *hobj, JSValue *harr)
+/* Release a stack object that has no Array pair when the caller knows which fields can hold a counted reference: bit i of `refmask` is set for field i that may. Only those fields are read
+   and released, then the shape reference is dropped; the fields are not written back and the block is dead until the region makes it again (every word of it is rewritten by that
+   init). QJS_AOT_REGION_MASKCHECK=1 in the run's environment checks the mask against all of the fields and aborts on a reference outside it. */
+QJS_AOT_STUB void qjs_aot_stack_release_m(JSContext *ctx, JSValue obj, uint32_t refmask)
 {
-    JSValue ha = JS_UNDEFINED, ho = JS_UNDEFINED;
-    JSObject *a = NULL, *p = NULL;
+    JSRuntime *rt = ctx->rt;
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    JSShape *sh = p->shape;
+    uint32_t m = refmask;
+    assert(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && JS_REF_COUNT(p) >= JS_STACK_BIAS / 2);
+    {
+        static int chk = -1;
+        if (unlikely(chk < 0))
+            chk = getenv("QJS_AOT_REGION_MASKCHECK") != NULL;
+        if (unlikely(chk)) {
+            int j;
+            for (j = 0; j < sh->prop_count && j < 32; j++) {
+                if (!((refmask >> j) & 1) && JS_VALUE_HAS_REF_COUNT(p->prop[j].u.value)) {
+                    fprintf(stderr, "MASKCHECK: field %d of a stack object holds a reference outside the mask %x\n", j, refmask);
+                    abort();
+                }
+            }
+        }
+    }
+    while (m) {
+        int i = __builtin_ctz(m);
+        m &= m - 1;
+        if (i >= sh->prop_count)
+            break;
+        if (JS_VALUE_HAS_REF_COUNT(p->prop[i].u.value))
+            JS_FreeValueRT(rt, p->prop[i].u.value);
+    }
+    js_free_shape(rt, sh);
+    p->shape = NULL;
+}
+
+/* Move a stack object, its stack array and its stack child object (any may be undefined) to the heap: the heap array takes the elements (their references move), the heap child and the
+   heap object take the fields (a field of the object that held the stack array holds the heap array, a field that held the stack child holds the heap child), and the stack blocks are
+   emptied and released. A field that no longer holds the child (it was overwritten after the store) is left alone, and the child is moved all the same: the code that made it may still hold
+   it. *hobj, *harr and *hchild each hold one reference for the caller. 1, or 0 with nothing moved on an out-of-memory. */
+#ifdef QJS_KIT_TEST_KNOBS
+static bool getenv_nomigfast(void)
+{
+    static int v = -1;
+    if (unlikely(v < 0))
+        v = getenv("QJS_AOT_NOMIGFAST") != NULL;
+    return v;
+}
+#else
+#define getenv_nomigfast() false
+#endif
+
+/* The heap object a stack block moves to, in two steps so that a failure leaves every block as it was. The first allocates it with the room qjs_aot_new_from_shape_cap would give (the
+   fields past the block's own are undefined); the second takes the block's shape reference (no duplicate, no release) and its fields, leaves the block's fields undefined and its shape
+   NULL as qjs_aot_stack_release does, and links the object into the collector's list. */
+static JSObject *js_aot_moved_alloc(JSContext *ctx, JSObject *src)
+{
+    JSRuntime *rt = ctx->rt;
+    JSShape *sh = src->shape;
+    uint32_t n = sh->prop_count, cap = js_aot_inline_room(sh, src->prop_inline_cap), i;
+    JSObject *h;
+    JSProperty *pr;
+    js_trigger_gc(rt, sizeof(JSObject));
+    h = js_malloc(ctx, offsetof(JSObject, u) + cap * sizeof(JSProperty));
+    if (unlikely(!h))
+        return NULL;
+    h->prop_inline_cap = cap;
+    h->class_id = JS_CLASS_OBJECT;
+    h->values_inline = 0;
+    h->arr_kind = JS_ARR_KIND_GENERIC;
+    h->extensible = true;
+    h->free_mark = 0;
+    h->is_exotic = 0;
+    h->fast_array = 0;
+    h->holey = 0;
+    h->is_constructor = 0;
+    h->is_uncatchable_error = 0;
+    h->tmp_mark = 0;
+    h->is_HTMLDDA = 0;
+    h->gv_watched = 0;
+    h->is_prototype = 0;
+    h->first_weak_ref = NULL;
+    pr = (JSProperty *)((uint8_t *)h + offsetof(JSObject, u));
+    h->prop = pr;
+    for (i = n; i < cap; i++)
+        pr[i].u.value = JS_UNDEFINED;
+    JS_REF_COUNT(h) = 1;
+    return h;
+}
+static void js_aot_moved_fill(JSContext *ctx, JSObject *h, JSObject *src, JSObject *child, JSValue hchild)
+{
+    JSShape *sh = src->shape;
+    int i, n = sh->prop_count;
+    for (i = 0; i < n; i++) {
+        JSValue v = src->prop[i].u.value;
+        if (child != NULL && JS_VALUE_HAS_REF_COUNT(v) && JS_VALUE_GET_PTR(v) == (void *)child)
+            v = JS_DupValue(ctx, hchild);
+#ifdef QJS_KIT_TEST_KNOBS
+        assert(JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT || JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) < JS_STACK_BIAS / 2);   /* the region's analysis keeps at most the one stack child in a field */
+#endif
+        h->prop[i].u.value = v;
+        src->prop[i].u.value = JS_UNDEFINED;
+    }
+    h->shape = sh;
+    src->shape = NULL;
+    add_gc_object(ctx->rt, &h->header, JS_GC_OBJ_TYPE_JS_OBJECT);
+}
+
+static int js_stack_migrate2(JSContext *ctx, JSValue obj, JSValue arr, JSValue child, JSValue *hobj, JSValue *harr, JSValue *hchild)
+{
+    JSValue ha = JS_UNDEFINED, hc = JS_UNDEFINED, ho = JS_UNDEFINED;
+    JSObject *a = NULL, *c = NULL, *p = NULL;
     uint32_t k;
     int i;
+    if (JS_VALUE_GET_TAG(arr) != JS_TAG_OBJECT && !getenv_nomigfast()) {   /* no Array pair: move the block's shape reference and fields straight into the new objects */
+        JSObject *hp = NULL, *hq = NULL;
+        c = JS_VALUE_GET_TAG(child) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(child) : NULL;
+        p = JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(obj) : NULL;
+        if ((c == NULL || c->shape->prop_count <= JS_OBJ_LEARNED_INLINE_MAX) && (p == NULL || p->shape->prop_count <= JS_OBJ_LEARNED_INLINE_MAX)) {
+            if (c != NULL) {
+                hq = js_aot_moved_alloc(ctx, c);
+                if (unlikely(!hq))
+                    return 0;
+            }
+            if (p != NULL) {
+                hp = js_aot_moved_alloc(ctx, p);
+                if (unlikely(!hp)) {
+                    if (hq != NULL)
+                        js_free(ctx, hq);
+                    return 0;
+                }
+            }
+            if (hq != NULL) {
+                js_aot_moved_fill(ctx, hq, c, NULL, JS_UNDEFINED);
+                hc = JS_MKPTR(JS_TAG_OBJECT, hq);
+            }
+            if (hp != NULL) {
+                js_aot_moved_fill(ctx, hp, p, c, hc);
+                ho = JS_MKPTR(JS_TAG_OBJECT, hp);
+            }
+            if (hq != NULL)
+                qjs_aot_object_filled(ctx, hc);
+            if (hp != NULL)
+                qjs_aot_object_filled(ctx, ho);
+            *hobj = ho;
+            *harr = JS_UNDEFINED;
+            *hchild = hc;
+            return 1;
+        }
+        c = NULL;
+        p = NULL;
+    }
     if (JS_VALUE_GET_TAG(arr) == JS_TAG_OBJECT) {
         a = JS_VALUE_GET_OBJ(arr);
         ha = JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->array_shape), JS_CLASS_ARRAY, NULL, 0, a->u.array.u1.size > a->u.array.count ? a->u.array.u1.size : a->u.array.count);
         if (JS_IsException(ha))
             return 0;
     }
+    if (JS_VALUE_GET_TAG(child) == JS_TAG_OBJECT) {
+        c = JS_VALUE_GET_OBJ(child);
+        hc = qjs_aot_new_from_shape_cap(ctx, c->shape, c->prop_inline_cap);
+        if (JS_IsException(hc)) {
+            JS_FreeValue(ctx, ha);
+            return 0;
+        }
+    }
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
         p = JS_VALUE_GET_OBJ(obj);
-        ho = qjs_aot_new_from_shape(ctx, p->shape);
+        ho = qjs_aot_new_from_shape_cap(ctx, p->shape, p->prop_inline_cap);   /* the room the stack block had: fields the object gains after the move fit as they did before it */
         if (JS_IsException(ho)) {
             JS_FreeValue(ctx, ha);
+            JS_FreeValue(ctx, hc);
             return 0;
         }
     }
@@ -67066,21 +67251,270 @@ QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr,
         h->prop[0].u.value = js_int32((int32_t)a->u.array.count);
         a->u.array.count = 0;
     }
+    if (c != NULL) {
+        JSObject *h = JS_VALUE_GET_OBJ(hc);
+        for (i = 0; i < c->shape->prop_count; i++) {
+            h->prop[i].u.value = c->prop[i].u.value;
+            c->prop[i].u.value = JS_UNDEFINED;
+        }
+    }
     if (p != NULL) {
         JSObject *h = JS_VALUE_GET_OBJ(ho);
         for (i = 0; i < p->shape->prop_count; i++) {
             JSValue v = p->prop[i].u.value;
             if (a != NULL && JS_VALUE_HAS_REF_COUNT(v) && JS_VALUE_GET_PTR(v) == (void *)a)
                 v = JS_DupValue(ctx, ha);
+            else if (c != NULL && JS_VALUE_HAS_REF_COUNT(v) && JS_VALUE_GET_PTR(v) == (void *)c)
+                v = JS_DupValue(ctx, hc);
             h->prop[i].u.value = v;
             p->prop[i].u.value = JS_UNDEFINED;
         }
     }
     qjs_aot_stack_release(ctx, obj, arr);
+    qjs_aot_stack_release(ctx, child, JS_UNDEFINED);   /* its fields moved: what is left is its shape reference */
+    if (c != NULL)
+        qjs_aot_object_filled(ctx, hc);
     if (p != NULL)
         qjs_aot_object_filled(ctx, ho);   /* the slot-claim check the stack object skipped */
     *hobj = ho;
     *harr = ha;
+    *hchild = hc;
+    return 1;
+}
+
+QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr, JSValue *hobj, JSValue *harr)
+{
+    JSValue hc;
+    return js_stack_migrate2(ctx, obj, arr, JS_UNDEFINED, hobj, harr, &hc);
+}
+
+/* The same for a stack object and a stack object that a field of it holds (or held: see above), either may be undefined. */
+QJS_AOT_STUB int qjs_aot_stack_migrate_child(JSContext *ctx, JSValue obj, JSValue child, JSValue *hobj, JSValue *hchild)
+{
+    JSValue ha;
+    return js_stack_migrate2(ctx, obj, JS_UNDEFINED, child, hobj, &ha, hchild);
+}
+
+/* Move a stack object that its owner lent to the running function, and the stack object one of its fields holds (if any), to the heap. The owner's frame outlives this call and tests
+   its lent blocks when the call returns, so each emptied block is left as a forward block: biased count (the release below does not change it), shape NULL (qjs_aot_stack_release drops
+   it), and the first slot (inside the block: the property array holds at least the shape's fields) a counted reference to the heap object, which the owner takes over. References to the heap
+   object after the call: the forward word holds one, *hobj holds one for the caller (who drops it once its own holders have taken theirs), and nothing else; to the heap child likewise. 1; or 0
+   with nothing moved and no forward word written, on an out-of-memory or when a second, different stack object is found in the fields (the owner's analysis makes none; the block is left
+   a valid lent block). */
+QJS_AOT_STUB int qjs_aot_stack_migrate_lent(JSContext *ctx, JSValue obj, JSValue *hobj, JSValue *hchild)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj), *c = NULL;
+    JSValue child = JS_UNDEFINED, ha;
+    int i, n = p->shape->prop_count;
+    assert(JS_REF_COUNT(p) >= JS_STACK_BIAS / 2 && n > 0);
+    for (i = 0; i < n; i++) {
+        JSValue v = p->prop[i].u.value;
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2) {
+            if (c != NULL && c != JS_VALUE_GET_OBJ(v))
+                return 0;
+            c = JS_VALUE_GET_OBJ(v);
+            child = v;
+        }
+    }
+    if (!js_stack_migrate2(ctx, obj, JS_UNDEFINED, child, hobj, &ha, hchild))
+        return 0;
+    p->prop[0].u.value = JS_DupValue(ctx, *hobj);
+    if (c != NULL)
+        c->prop[0].u.value = JS_DupValue(ctx, *hchild);
+    return 1;
+}
+
+/* The callee's side of a lent argument: when *slot holds a live stack block (the owner lent it), move it to the heap (qjs_aot_stack_migrate_lent) and put the heap object in *slot, which holds no
+   reference of its own (the forward word keeps the object alive until the owner takes it); anything else is left alone. 1, or 0 with nothing moved on an out-of-memory. */
+QJS_AOT_STUB int qjs_aot_stack_unlend(JSContext *ctx, JSValue *slot)
+{
+    JSValue v = *slot, ho, hc;
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return 1;
+    p = JS_VALUE_GET_OBJ(v);
+    if (JS_REF_COUNT(p) < JS_STACK_BIAS / 2 || p->shape == NULL)
+        return 1;
+    if (!qjs_aot_stack_migrate_lent(ctx, v, &ho, &hc))
+        return 0;
+    JS_FreeValue(ctx, hc);
+    JS_FreeValue(ctx, ho);
+    *slot = p->prop[0].u.value;
+    return 1;
+}
+
+/* The heap object a lent stack block was moved to (the forward word qjs_aot_stack_migrate_lent leaves), or `v` itself when it is not such a block. The reference stays with the block. */
+QJS_AOT_STUB JSValue qjs_aot_stack_forward(JSValue v)
+{
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(v);
+        if (JS_REF_COUNT(p) >= JS_STACK_BIAS / 2 && p->shape == NULL)
+            return p->prop[0].u.value;
+    }
+    return v;
+}
+
+/* Move the contents of the stack object `src` into the stack object `dst`, both blocks of one owner's frame and live. `dst` takes `src`'s shape and field values; the fields it held are released first.
+   A stack object a field of `src` holds (`srcc`, the one child a block may hold) is not left in the owner's frame under a name that will be reused: its contents move into the block `dstc` and the
+   field of `dst` holds `dstc`; `dstc` (the child `dst` held, released the same way) must be given when `srcc` is. `src` is left a valid block whose fields are all undefined (its own release
+   then frees nothing and drops its shape reference), and `srcc` likewise. 1 when moved; 0 with nothing changed when the contents do not fit (a layout past the room of `dst` or `dstc`), when
+   `src` holds another stack object than `srcc`, or when the children hold stack objects themselves. */
+static void js_stack_take_fields(JSContext *ctx, JSObject *d, JSObject *s, JSValue keep)
+{
+    int i, sn = s->shape->prop_count, dn = d->shape->prop_count;
+    JSShape *old = d->shape;
+    for (i = 0; i < dn; i++) {
+        JSValue v = d->prop[i].u.value;
+        if (!(JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(keep) == JS_TAG_OBJECT && JS_VALUE_GET_PTR(v) == JS_VALUE_GET_PTR(keep)) && JS_VALUE_HAS_REF_COUNT(v))
+            JS_FreeValue(ctx, v);
+        d->prop[i].u.value = JS_UNDEFINED;
+    }
+    d->shape = js_dup_shape(s->shape);
+    js_free_shape(ctx->rt, old);
+    for (i = 0; i < sn; i++) {
+        d->prop[i].u.value = s->prop[i].u.value;
+        s->prop[i].u.value = JS_UNDEFINED;
+    }
+}
+
+QJS_AOT_STUB int qjs_aot_slot_assign(JSContext *ctx, JSValue dst, JSValue dstc, JSValue src, JSValue srcc)
+{
+    JSObject *d, *s, *dc = NULL, *sc = NULL;
+    int i, sn, scn = 0;
+    if (JS_VALUE_GET_TAG(dst) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(src) != JS_TAG_OBJECT)
+        return 0;
+    d = JS_VALUE_GET_OBJ(dst);
+    s = JS_VALUE_GET_OBJ(src);
+    if (d == s || JS_REF_COUNT(d) < JS_STACK_BIAS / 2 || JS_REF_COUNT(s) < JS_STACK_BIAS / 2 || d->shape == NULL || s->shape == NULL)
+        return 0;
+    sn = s->shape->prop_count;
+    if (sn > d->prop_inline_cap)
+        return 0;
+    if (JS_VALUE_GET_TAG(srcc) == JS_TAG_OBJECT) {
+        if (JS_VALUE_GET_TAG(dstc) != JS_TAG_OBJECT)
+            return 0;
+        sc = JS_VALUE_GET_OBJ(srcc);
+        dc = JS_VALUE_GET_OBJ(dstc);
+        if (sc == dc || JS_REF_COUNT(sc) < JS_STACK_BIAS / 2 || JS_REF_COUNT(dc) < JS_STACK_BIAS / 2 || sc->shape == NULL || dc->shape == NULL)
+            return 0;
+        scn = sc->shape->prop_count;
+        if (scn > dc->prop_inline_cap)
+            return 0;
+        for (i = 0; i < scn; i++) {
+            JSValue v = sc->prop[i].u.value;
+            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2)
+                return 0;
+        }
+    }
+    {
+        int nsc = 0, dn = d->shape->prop_count;
+        for (i = 0; i < sn; i++) {
+            JSValue v = s->prop[i].u.value;
+            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2) {
+                if (JS_VALUE_GET_OBJ(v) != sc)
+                    return 0;
+                nsc++;
+            }
+        }
+        if ((sc != NULL) != (nsc == 1) || nsc > 1)
+            return 0;
+        /* a stack object in a field being released other than the child block that stays would have its bias decremented */
+        for (i = 0; i < dn; i++) {
+            JSValue v = d->prop[i].u.value;
+            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2 && JS_VALUE_GET_OBJ(v) != dc)
+                return 0;
+        }
+        if (dc != NULL) {
+            int dcn = dc->shape->prop_count;
+            for (i = 0; i < dcn; i++) {
+                JSValue v = dc->prop[i].u.value;
+                if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2)
+                    return 0;
+            }
+        }
+    }
+    if (dc != NULL)
+        js_stack_take_fields(ctx, dc, sc, JS_UNDEFINED);
+    js_stack_take_fields(ctx, d, s, dstc);
+    if (sc != NULL) {
+        for (i = 0; i < sn; i++)
+            if (JS_VALUE_GET_TAG(d->prop[i].u.value) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(d->prop[i].u.value) == sc)
+                d->prop[i].u.value = dstc;
+    }
+    return 1;
+}
+
+/* A shell: a stack block of the caller's frame with room for `room` fields that is no object yet (shape NULL, every field undefined). A callee that returns an object of its own frame
+   fills it (qjs_aot_slot_fill) and the caller then owns a stack object; a shell nothing filled holds nothing and its release is the caller's no-op. JS_UNINITIALIZED when it does not fit. */
+QJS_AOT_STUB JSValue qjs_aot_stack_shell(void *buf, size_t bytes, uint32_t room)
+{
+    JSObject *p;
+    uint32_t i;
+    if (room == 0 || room > JS_OBJ_LEARNED_INLINE_MAX)
+        return JS_UNINITIALIZED;
+    p = js_stack_block(buf, bytes, offsetof(JSObject, u) + room * sizeof(JSProperty));
+    if (p == NULL)
+        return JS_UNINITIALIZED;
+    p->prop_inline_cap = room;
+    p->class_id = JS_CLASS_OBJECT;
+    p->arr_kind = JS_ARR_KIND_GENERIC;
+    p->extensible = true;
+    p->shape = NULL;
+    p->prop = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
+    for (i = 0; i < room; i++)
+        p->prop[i].u.value = JS_UNDEFINED;
+    return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+/* The stack object `src` of a returning function's frame (and the one stack object a field of it holds, `srcc`) becomes the object of the shell `slot` the caller gave: the shell takes the
+   shape and the field values (the references move), the stack child's contents move to a heap object that the shell's field holds, and `src` is left with undefined fields (its own release then
+   frees nothing). 1 when filled; 0 with nothing changed when `slot` is not an empty shell, the object does not fit its room, or `src` holds a stack object other than `srcc` (or `srcc` is
+   given and `src` does not hold it exactly once, or it holds a stack object); the caller then moves `src` to the heap as before. -1 on an out-of-memory, nothing changed. */
+QJS_AOT_STUB int qjs_aot_slot_fill(JSContext *ctx, JSValue slot, JSValue src, JSValue srcc)
+{
+    JSObject *d, *s, *sc = NULL;
+    JSValue hc = JS_UNDEFINED, ho, ha;
+    int i, sn, nsc = 0;
+    if (JS_VALUE_GET_TAG(slot) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(src) != JS_TAG_OBJECT)
+        return 0;
+    d = JS_VALUE_GET_OBJ(slot);
+    s = JS_VALUE_GET_OBJ(src);
+    if (d == s || JS_REF_COUNT(d) < JS_STACK_BIAS / 2 || d->shape != NULL || JS_REF_COUNT(s) < JS_STACK_BIAS / 2 || s->shape == NULL)
+        return 0;
+    sn = s->shape->prop_count;
+    if (sn > d->prop_inline_cap)
+        return 0;
+    if (JS_VALUE_GET_TAG(srcc) == JS_TAG_OBJECT) {
+        sc = JS_VALUE_GET_OBJ(srcc);
+        if (JS_REF_COUNT(sc) < JS_STACK_BIAS / 2 || sc->shape == NULL)
+            return 0;
+        for (i = 0; i < sc->shape->prop_count; i++) {
+            JSValue v = sc->prop[i].u.value;
+            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2)
+                return 0;
+        }
+    }
+    for (i = 0; i < sn; i++) {
+        JSValue v = s->prop[i].u.value;
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2) {
+            if (JS_VALUE_GET_OBJ(v) != sc)
+                return 0;
+            nsc++;
+        }
+    }
+    if ((sc != NULL) != (nsc == 1) || nsc > 1)
+        return 0;
+    if (sc != NULL && !js_stack_migrate2(ctx, JS_UNDEFINED, JS_UNDEFINED, srcc, &ho, &ha, &hc))
+        return -1;
+    d->shape = js_dup_shape(s->shape);
+    d->extensible = s->extensible;
+    for (i = 0; i < sn; i++) {
+        JSValue v = s->prop[i].u.value;
+        if (sc != NULL && JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(v) == sc)
+            v = hc;
+        d->prop[i].u.value = v;
+        s->prop[i].u.value = JS_UNDEFINED;
+    }
     return 1;
 }
 
@@ -67912,7 +68346,8 @@ int qjs_aot_apply_arguments(JSContext *ctx, JSRegRun *f, JSValue *window,
     return 1;
 }
 
-int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
+int qjs_aot_construct_this_cap(JSContext *ctx, JSObject *ctor, JSValue *out,
+                               uint32_t cap)
 {
     JSFunctionBytecode *cb;
     JSValue obj;
@@ -67923,12 +68358,27 @@ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
     if (cb->is_derived_class_constructor ||
         !(cb->aot_fn != NULL ? cb->aot_light : cb->regvm_light))
         return 0;
+    if (cap > cb->inst_inline_cap && cap <= JS_OBJ_LEARNED_INLINE_MAX) {
+        /* shapes double their property array, and an add that changes the size needs the inline capacity to cover it: a power of two */
+        uint32_t size = 1;
+
+        while (size < cap)
+            size *= 2;
+        cap = size;
+    } else {
+        cap = cb->inst_inline_cap;
+    }
     obj = js_create_from_ctor_cap(ctx, JS_MKPTR(JS_TAG_OBJECT, ctor),
-                                  JS_CLASS_OBJECT, cb->inst_inline_cap);
+                                  JS_CLASS_OBJECT, cap);
     if (JS_IsException(obj))
         return -1;
     *out = obj;
     return 1;
+}
+
+int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
+{
+    return qjs_aot_construct_this_cap(ctx, ctor, out, 0);
 }
 
 /* A constructor wrapper `function () { this.X.apply(this, arguments); }` (the generator recognises it by its register
