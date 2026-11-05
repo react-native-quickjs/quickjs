@@ -1,0 +1,38 @@
+Subject: The stack build compiles again: register-VM-only helpers are guarded
+
+What this does
+  - `regvm_frame_regs`, `regvm_line_key`, `js_array_cmp_numeric_shape` read fields of `JSFunctionBytecode` that exist only in a register build (`QJS_REGVM`); outside that build `regvm_frame_regs` is not compiled, `regvm_line_key` returns its argument and the comparator-shape probe returns 0 (no recognised shape, so `Array.prototype.sort` takes the generic path).
+  - `AOT_EPOCH_BUMP` has a stack-build definition (the epoch increment alone), so `ic_watchpoint_bump` compiles there.
+
+Why we need it
+  The shipping projection (`engine/quickjs-rel`, compiled without `QJS_REGVM`) did not compile: four helpers added by the register-VM series used register-only fields or a macro that is defined only in a register build. A stack build (Debug, Release, sanitizers, test262 stack, Android/iOS) stopped at the first of them.
+
+Failure
+  None at run time: the changes only remove code from, or add a no-op to, the build that could not be built before.
+
+Soundness
+  - A register build is unchanged (the guarded code is inside `#if QJS_REGVM`, which is true there).
+  - The stack build never had register programs, so `regvm_line_key`'s identity result and the comparator probe's 0 are the values it would have computed with empty fields.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2104,0 +2105 @@
++#if QJS_REGVM
+@@ -2112,0 +2114 @@
++#endif
+@@ -4926,0 +4929,4 @@
++#if !QJS_REGVM
++    (void)b;
++    return rpc;
++#else
+@@ -4935,0 +4942 @@
++#endif
+@@ -8783,0 +8791,2 @@
++#else
++#define AOT_EPOCH_BUMP(rt_, id_) do { (rt_)->aot_pic_epoch++; } while (0)
+@@ -91643,0 +91653,4 @@
++#if !QJS_REGVM
++    (void)b;
++    return 0;
++#else
+@@ -91681,0 +91695 @@
++#endif

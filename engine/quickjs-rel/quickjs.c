@@ -2102,6 +2102,7 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
    the count the unit compiled the body for when a unit is bound (see
    `regvm_light_scan`). Everything that sizes or scans a frame goes through this,
    so the unit's own array and the engine's arena frame cannot disagree. */
+#if QJS_REGVM
 static inline uint32_t regvm_frame_regs(const JSFunctionBytecode *b)
 {
     uint32_t n = b->regvm_reg_count > 0 ? (uint32_t)b->regvm_reg_count : 0;
@@ -2110,6 +2111,7 @@ static inline uint32_t regvm_frame_regs(const JSFunctionBytecode *b)
         n = b->regvm_light_scan;
     return n;
 }
+#endif
 
 #if QJS_AOT
 /* AOT runtime. `js_aot_digest` is the profiler digest, reused as the binding
@@ -4924,6 +4926,10 @@ static int regvm_light_var_bound(JSFunctionBytecode *b)
    instruction by its stack pc; the offset may point inside an instruction. */
 static uint32_t regvm_line_key(JSFunctionBytecode *b, uint32_t rpc)
 {
+#if !QJS_REGVM
+    (void)b;
+    return rpc;
+#else
     int32_t j = (int32_t)rpc;
 
     if (!b->regvm_src_pc || b->regvm_len <= 0)
@@ -4933,6 +4939,7 @@ static uint32_t regvm_line_key(JSFunctionBytecode *b, uint32_t rpc)
     while (j >= 0 && b->regvm_src_pc[j] < 0)
         j--;
     return j < 0 ? 0 : (uint32_t)b->regvm_src_pc[j];
+#endif
 }
 
 #if JS_ENABLE_DEBUGGER
@@ -8781,6 +8788,8 @@ static JSRegPIC *regvm_pic_ensure(JSRuntime *rt, JSFunctionBytecode *b)
     }
     return t;
 }
+#else
+#define AOT_EPOCH_BUMP(rt_, id_) do { (rt_)->aot_pic_epoch++; } while (0)
 #endif /* QJS_REGVM */
 
 #if JS_ENABLE_IC
@@ -24505,7 +24514,7 @@ static __exception int regvm_for_of_next(JSContext *ctx, JSValue *regs_sp,
                         value = JS_GetProperty(ctx, obj, JS_ATOM_value);
                     JS_FreeValue(ctx, obj);
                 }
-            } else if (done) {
+            } else if (done && !JS_IsException(value)) {
                 JS_FreeValue(ctx, value);
                 value = JS_UNDEFINED;
             }
@@ -75373,6 +75382,9 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
         !weak ||
         !init_set || !undef_set || !uni)
         goto done;
+    /* Both sets start empty: only registers proved to need a fill are marked. */
+    memset(init_set, REG_INIT_UNINIT, nreg);
+    memset(undef_set, REG_INIT_UNINIT, nreg);
 
     /* Block membership by source pc: the fusion passes append branch islands
        and stubs at the end of the IR with their block's `src_pc`, so the stream
@@ -76613,6 +76625,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
 
         if (bdef && bval && bpos && bcnt && touched && ins_lo && ins_hi && lreg) {
             int bb = 0;
+            /* The per-slot definition counters start at zero; only the touched
+               entries are reset after each block. */
+            memset(bcnt, 0, (size_t)(fd->var_count + 1) * sizeof(int));
             /* Bucket the instructions by block and record each block's
                contiguous range, so the per-block scans below touch each
                instruction once. */
@@ -91641,6 +91656,10 @@ fail:
    nothing. `1` is ascending, `-1` descending, `0` for any other program. */
 static int js_array_cmp_numeric_shape(JSFunctionBytecode *b)
 {
+#if !QJS_REGVM
+    (void)b;
+    return 0;
+#else
     const uint8_t *c;
     int len, p, sz, op;
     int ra0, ra1, sub_d, sub_l, sub_r;
@@ -91679,6 +91698,7 @@ static int js_array_cmp_numeric_shape(JSFunctionBytecode *b)
         return 0;
     /* `sub` subtracts its second source from its first: a - b ascends, b - a descends */
     return (sub_l == ra0) ? 1 : -1;
+#endif
 }
 
 /* Sorts `n` doubles, keeping equal values in their order: `tmp` is scratch of `n`

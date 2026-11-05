@@ -1,0 +1,26 @@
+Subject: Register analysis tables start zeroed instead of holding allocator garbage
+
+What this does
+  - `regvm_own_analyze` sets `init_set` and `undef_set` to `REG_INIT_UNINIT` right after their allocation succeeds.
+  - `js_regvm_encode` zeroes the per-slot definition counters `bcnt` before the first block is bucketed.
+
+Why we need it
+  Both arrays came from `js_malloc` and were read before every entry had been written: `init_set`/`undef_set` through the "needs a fill" test and `bcnt` through the per-block counters. Which registers were marked, and how the definitions were bucketed, depended on what the allocator happened to return.
+
+Failure
+  Valgrind reported conditional jumps on uninitialised values in these two functions for ordinary register-build programs, which also masked every other finding in a valgrind sweep of the kit cases. The effect on code was a register spuriously treated as needing a fill (a wasted store) or, for `bcnt`, a mis-sized bucket.
+
+Soundness
+  - The all-clear values are the ones the code already assumes ("only registers proved to need a fill are marked"; "counters start at zero").
+  - Registers that were marked by the garbage and are not marked now are ones the analysis never proved; every proved one is still marked by the existing code.
+  - Allocation size and lifetime are unchanged, and no stack-build code is touched.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -75384,0 +75385,3 @@
++    /* Both sets start empty: only registers proved to need a fill are marked. */
++    memset(init_set, REG_INIT_UNINIT, nreg);
++    memset(undef_set, REG_INIT_UNINIT, nreg);
+@@ -76624,0 +76628,3 @@
++            /* The per-slot definition counters start at zero; only the touched
++               entries are reset after each block. */
++            memset(bcnt, 0, (size_t)(fd->var_count + 1) * sizeof(int));

@@ -1,0 +1,19 @@
+Subject: A `for-of` over a generator that throws keeps its exception
+
+What this does
+  - `regvm_for_of_next`'s inline path for a plain generator frees the value `js_generator_next` returned when the generator is done. It now does so only when that value is not the pending exception.
+
+Why we need it
+  A generator that throws while `for-of` drives it returns `JS_EXCEPTION` with `done` set. The path treated that as a finished generator's return value and freed it, which discarded the exception record: the loop ended as if the generator had completed, and the error was lost or surfaced as an unrelated one.
+
+Failure
+  `function* g() { yield 1; throw new Error('x'); } for (const v of g()) ;` must throw `x`. In a register build it finished silently. The register-build test262 run showed 424 failures against a baseline of 50, all generator/for-of tests that expect the throw.
+
+Soundness
+  - `JS_IsException(value)` is a tag compare on a value the function already holds; the done-and-not-exception path is unchanged, and an exception falls through to the existing `done < 0` handling just below.
+  - Only the register VM contains this function; the stack build is unaffected.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -24517 +24517 @@
+-            } else if (done) {
++            } else if (done && !JS_IsException(value)) {

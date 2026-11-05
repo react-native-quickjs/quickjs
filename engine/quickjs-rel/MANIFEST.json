@@ -1823,12 +1823,24 @@
       "sha256": "fad247283e763b519eb0ff9e2cf25545e0d8f25fb19f2d07141f9725d3bc5e50"
     },
     {
+      "name": "0462-stack-build-regvm-guards.patch",
+      "sha256": "373e79cadc0d11798d1b4b3ed8a34c29d1ebb8593c0b04cbf3a26096311f8abb"
+    },
+    {
+      "name": "0463-for-of-generator-exception.patch",
+      "sha256": "a8294954d607267aa3dba6a1ce389279682ed78dec642ebb7277d9bff4e84f53"
+    },
+    {
+      "name": "0464-register-analysis-tables-zeroed.patch",
+      "sha256": "0a52914608e939e2f35c208d17f648925dbd269ad4d5ea330472db0d37c370ac"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "ce8b3e5c19a1a64d2862bc88e64abab487750bd1b628958bb3b403f14e7e7d0c",
+    "quickjs.c": "a2b196ac39cdd2ad36b3d88077d974f6494a8b550ab22b1508ddcf253686f653",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
