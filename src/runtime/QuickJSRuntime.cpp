@@ -650,11 +650,11 @@ void QuickJSRuntime::drainPendingReleases() noexcept {
     JS_FreeAtomRT(runtime_, atom);
   }
   for (QuickJSPointerValue *pv : pointerValues) {
-    pv->nextFree_ = freeValues_;
+    setNext(pv, freeValues_);
     freeValues_ = pv;
   }
   for (QuickJSAtomPointerValue *pv : atomPointerValues) {
-    pv->nextFree_ = freeAtoms_;
+    setNext(pv, freeAtoms_);
     freeAtoms_ = pv;
   }
 }
@@ -665,7 +665,7 @@ void QuickJSRuntime::refillValueSlab() {
   valueSlabs_.push_back(slab);
   for (size_t i = 0; i < kPointerValueSlabSize; ++i) {
     auto *slot = slab + i;
-    slot->nextFree_ = freeValues_;
+    setNext(slot, freeValues_);
     freeValues_ = slot;
   }
 }
@@ -676,7 +676,7 @@ void QuickJSRuntime::refillAtomSlab() {
   atomSlabs_.push_back(slab);
   for (size_t i = 0; i < kPointerValueSlabSize; ++i) {
     auto *slot = slab + i;
-    slot->nextFree_ = freeAtoms_;
+    setNext(slot, freeAtoms_);
     freeAtoms_ = slot;
   }
 }

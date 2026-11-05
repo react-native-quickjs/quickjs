@@ -884,7 +884,7 @@ void e_roles_check(void) {
   if (missing || mismatch) {
     fprintf(stderr, "e_roles: %d missing, %d inconsistent; run gen-roles.py\n",
             missing, mismatch);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
 }
 

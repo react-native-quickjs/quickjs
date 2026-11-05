@@ -1,0 +1,20 @@
+Subject: JS_ComputeMemoryUsage does not read class data of a plain object
+
+What this does
+  - `JS_ComputeMemoryUsage` has a case for `JS_CLASS_OBJECT` that counts nothing, ahead of the default case.
+
+Why we need it
+  The default case treated `p->u.opaque` as an allocated block. A plain object has no class data, and an object made with inline property room is allocated as `offsetof(JSObject, u) + cap * sizeof(JSProperty)`: its `u` area is the first property slots (or nothing, when the capacity is zero), so the read took a property value for a pointer or ran past the allocation.
+
+Failure
+  `CDPTest.EveryAdvertisedMethodIsImplemented` (`Runtime.getHeapUsage` through `JS_ComputeMemoryUsage`) reported a heap-buffer-overflow of 8 bytes at the `p->u.opaque` read under AddressSanitizer on Linux (the ASan ctest of the checkpoint run, finding F11).
+
+Soundness
+  - Memory statistics only; no allocation, ownership or object state changes.
+  - Other classes keep their cases.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -12128,0 +12129,2 @@
++            break;
++        case JS_CLASS_OBJECT:            /* no class data: the union is not used */

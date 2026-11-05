@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <new>
@@ -122,10 +123,7 @@ class QuickJSRuntime : public jsi::Runtime {
 
     QuickJSRuntime &runtime_;
     bool owned_;
-    union {
-      JSValue value_;
-      QuickJSPointerValue *nextFree_;
-    };
+    JSValue value_;
   };
 
   /// Backing store for jsi::PropNameID. Atoms are interned and comparable by
@@ -149,10 +147,7 @@ class QuickJSRuntime : public jsi::Runtime {
     ~QuickJSAtomPointerValue() override = default;
 
     QuickJSRuntime &runtime_;
-    union {
-      JSAtom atom_;
-      QuickJSAtomPointerValue *nextFree_;
-    };
+    JSAtom atom_;
   };
 
   /// Safe to call from any thread: an off-thread release is queued and freed on
@@ -440,6 +435,19 @@ class QuickJSRuntime : public jsi::Runtime {
     JSValue *values_{inline_};
   };
 
+  // The free lists of the two slabs thread through slots that hold no live object: the link is the slot's first word, written and read as
+  // bytes. (Reading it through a member of a not-yet-constructed object is a lifetime violation that -fsanitize=vptr reports.)
+  template <class T>
+  static T *nextOf(T *slot) noexcept {
+    T *next;
+    std::memcpy(&next, static_cast<void *>(slot), sizeof(next));
+    return next;
+  }
+  template <class T>
+  static void setNext(T *slot, T *next) noexcept {
+    std::memcpy(static_cast<void *>(slot), &next, sizeof(next));
+  }
+
   // Pooled: one PointerValue per jsi value crossing the boundary, and
   // new/delete measured ~20 ns against a ~4.5 ns property lookup. Inline
   // because the call itself was a measurable part of that cost.
@@ -448,7 +456,7 @@ class QuickJSRuntime : public jsi::Runtime {
       refillValueSlab();
     }
     QuickJSPointerValue *slot = freeValues_;
-    freeValues_ = slot->nextFree_;
+    freeValues_ = nextOf(slot);
     return new (static_cast<void *>(slot))
         QuickJSPointerValue(*this, value, owned);
   }
@@ -458,13 +466,13 @@ class QuickJSRuntime : public jsi::Runtime {
       refillAtomSlab();
     }
     QuickJSAtomPointerValue *slot = freeAtoms_;
-    freeAtoms_ = slot->nextFree_;
+    freeAtoms_ = nextOf(slot);
     return new (static_cast<void *>(slot)) QuickJSAtomPointerValue(*this, atom);
   }
 
   void recyclePointerValue(QuickJSPointerValue *pv) noexcept {
     if (isOnJSThread()) {
-      pv->nextFree_ = freeValues_;
+      setNext(pv, freeValues_);
       freeValues_ = pv;
       return;
     }
@@ -473,7 +481,7 @@ class QuickJSRuntime : public jsi::Runtime {
 
   void recycleAtomPointerValue(QuickJSAtomPointerValue *pv) noexcept {
     if (isOnJSThread()) {
-      pv->nextFree_ = freeAtoms_;
+      setNext(pv, freeAtoms_);
       freeAtoms_ = pv;
       return;
     }

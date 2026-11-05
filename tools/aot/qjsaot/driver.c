@@ -2785,7 +2785,9 @@ int qjsaot_driver_main(int argc, char **argv) {
           mf = open_memstream(&tb, &tl);
           if (!mf) continue;
           whys[i][0] = 0;
+          e_fatal_reset(); e_fatal_set_hex(hex);
           ok = e_emit_inline_func(mf, &funcs[i], hex, whys[i], 160);
+          if (e_fatal_taken()) ok = 0;   /* refused by e_fatal */
           fclose(mf);
           g_inl_try[i] = ok ? 1 : 2;
           if (ok && (sweep == E_INL_SWEEPS - 1 || !e_inline_pending())) {
@@ -2826,8 +2828,15 @@ int qjsaot_driver_main(int argc, char **argv) {
         fails++;
         continue;
       }
+      e_fatal_reset(); e_fatal_set_hex(hex);
       ninsn = e_emit_body(mf, &funcs[i], hex);
       fclose(mf);
+      if (e_fatal_taken()) {   /* refused by e_fatal: no body, the function runs in the engine */
+        free(eb[i].buf);
+        eb[i].buf = NULL;
+        eb[i].len = 0;
+        continue;
+      }
       if (ninsn < 0) {
         fprintf(
             stderr, "qjsaot: malformed program in %s (%s)\n",
@@ -2947,6 +2956,30 @@ int qjsaot_driver_main(int argc, char **argv) {
             if (best < 0) break;
             sel[best] = 0;
             est_bytes -= (long)eb[best].len;
+          }
+        }
+        /* bisect aid: QJS_AOT_SEL_RANGE=lo:hi keeps only the selected functions whose ordinal (in selection order) is in [lo,hi);
+           the dependency pass below then drops what cannot stay. QJS_AOT_SEL_RANGE=count prints the selected total. */
+        {
+          const char *rg = getenv("QJS_AOT_SEL_RANGE");
+          if (rg != NULL) {
+            long lo = 0, hi = 0, ord = 0, total = 0;
+            for (k = 0; k < nuniq; k++) total += sel[uniq[k]] ? 1 : 0;
+            if (strchr(rg, ':') != NULL) {
+              for (k = 0; k < nuniq; k++) {
+                const char *t = rg;
+                int keep = 0;
+                if (!sel[uniq[k]]) continue;
+                while (t != NULL && *t != '\0') {
+                  if (sscanf(t, "%ld:%ld", &lo, &hi) == 2 && ord >= lo && ord < hi) keep = 1;
+                  t = strchr(t, ',');
+                  if (t != NULL) t++;
+                }
+                if (!keep) sel[uniq[k]] = 0;
+                ord++;
+              }
+            }
+            fprintf(stderr, "qjsaot: QJS_AOT_SEL_RANGE: %ld functions selected before the range\n", total);
           }
         }
         /* a body whose exits name another function's resume or generic body (a region's expanded callees, a resumable copy's callee) cannot stay when that function is not in the unit

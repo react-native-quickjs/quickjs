@@ -94,6 +94,7 @@ typedef struct RInst {
   int wr_uninit_pc, wr_put_pc, wr_read_pc;
   char wr_method[40];   /* the pcs of its local_uninit, put_local_s0 and the read of `this.m` */
   uint8_t rty;            /* F64: the type of this instance's result (RT_*; RT_ANY or 0 when it is a JSValue `res`) */
+  int *idom, curb;        /* F21: the immediate dominators of the blocks (computed on first use), and the block being walked */
   uint8_t *ty, *rw;       /* F64 (region_fn_var.inc): the type of each value (RT_*), and whether a double was made by + - * neg inc dec (stored as the engine stores it, not normalised) */
 } RInst;
 
@@ -204,6 +205,10 @@ typedef struct RCtx {
   struct RDsh { int k, nn; char names[32][40]; } dsh[48]; int ndsh;
   unsigned dsx_ep; struct { int inst, base; unsigned ep; int var; } dsx[96]; int ndsx; int ndx;
   unsigned lent;   /* the parameters of the root that it only reads, so a caller may lend its stack objects to them (rg_lent_mask) */
+  /* F21: the root arguments whose value a trusted fixed-slot access depends on, tested once at the entry (an object of one of the classes the accesses assume), and the accesses
+     refused trust because their receiver is neither made by the region nor tied to such an argument (the dominance check, QJS_AOT_REGION_DOMCHECK) */
+  unsigned ra_mask, ra_cls[8]; int ra_any[8]; int ra_flag, ra_site;
+  struct { int inst, blk; char val[40]; } ck[96]; int nck;   /* receivers already tested, and the block of the test: an access dominated by it tests nothing */
 } RCtx;
 
 static RCtx *g_rgc;       /* the region being compiled (the field-position query registers the classes it relies on) */
@@ -904,8 +909,8 @@ static int rg_xit_x(RCtx *c, int ii, int pc) {
         if (e->creg >= 0) {
           pmsave[npm].I = X; pmsave[npm].reg = e->creg; memcpy(pmsave[npm].old, X->cur[e->creg], 40); npm++;
           { int pi_; for (pi_ = 0; pi_ < c->npmn && strcmp(c->pmn[pi_], e->name) != 0; pi_++) {}
-            if (pi_ == c->npmn) { if (pi_ >= 64) { fprintf(stderr, "qjsaot: FATAL more than 64 distinct pending-pair method names in one region\n"); abort(); } snprintf(c->pmn[pi_], 40, "%s", e->name); c->npmn++; }
-            if (snprintf(X->cur[e->creg], 40, "RG_PM(%s,%d)", e->recv, pi_) >= 40) { fprintf(stderr, "qjsaot: FATAL pending-pair callee text overflows the 40-char slot: RG_PM(%s,%d)\n", e->recv, pi_); abort(); } }
+            if (pi_ == c->npmn) { if (pi_ >= 64) { e_fatal("more than 64 distinct pending-pair method names in one region", NULL); pi_ = 0; } snprintf(c->pmn[pi_], 40, "%s", e->name); c->npmn++; }
+            if (snprintf(X->cur[e->creg], 40, "RG_PM(%s,%d)", e->recv, pi_) >= 40) { fprintf(stderr, "qjsaot: FATAL pending-pair callee text overflows the 40-char slot: RG_PM(%s,%d)\n", e->recv, pi_); e_fatal("pending-pair callee text overflows its slot", NULL); } }
         }
         if (e->treg >= 0 && e->this_t[0]) {
           pmsave[npm].I = X; pmsave[npm].reg = e->treg; memcpy(pmsave[npm].old, X->cur[e->treg], 40); npm++;
@@ -1108,9 +1113,76 @@ static void rg_lookup(RCtx *c, int gi, const char *val, const char *xl, const ch
 static int g_rg_plain; /* the last trusted field holds only values that are not reference counted */
 static unsigned g_rg_cls; /* ... and the whole-program kinds of the last trusted field (bundle.c K_*): F64 stores narrow into a field that may be claimed an int */
 static int rg_atom_n(const Q2Insn *in, int which, char *out, size_t cap);
+
+/* F21: where a receiver of a trusted fixed-slot access comes from. A trusted access reads a header and a slot with no tag or shape test, so the receiver must be an object of the
+   class the access assumes. 1: it is (made by this region, a field the claims cover, the dispatch's `this`, or a root `this`, which the entry takes as an object). 2: it is the root
+   argument *arg, which the entry tests once. 0: nothing proves it (a call result, an element, a merge of values, an argument of a caller that does not prove it). */
+static char g_ro_why[40];
+/* the receiver tests are off for the vkit knock-outs: QJS_AOT_REGION_NOF21GUARD=1, and QJS_AOT_FACTS_OFF=layout (the tests guard the same assumption as the layout fact, an instance of the class shape) */
+static int rg_f21_off(void) { const char *fo = getenv("QJS_AOT_FACTS_OFF"); return getenv("QJS_AOT_REGION_NOF21GUARD") != NULL || getenv("QJS_AOT_REGION_NOLAYOUTDEP") != NULL || (fo != NULL && strstr(fo, "layout") != NULL); }
+static int g_rg_chk;          /* the access just trusted has a receiver nothing proves: the emitter tests it first (rg_recv_guard) */
+static unsigned g_rg_chk_km;  /* ... against the shapes of these classes (a bit per class-table index), any object when 0 */
+static int rg_recv_origin(RCtx *c, const RInst *I, Q2ValueId v, unsigned *amask, int depth) {
+  int guard, di, s0;
+  const Q2Insn *d = NULL;
+  if (depth > 16) { snprintf(g_ro_why, sizeof(g_ro_why), "too deep"); return 0; }
+  for (guard = 0; guard < 64; guard++) {
+    if ((int32_t)v < 0 || (int32_t)v >= I->q.nvalues) return 0;
+    di = I->q.values[v].insn;
+    if (di < 0 || di >= I->q.ninsns) break;
+    d = &I->q.insns[di];
+    if ((d->rop == ROP_move || d->rop == ROP_move_s || d->rop == ROP_move_xfer) && d->nuse >= 1) { v = d->use[0]; continue; }
+    break;
+  }
+  if (di < 0 || di >= I->q.ninsns) { snprintf(g_ro_why, sizeof(g_ro_why), "block parameter"); return 0; }
+  switch (d->rop) {
+    case ROP_load_this: return 1;
+    case ROP_get_this_field: case ROP_get_this_field2:
+      if (d->ndef >= 2 && d->def[1] == v) return 1;   /* the copy of `this` */
+      snprintf(g_ro_why, sizeof(g_ro_why), "field value");
+      return 0;
+    case ROP_construct: case ROP_new_object: case ROP_object_template: case ROP_array_from: return 1;
+    case ROP_get_field2: case ROP_get_field2_own:
+      if (d->ndef >= 2 && d->def[1] == v && d->nuse >= 1) return rg_recv_origin(c, I, d->use[0], amask, depth + 1);
+      snprintf(g_ro_why, sizeof(g_ro_why), "field value");
+      return 0;
+    case ROP_get_field: case ROP_get_field_own: case ROP_get_field_chain: case ROP_get_field_chain_own:
+      snprintf(g_ro_why, sizeof(g_ro_why), "field value");
+      return 0;
+    case ROP_get_element: snprintf(g_ro_why, sizeof(g_ro_why), "array element"); return 0;
+    case ROP_get_global: snprintf(g_ro_why, sizeof(g_ro_why), "global value"); return 0;
+    case ROP_call: case ROP_call_method: snprintf(g_ro_why, sizeof(g_ro_why), "call result"); return 0;
+    case ROP_get_arg: case ROP_get_arg2: {
+      char *e;
+      long ci, vid;
+      s0 = d->narg > 1 ? (int)d->arg[1].val : 0;
+      if (d->rop == ROP_get_arg2 && d->ndef >= 2 && d->def[1] == v && d->narg > 3) s0 = (int)d->arg[3].val;
+      if (s0 < 0 || s0 > 7) return 0;
+      if (I->id == 0) {
+        int k;
+        for (k = 0; k < I->q.ninsns; k++) {
+          int rp = I->q.insns[k].rop;
+          if (rp == ROP_put_arg || rp == ROP_put_arg_xfer || rp == ROP_apply_arguments) { snprintf(g_ro_why, sizeof(g_ro_why), "assigned argument"); return 0; }   /* the entry value is not the value at the access */
+        }
+        *amask |= 1u << s0;
+        return 2;
+      }
+      if (s0 >= I->nargs || I->arg[s0][0] != 'r') { snprintf(g_ro_why, sizeof(g_ro_why), "missing argument"); return 0; }
+      ci = strtol(I->arg[s0] + 1, &e, 10);
+      if (e == I->arg[s0] + 1 || e[0] != '_' || e[1] != 'v') return 0;
+      vid = strtol(e + 2, &e, 10);
+      if (*e != 0 || ci < 0 || ci >= c->nin || c->in[ci] == I) return 0;
+      return rg_recv_origin(c, c->in[ci], (Q2ValueId)vid, amask, depth + 1);
+    }
+    default: e_rop_name(d->rop, g_ro_why, sizeof(g_ro_why)); return 0;
+  }
+}
 static int rg_trust_field_n(const RInst *I, const Q2Insn *in, int write, const char *name, char *buf, size_t cap) {
   int slot, add = 0;
   unsigned cls = 0;
+  int org = 1;
+  unsigned oam = 0, km = 0;
+  g_rg_chk = 0;
   if (qjsaot_region_mode() != 2) return 0;
   if (I->cls1 > 0) {
     char nm_[48];
@@ -1134,6 +1206,23 @@ static int rg_trust_field_n(const RInst *I, const Q2Insn *in, int write, const c
     if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "why: %s pc %d .%s: no single position (add=%d)\n", I->g->name, in->pc, name ? name : "?", add);
     return 0;
   }
+  if (g_rgc != NULL && !rg_f21_off() && in->nuse >= 1) {
+    /* the access reads a header and a slot with no test: the receiver has to be proven an object of the assumed class (see rg_recv_origin) */
+    Q2ValueId rv = in->use[0];
+    int chain2 = 0;
+    char n2_[48], n1_[48];
+    if ((in->rop == ROP_get_field_chain || in->rop == ROP_get_field_chain_own) && name != NULL && rg_atom_n(in, 1, n2_, sizeof(n2_)) && strcmp(n2_, name) == 0 && rg_atom_n(in, 0, n1_, sizeof(n1_)) && strcmp(n1_, name) != 0) chain2 = 1;
+    if (chain2) org = 0;   /* the receiver of the second read is the first read's value */
+    else { g_ro_why[0] = 0; org = rg_recv_origin(g_rgc, I, rv, &oam, 0); }
+    if (org == 0) {
+      /* nothing proves the receiver: the access stays trusted (a fixed slot) behind a test of the receiver made where the access is emitted */
+      if (!g_rgc->emit) {
+        g_rgc->ra_flag++;
+        if (getenv("QJS_AOT_REGION_DOMCHECK") != NULL) fprintf(stderr, "domcheck: %s pc %d .%s: the receiver (%s) is not proven an object of the assumed class; it is tested at the access\n", I->g->name ? I->g->name : "?", in->pc, name ? name : "?", g_ro_why[0] ? g_ro_why : "field of unproven kind");
+      }
+      g_rg_chk = 1;
+    }
+  }
   if (g_rgc != NULL) {
     /* the read is at a fixed slot with no check: every class that can reach it is in the class table, whose layouts the word depends on (an instance that
        leaves its class shape breaks the word before the next entry) */
@@ -1151,6 +1240,16 @@ static int rg_trust_field_n(const RInst *I, const Q2Insn *in, int write, const c
         continue;   /* test knob: bind the tables, access the base fields unguarded (UNSOUND for a base field that is deleted or reordered) */
       }
       g_rgc->cls[k].need_layout = 1;
+      km |= k < 32 ? 1u << k : 0;
+    }
+  }
+  if (g_rg_chk) g_rg_chk_km = km;
+  if (org == 2 && oam != 0) {
+    /* the receiver comes from root arguments (directly, or through merges, expanded calls and inlined parameters): the entry tests each one (an object, of one of the classes assumed here) */
+    int oa_;
+    for (oa_ = 0; oa_ < 8; oa_++) if ((oam >> oa_) & 1u) {
+      g_rgc->ra_mask |= 1u << oa_;
+      if (km != 0) g_rgc->ra_cls[oa_] |= km; else g_rgc->ra_any[oa_] = 1;
     }
   }
   snprintf(buf, cap, "%du * QJS_AOT_SIZEOF_JSPROPERTY", slot);
@@ -1159,7 +1258,59 @@ static int rg_trust_field_n(const RInst *I, const Q2Insn *in, int write, const c
   return 1;
 }
 static int rg_trust_field(const RInst *I, const Q2Insn *in, int write, char *buf, size_t cap) { return rg_trust_field_n(I, in, write, NULL, buf, cap); }
-static void rg_verify(RCtx *c, const RInst *I, const Q2Insn *in, int write, const char *val, const char *nm, const char *off) {
+/* F21: the test of a receiver nothing proves, emitted before the first trusted access on it in a stretch: an object, and of one of the classes the access assumes. */
+static int rg_dominates(RInst *I, int a, int b) {
+  Q2Func *fn = &I->q;
+  int i, ch;
+  if (a == b) return 1;
+  if (a < 0 || b < 0 || a >= fn->nblocks || b >= fn->nblocks || fn->rpo == NULL || fn->rpo_pos == NULL) return 0;
+  if (I->idom == NULL) {
+    I->idom = malloc((size_t)fn->nblocks * sizeof(int));
+    if (I->idom == NULL) abort();
+    for (i = 0; i < fn->nblocks; i++) I->idom[i] = -1;
+    if (fn->nrpo > 0) I->idom[fn->rpo[0]] = fn->rpo[0];
+    do {
+      ch = 0;
+      for (i = 1; i < fn->nrpo; i++) {
+        int bb = fn->rpo[i], nd = -1, k;
+        if (fn->blocks[bb].resume) continue;
+        for (k = 0; k < fn->blocks[bb].npreds; k++) {
+          int pr = fn->blocks[bb].preds[k], x, y;
+          if (pr < 0 || pr >= fn->nblocks || fn->rpo_pos[pr] < 0 || I->idom[pr] < 0) continue;
+          if (nd < 0) { nd = pr; continue; }
+          x = pr; y = nd;
+          while (x != y) {
+            while (fn->rpo_pos[x] > fn->rpo_pos[y]) { x = I->idom[x]; if (x < 0) break; }
+            if (x < 0) break;
+            while (fn->rpo_pos[y] > fn->rpo_pos[x]) { y = I->idom[y]; if (y < 0) break; }
+            if (y < 0) { x = -1; break; }
+          }
+          nd = x;
+          if (nd < 0) break;
+        }
+        if (nd >= 0 && I->idom[bb] != nd) { I->idom[bb] = nd; ch = 1; }
+      }
+    } while (ch);
+  }
+  for (i = 0; b != a && i < fn->nblocks; i++) { b = I->idom[b]; if (b < 0 || I->idom[b] == b) return b == a; }
+  return b == a;
+}
+static void rg_recv_guard(RCtx *c, RInst *I, const char *val, const char *xl) {
+  int i, k, first = 1;
+  if (!g_rg_chk || !c->emit) return;
+  for (i = 0; i < c->nck; i++) if (c->ck[i].inst == I->id && strcmp(c->ck[i].val, val) == 0 && rg_dominates(I, c->ck[i].blk, I->curb)) return;
+  fprintf(c->o, "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT", val);
+  if (g_rg_chk_km != 0) {
+    fprintf(c->o, " || (");
+    for (k = 0; k < 32; k++) if ((g_rg_chk_km >> k) & 1u) { fprintf(c->o, "%s*(const void *const *)((const char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_SHAPE) != rk_s_%s[%d]", first ? "" : " && ", val, c->hex, k); first = 0; }
+    fprintf(c->o, ")");
+  }
+  fprintf(c->o, ", 0)) goto %s;\n", xl);
+  i = c->nck < 96 ? c->nck++ : 0;
+  c->ck[i].inst = I->id; c->ck[i].blk = I->curb; snprintf(c->ck[i].val, sizeof(c->ck[i].val), "%s", val);
+}
+static void rg_verify(RCtx *c, RInst *I, const Q2Insn *in, int write, const char *val, const char *nm, const char *off, const char *xl) {
+  rg_recv_guard(c, I, val, xl);
   if (getenv("QJS_AOT_REGION_VERIFY") == NULL) return;
   fprintf(c->o, "        rg_vf_%s(ctx, %s, \"%s\", %s, %d, %d, \"%s\");\n", c->hex, val, nm, off, write, in->pc, I->g->name ? I->g->name : "?");
 }
@@ -1668,11 +1819,17 @@ static int rg_returned(const Q2Func *fn, Q2ValueId v0) {
 
 /* Whether the object a site of instance ii makes (value v) can still be live when the site runs again: within one run of ii only when the site is in a
    loop of ii and the value is carried over a back edge; in a later run (ii expanded in a loop above) only when ii returns it and the caller keeps it so. */
+/* Whether the block that defines value v of fn lies in a loop of fn. The instance flag `curloop` is set while a block is being emitted, which is after the stack-object decision
+   asks: for a construct directly in a loop of the root function it was still 0 there, and an object carried over the back edge was taken for one that is not. */
+static int rg_val_in_loop(const Q2Func *fn, int v) {
+  if (v < 0 || v >= fn->nvalues) return 1;
+  return rg_in_loop(fn, fn->values[v].block);
+}
 static int rg_carried_up(RCtx *c, int ii, int v) {
   for (;;) {
     RInst *I = c->in[ii];
     if (rg_trust_on()) {
-      if (I->curloop && rg_carried(&I->q, (Q2ValueId)v)) return 1;
+      if ((I->curloop || (getenv("QJS_AOT_KO_CURLOOP") == NULL && rg_val_in_loop(&I->q, v))) && rg_carried(&I->q, (Q2ValueId)v)) return 1;
       if (ii == 0 || I->par < 0 || !rg_returned(&I->q, (Q2ValueId)v)) return 0;
     } else {
       if (rg_carried(&I->q, (Q2ValueId)v)) return 1;
@@ -2676,6 +2833,7 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
        its back edges poll (below) with the instance's frame state, the chain of frames materialised at the poll exit */
     if (c->emit) fprintf(o, "        %sB%d: (void)0;\n", I->pfx, b);
     c->dsx_ep++;   /* a block start ends the stretch of a shape test (T13) */
+    I->curb = b;
     if (b >= 128) return rg_fail(c, "too many blocks");
     I->curloop = rg_in_loop(fn, b);
     if (I->cur != NULL) {
@@ -2909,7 +3067,7 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
               int tr_ = rg_trust_field(I, in, 0, to_, sizeof(to_));
               if (I->owner_g < 0) { fprintf(o, "        %sv%d = %s;\n", I->pfx, dv2, I->self); if (!tr_) rg_lookup(c, gq, I->self, xl, "        "); }
               else fprintf(o, "        %sv%d = %s;\n", I->pfx, dv2, I->self);
-              if (tr_) { rg_verify(c, I, in, 0, I->self, nm, to_); rg_inv_read(c, I, o, dv, I->self, to_, nm); }
+              if (tr_) { rg_verify(c, I, in, 0, I->self, nm, to_, xl); rg_inv_read(c, I, o, dv, I->self, to_, nm); }
               else fprintf(o, "        %sv%d = *q2_slotp(%s, rg_off_%s_%d[gix_%d][%d]);\n", I->pfx, dv, I->self, c->hex, gq, gq, qq);
               if (rg_inv_has(c, I->self)) { snprintf(tmp_, sizeof(tmp_), "%sv%d", I->pfx, dv2); rg_inv_add(c, tmp_); rg_orig_set(c, tmp_, rg_orig(c, I->self)); }
             }
@@ -2977,7 +3135,7 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
               char to_[64];
               int tr_ = rg_trust_field_n(I, in, 0, n1, to_, sizeof(to_));
               if (!(is_this && I->owner_g >= 0)) fprintf(o, "        {\n"), (tr_ ? (void)0 : rg_lookup(c, gq, val, xl, "        "));
-              if (tr_) { rg_verify(c, I, in, 0, val, n1, to_); rg_inv_read(c, I, o, dv, val, to_, n1); }
+              if (tr_) { rg_verify(c, I, in, 0, val, n1, to_, xl); rg_inv_read(c, I, o, dv, val, to_, n1); }
               else fprintf(o, "        %sv%d = *q2_slotp(%s, rg_off_%s_%d[gix_%d][%d]);\n", I->pfx, dv, val, c->hex, gq, gq, qq);
             }
             if (!(is_this && I->owner_g >= 0)) fprintf(o, "        }\n");
@@ -3013,7 +3171,7 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
               if (qq < 0 && !tr2_) return rg_fail(c, "pc %d: .%s has no verified position", in->pc, n2);
               snprintf(val, sizeof(val), "%sv%d", I->pfx, dv);
               fprintf(o, "        {\n");
-              if (tr2_) { rg_verify(c, I, in, 0, val, n2, t2_); rg_inv_read(c, I, o, dv2, val, t2_, n2); fprintf(o, "        }\n"); }
+              if (tr2_) { rg_verify(c, I, in, 0, val, n2, t2_, xl); rg_inv_read(c, I, o, dv2, val, t2_, n2); fprintf(o, "        }\n"); }
               else { rg_lookup(c, gq, val, xl, "        ");
               fprintf(o, "        %sv%d = *q2_slotp(%s, rg_off_%s_%d[gix_%d][%d]);\n        }\n", I->pfx, dv2, val, c->hex, gq, gq, qq); }
             }
@@ -3112,7 +3270,7 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
               char to_[64];
               int tr_ = rg_trust_field(I, in, 0, to_, sizeof(to_));
               if (!(is_this && I->owner_g >= 0)) fprintf(o, "        {\n"), (tr_ ? (void)0 : rg_lookup(c, gq, val, xl, "        "));
-              if (tr_) { rg_verify(c, I, in, 0, val, nm, to_); rg_inv_read(c, I, o, dv, val, to_, nm); }
+              if (tr_) { rg_verify(c, I, in, 0, val, nm, to_, xl); rg_inv_read(c, I, o, dv, val, to_, nm); }
               else fprintf(o, "        %sv%d = *q2_slotp(%s, rg_off_%s_%d[gix_%d][%d]);\n", I->pfx, dv, val, c->hex, gq, gq, qq);
             }
             if (!(is_this && I->owner_g >= 0)) fprintf(o, "        }\n");
@@ -3177,7 +3335,7 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
               if (wdisp_ == 2) rg_add_off(c, val, &ad_, xd_);
               else rg_disp_off(c, I, val, rg_base(fn, (Q2ValueId)u0), &wd_, xd_);
               snprintf(off, sizeof(off), "off_");
-            } else if (rg_trust_field(I, in, 1, off, sizeof(off))) rg_verify(c, I, in, 1, val, nm, off);
+            } else if (rg_trust_field(I, in, 1, off, sizeof(off))) rg_verify(c, I, in, 1, val, nm, off, xl);
             else {
               if (!(is_this && I->owner_g >= 0)) rg_lookup(c, gq, val, xl, "        ");
               snprintf(off, sizeof(off), "rg_off_%s_%d[gix_%d][%d]", c->hex, gq, gq, qq);
@@ -4072,7 +4230,7 @@ static void rg_emit_init(RCtx *c) {
       fprintf(o, "  { JSValue i_ = JS_CallConstructor(ctx, F, 0, NULL); if (JS_IsException(i_)) JS_FreeValue(ctx, JS_GetException(ctx)); else { const void *is_ = *(const void *const *)((const char *)JS_VALUE_GET_PTR(i_) + QJS_AOT_OFF_JSOBJECT_SHAPE);\n");
       fprintf(o, "    fprintf(stderr, \"shapecheck %s %%s: instance %%p class %%p props %%d/%%d\\n\", is_ == rk_s_%s[%d] ? \"SAME\" : \"DIFFERENT\", is_, rk_s_%s[%d], *(const int *)((const unsigned char *)is_ + QJS_AOT_OFF_JSSHAPE_PROP_COUNT), *(const int *)((const unsigned char *)rk_s_%s[%d] + QJS_AOT_OFF_JSSHAPE_PROP_COUNT)); JS_FreeValue(ctx, i_); } }\n", K->ctor, h, k, h, k, h, k);
     }
-    if (K->need_layout) {
+    if (K->need_layout && getenv("QJS_AOT_REGION_NOLAYOUTDEP") == NULL) {   /* (the vkit knock-out drops the dependency and the receiver tests together) */
       /* fields of loaded instances are read at fixed slots with no check: an instance that leaves the class shape must break the word */
       fprintf(o, "  { unsigned id_ = *(const uint16_t *)((const unsigned char *)rk_s_%s[%d] + QJS_AOT_OFF_SHAPE_LAYOUT_ID);\n", h, k);
       fprintf(o, "    if (id_ == 0 || id_ > 63 || qjs_aot_layout_depend(ctx, id_, &rg_fw_%s, 1) != 1) {", h);
@@ -5383,7 +5541,7 @@ static void rg_sr_decide(RCtx *c) {
         for (w = 0; w < s.nvis; w++) if (s.vis[w][2] == 0 && s.vis[w][0] == 0) n0_++;
         if (s.nmat > 0 || s.arrfound || s.par > 0 || s.nls > 0 || n0_ > 16) { ok = 0; g_sr_line = -1; }
       }
-      if (ok && (I->ploop || I->curloop)) {
+      if (ok && (I->ploop || I->curloop || (getenv("QJS_AOT_KO_CURLOOP") == NULL && rg_val_in_loop(&I->q, dv)))) {
         /* alive when the construct runs again (carried over a back edge) is the heap's: the edges that move the object to the heap are not such a carry */
         int carried_ = 0, m;
         if (getenv("QJS_AOT_REGION_PARKALL") != NULL) carried_ = 1;
@@ -5393,6 +5551,7 @@ static void rg_sr_decide(RCtx *c) {
           carried_ = rg_carried_up(c, ii, dv);
           g_nmskip = 0;
         }
+        if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d carry test: nmat %d carried %d\n", c->hex, ki, s.nmat, carried_);
         if (carried_) { ok = 0; if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "stackobj: root %.8s cons %d carried over a loop edge\n", c->hex, ki); g_sr_line = -1; }
       }
       if (ok && s.par > 0 && (s.arrfound || s.nmat > 0)) { ok = 0; g_sr_line = -1; }   /* a stack child is one level: no Array of its own, no move to the heap of its own */
@@ -5846,7 +6005,7 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
             const RCons *a_ = &snap_[kv_], *b_ = &c->cons[kv_];
             if (a_->virt != b_->virt || a_->stack != b_->stack || a_->esc != b_->esc || a_->sk_pair != b_->sk_pair || a_->vok != b_->vok || a_->vcov != b_->vcov || a_->nn != b_->nn || a_->chi != b_->chi || a_->par != b_->par || memcmp(a_->vcls, b_->vcls, sizeof(a_->vcls)) != 0 || memcmp(a_->vty, b_->vty, sizeof(a_->vty)) != 0) {
               fprintf(stderr, "VIRTCHECK: cons %d changed its storage decision in the second type round\n", kv_);
-              abort();
+              e_fatal("internal inconsistency (see the message above)", NULL);
             }
           }
           free(snap_);
@@ -5926,7 +6085,10 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   fprintf(o, "#ifndef RG_OWN_T\n#define RG_OWN_T 1\n/* the references an out-of-line call makes the region hold until it returns or leaves */\n");
   /* the list starts in the region's stack buffer (a negative capacity) and moves to the heap when it fills */
   fprintf(o, "static __attribute__((noinline)) void rg_own_grow(JSValue **p, int *cap) { int oc = *cap < 0 ? -*cap : *cap, nc = oc * 2; JSValue *q = *cap < 0 ? malloc((size_t)nc * sizeof(JSValue)) : realloc(*p, (size_t)nc * sizeof(JSValue)); if (q == NULL) abort(); if (*cap < 0) memcpy(q, *p, (size_t)oc * sizeof(JSValue)); *p = q; *cap = nc; }\n");
-  fprintf(o, "static inline __attribute__((always_inline)) JSValue rg_numnorm(JSValue v)\n{\n  if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) { double d = JS_VALUE_GET_FLOAT64(v); int32_t i = (int32_t)d; if (d == (double)i && !(i == 0 && __builtin_signbit(d))) return JS_MKVAL(JS_TAG_INT, i); }\n  return v;\n}\n");
+  if (getenv("QJS_AOT_KO_NUMNORM") != NULL)   /* (the knock-out: the unguarded conversion, whose result for a double outside int32 the optimizer may assume away) */
+    fprintf(o, "static inline __attribute__((always_inline)) JSValue rg_numnorm(JSValue v)\n{\n  if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) { double d = JS_VALUE_GET_FLOAT64(v); int32_t i = (int32_t)d; if (d == (double)i && !(i == 0 && __builtin_signbit(d))) return JS_MKVAL(JS_TAG_INT, i); }\n  return v;\n}\n");
+  else
+  fprintf(o, "static inline __attribute__((always_inline)) JSValue rg_numnorm(JSValue v)\n{\n  if (JS_VALUE_GET_TAG(v) == JS_TAG_FLOAT64) { double d = JS_VALUE_GET_FLOAT64(v); if (d >= -2147483648.0 && d <= 2147483647.0) { int32_t i = (int32_t)d; if (d == (double)i && !(i == 0 && __builtin_signbit(d))) return JS_MKVAL(JS_TAG_INT, i); } }\n  return v;\n}\n");
   fprintf(o, "static inline __attribute__((always_inline)) void rg_own_put(JSContext *ctx, JSValue **p, int *n, int *cap, JSValue v) { (void)ctx; if (!JS_VALUE_HAS_REF_COUNT(v)) return; if (*n >= (*cap < 0 ? -*cap : *cap)) rg_own_grow(p, cap); (*p)[(*n)++] = v; }\n");
   fprintf(o, "static inline __attribute__((always_inline)) void rg_own_dup(JSContext *ctx, JSValue **p, int *n, int *cap, JSValue v) { if (!JS_VALUE_HAS_REF_COUNT(v)) return; q2_dup_p(v); rg_own_put(ctx, p, n, cap, v); }\n");
   if (getenv("QJS_AOT_REGION_OWNSTAT") != NULL) fprintf(o, "static unsigned long q2_os_[4096]; __attribute__((destructor)) static void q2_os_dump(void) { int i; for (i = 0; i < 4096; i++) if (q2_os_[i]) fprintf(stderr, \"OWNRUN site %%d: %%lu\\n\", i, q2_os_[i]); }\n");
@@ -6108,6 +6270,22 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
     /* TRUST: the region's facts are bound once (rg_init, a few tries if a global is not defined yet); after that the word is the only test */
     fprintf(o, "    if (__builtin_expect(!rg_ini_%s, 0)) { if (rg_itry_%s >= 4) { rg_byp_%s++; return aot_fs_%s(ctx, f, fr, entry_pc); } rg_itry_%s++; if (!rg_init_%s(ctx)) { rg_ifail_%s++; rg_byp_%s++; return aot_fs_%s(ctx, f, fr, entry_pc); } }\n", hex, hex, hex, hex, hex, hex, hex, hex, hex);
     fprintf(o, "    if (__builtin_expect(!QJS_AOT_FACTS_OK(&rg_fw_%s, 1), 0)) { rg_byp_%s++; return aot_fs_%s(ctx, f, fr, entry_pc); }\n", hex, hex, hex);
+    {
+      /* F21: the root arguments a trusted fixed-slot access reads through are objects of the classes the accesses assume; anything else runs the generic body */
+      int ra_;
+      if (getenv("QJS_AOT_REGION_DOMCHECK") != NULL) fprintf(stderr, "domcheck: region %s: %d trusted accesses have a receiver nothing proves (tested at the access), root arguments tested once at the entry: mask %x\n", hex, c->ra_flag, c->ra_mask);
+      for (ra_ = 0; ra_ < 8; ra_++) {
+        int kq_, first_ = 1;
+        if (!((c->ra_mask >> ra_) & 1u)) continue;
+        fprintf(o, "    { JSValue ra_ = %d < f_argc ? f_argv[%d] : JS_UNDEFINED;\n      if (__builtin_expect(JS_VALUE_GET_TAG(ra_) != JS_TAG_OBJECT", ra_, ra_);
+        if (!c->ra_any[ra_] && c->ra_cls[ra_] != 0) {
+          fprintf(o, " || (");
+          for (kq_ = 0; kq_ < 32; kq_++) if ((c->ra_cls[ra_] >> kq_) & 1u) { fprintf(o, "%s*(const void *const *)((const char *)JS_VALUE_GET_PTR(ra_) + QJS_AOT_OFF_JSOBJECT_SHAPE) != rk_s_%s[%d]", first_ ? "" : " && ", hex, kq_); first_ = 0; }
+          fprintf(o, ")");
+        }
+        fprintf(o, ", 0)) return aot_g_%s(ctx, f, fr, entry_pc); }\n", hex);
+      }
+    }
     if (c->in[0]->kcls > 0)
       fprintf(o, "    if (__builtin_expect(JS_VALUE_GET_TAG(f_this) != JS_TAG_OBJECT || *(const void *const *)((const char *)JS_VALUE_GET_PTR(f_this) + QJS_AOT_OFF_JSOBJECT_SHAPE) != rk_s_%s[%d], 0)) return aot_g_%s(ctx, f, fr, entry_pc);\n", hex, c->in[0]->kcls - 1, hex);
     for (g = 0; g < c->ngl; g++) fprintf(o, "    JSValue rgc_%d = rgk_%s[%d];\n", g, hex, g);
@@ -6384,7 +6562,7 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
       fprintf(stderr, "\n");
     }
   }
-  if (f != NULL && getenv("QJS_AOT_REGION_NOBORROWCHECK") == NULL && rg_borrow_check(c, root)) { fprintf(stderr, "qjsaot: a lent root stores or keeps a lent value (BORROWCHECK)\n"); abort(); }
+  if (f != NULL && getenv("QJS_AOT_REGION_NOBORROWCHECK") == NULL && rg_borrow_check(c, root)) { fprintf(stderr, "qjsaot: a lent root stores or keeps a lent value (BORROWCHECK)\n"); e_fatal("a lent root stores or keeps a lent value", NULL); }
   if (f != NULL) rg_lent_real_set(hex, c->lent);
   if (f != NULL && rg_has_retslot(c) && g_nrs_real < 64 && !region_retslot_real(hex)) snprintf(g_rs_real[g_nrs_real++], 33, "%s", hex);
   ok = 1;

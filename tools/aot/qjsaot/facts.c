@@ -2015,7 +2015,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
     if ((out->vclaim[k] & 0xC0) == 0x40 && !((out->claimdeps >> ((out->vclaim[k] & 0x3f) - 1)) & 1)) {
       fprintf(stderr, "qjsaot: a never-null promise on layout %d is used without that layout's bit in the body's dependencies\n",
               out->vclaim[k] & 0x3f);
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
     }
 done:
   if (outs != NULL) {

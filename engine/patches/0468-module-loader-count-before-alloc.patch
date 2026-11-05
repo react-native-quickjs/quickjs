@@ -1,0 +1,75 @@
+Subject: The module loader checks entry counts before it records them
+
+What this does
+  - A new reader, `bc_get_leb128_count`, rejects an entry count above INT32_MAX ("invalid count"); `bc_get_leb128_int` is unchanged because the other int fields it reads legitimately hold negative values (-1 for "none").
+  - `JS_ReadModule` reads each entry count into a local and stores it in the module (`*_entries_count`) only after the matching table was allocated, so a failed allocation or a later read error leaves the module with count 0 and the count never exceeds the allocated size.
+
+Why we need it
+  The loader stored the count first and allocated afterwards. A malformed container that declares a huge count made `js_mallocz` fail (or, for a negative count, ask for a wrapped-around size), and the `fail:` path then freed the half-built module with a count that no table backs: `js_free_module_def` walked entries that were never allocated.
+
+Failure
+  Loading a crafted bytecode container whose module section declares an entry count of 2^31-1 or a negative LEB128 value crashed in `js_free_module_def` (heap-buffer-overflow under ASan, a wild read otherwise) instead of failing with an error. Found by the bytecode load-only fuzzer; inputs `bcl-stack-1`, `bcl2-stack-1`, `bcl3-stack-1` and the register-VM reproducer.
+
+Soundness
+  - A valid container is unchanged: its counts fit an int and the tables are allocated before the counts are stored.
+  - The only new rejection is a count that no valid writer produces (above INT32_MAX).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -84559,0 +84560,14 @@
++}
++
++/* An entry count: a value that does not fit an int is not one any writer produced. */
++static int bc_get_leb128_count(BCReaderState *s, int *pval)
++{
++    uint32_t val;
++    if (bc_get_leb128(s, &val))
++        return -1;
++    if (val > INT32_MAX) {
++        JS_ThrowSyntaxError(s->ctx, "invalid count");
++        return -1;
++    }
++    *pval = (int)val;
++    return 0;
+@@ -86266,0 +86281 @@
++    int rd_cnt = 0;
+@@ -86271 +86286 @@
+-    if (bc_get_leb128_int(s, &m->req_module_entries_count))
++    if (bc_get_leb128_count(s, &rd_cnt))
+@@ -86274,2 +86289,2 @@
+-    if (m->req_module_entries_count != 0) {
+-        m->req_module_entries_size = m->req_module_entries_count;
++    if (rd_cnt != 0) {
++        m->req_module_entries_size = rd_cnt;
+@@ -86278,0 +86294 @@
++        m->req_module_entries_count = rd_cnt;
+@@ -86301 +86317 @@
+-    if (bc_get_leb128_int(s, &m->export_entries_count))
++    if (bc_get_leb128_count(s, &rd_cnt))
+@@ -86303,2 +86319,2 @@
+-    if (m->export_entries_count != 0) {
+-        m->export_entries_size = m->export_entries_count;
++    if (rd_cnt != 0) {
++        m->export_entries_size = rd_cnt;
+@@ -86307,0 +86324 @@
++        m->export_entries_count = rd_cnt;
+@@ -86327 +86344 @@
+-    if (bc_get_leb128_int(s, &m->star_export_entries_count))
++    if (bc_get_leb128_count(s, &rd_cnt))
+@@ -86329,2 +86346,2 @@
+-    if (m->star_export_entries_count != 0) {
+-        m->star_export_entries_size = m->star_export_entries_count;
++    if (rd_cnt != 0) {
++        m->star_export_entries_size = rd_cnt;
+@@ -86333,0 +86351 @@
++        m->star_export_entries_count = rd_cnt;
+@@ -86341 +86359 @@
+-    if (bc_get_leb128_int(s, &m->import_entries_count))
++    if (bc_get_leb128_count(s, &rd_cnt))
+@@ -86343,2 +86361,2 @@
+-    if (m->import_entries_count != 0) {
+-        m->import_entries_size = m->import_entries_count;
++    if (rd_cnt != 0) {
++        m->import_entries_size = rd_cnt;
+@@ -86347,0 +86366 @@
++        m->import_entries_count = rd_cnt;

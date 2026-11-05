@@ -1,0 +1,25 @@
+Subject: The module loader rejects a module whose body is not function bytecode
+
+What this does
+  - `JS_ReadModule` checks that the value it read as the module's body (`func_obj`) is function bytecode. Any other value fails the load with a SyntaxError and the half-built module is released as on every other malformed-container path.
+
+Why we need it
+  The module definition owns `func_obj`, and the collector does not trace module definitions. Function bytecode there is handled: it is untraced code that the final collection promotes. A plain object is not: it is a collected object whose only holder is invisible to the collector, so it counts as an outside reference and keeps its prototype chain, and through it the whole realm, reachable. The context is then never released (the module list is only freed with the context), and the objects of the realm stay on the collector's list.
+
+Failure
+  A module container (tag 0x0d) whose body is an object, 279 bytes found by the load-only bytecode fuzzer, loads and is then freed: `JS_FreeRuntime` asserts `list_empty(&rt->gc_obj_list)` in an assertion build, and a leak sanitizer reports the realm's objects in the register build (F18, F18b). Found by watching the reference count of the retained object: it was created by the reader, stored as a property of a parent object read the same way, and held only by the module definition.
+
+Soundness
+  A container the writer produces always has function bytecode as its body, so valid containers load as before. The check is on the tag only.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -86404,0 +86405,7 @@
++        goto fail;
++    /* A module's body is function bytecode. Any other value is owned by the
++       module definition, which the collector does not trace: a plain object
++       there counts as an outside reference and keeps its prototype chain, and
++       through it the whole realm, alive after the context is released. */
++    if (JS_VALUE_GET_TAG(m->func_obj) != JS_TAG_FUNCTION_BYTECODE) {
++        JS_ThrowSyntaxError(ctx, "invalid module function");
+@@ -86405,0 +86413 @@
++    }

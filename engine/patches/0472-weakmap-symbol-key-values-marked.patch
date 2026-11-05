@@ -1,0 +1,42 @@
+Subject: A WeakMap marks the values of entries keyed by a symbol
+
+What this does
+  - The WeakMap class gets a collector mark function, `js_weakmap_mark`: for every live record whose key is a symbol it marks the record's value.
+
+Why we need it
+  The collector subtracts the references objects hold on each other before it decides what is reachable. A WeakMap had no mark function, because the values of its entries are marked from their keys (`mark_weak_map_value`), and that only works for keys that are objects. A symbol is not a collectable object, so nothing marked the value of a symbol-keyed entry: the map's reference to the value stayed counted as an outside reference, the value was treated as a root, and it kept everything it can reach (through `Object.prototype` and the realm, the whole heap) alive when the rest was garbage.
+
+Failure
+  `var s = Symbol(); var wm = new WeakMap(); wm.set(s, {});` followed by freeing the context and the runtime ended in `assert(list_empty(&rt->gc_obj_list))` in `JS_FreeRuntime` (an assertion build; other builds keep the heap allocated until the runtime memory is released). This happens in the unmodified upstream engine too (quickjs-ng at the submodule commit); a FinalizationRegistry stored as the value of such an entry hit the same.
+
+Soundness
+  - Only entries keyed by a symbol are marked; object-keyed entries are unchanged.
+  - The map now keeps such a value alive for the collector while the map is alive, not only while the key is: when the key's last reference goes, the entry is still removed and its value freed at once by `reset_weak_ref`, as before. The only difference is for a value that reaches its own map or key through a cycle.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2798,0 +2799,2 @@
++static void js_weakmap_mark(JSRuntime *rt, JSValueConst val,
++                            JS_MarkFunc *mark_func);
+@@ -3954 +3956 @@
+-    { JS_ATOM_WeakMap, js_map_finalizer, NULL },         /* JS_CLASS_WEAKMAP */
++    { JS_ATOM_WeakMap, js_map_finalizer, js_weakmap_mark }, /* JS_CLASS_WEAKMAP */
+@@ -103663,0 +103666,19 @@
++/* The values of a WeakMap entry whose key is an object are marked from that key (mark_weak_map_value). A symbol is not a collectable
++   object, so nothing marks the values of entries keyed by one: the collector would count the map's reference to such a value as
++   external and keep the value, and everything it reaches, alive for as long as the runtime lives. The map marks them itself. */
++static void js_weakmap_mark(JSRuntime *rt, JSValueConst val,
++                            JS_MarkFunc *mark_func)
++{
++    JSObject *p = JS_VALUE_GET_OBJ(val);
++    JSMapState *s = p->u.map_state;
++    struct list_head *el;
++
++    if (s) {
++        list_for_each(el, &s->records) {
++            JSMapRecord *mr = list_entry(el, JSMapRecord, link);
++            if (!mr->empty && JS_VALUE_GET_TAG(mr->key) == JS_TAG_SYMBOL)
++                JS_MarkValue(rt, mr->value, mark_func);
++        }
++    }
++}
++

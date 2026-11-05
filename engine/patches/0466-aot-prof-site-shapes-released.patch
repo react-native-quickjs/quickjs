@@ -1,0 +1,25 @@
+Subject: Freeing a profiled function releases the shapes its sites recorded
+
+What this does
+  - `js_aot_prof_free` frees the shapes held in the function's profile sites (`sites[].shapes[]`), next to the receiver shapes (`pcs[].rshape`) it already frees.
+
+Why we need it
+  A profile site takes a counted reference on each shape it records, so the shape's address cannot be reused before the dump. The dump releases them, but only for the functions that still exist when it runs. A function collected earlier (a closure body that became garbage mid-run) was freed with its site records, and the shapes they held were never released.
+
+Failure
+  A profile run (`QJS_AOT_PROFILE=1`, the profiling engine behind `QJS_AOT_PROFILE_OUT`) of a script whose function becomes garbage before exit (`(function(){ var f4 = function(){...Array.fromAsync(...).then(...)...}; for (...) f4(0); })();`) ended in `Assertion failed: (list_empty(&rt->gc_obj_list))` in `JS_FreeRuntime`: one recorded shape stayed on the collector's list with a count of one. A kit chain's profile step then reported "profile-run failed" for the cases that did this (m1 eops async-resume, element-01, suspend-00, suspend-01).
+
+Soundness
+  - Only the profiling build is affected (`QJS_AOT_PROFILE`).
+  - The dump already sets released entries to NULL, so a function the dump saw is not released twice; entries are released exactly once, by the dump or by this free.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -65102,0 +65103,7 @@
++    if (pf->sites != NULL) {
++        int si, sj;
++        for (si = 0; si < pf->nsites; si++)
++            for (sj = 0; sj < pf->sites[si].nshapes; sj++)
++                if (pf->sites[si].shapes[sj] != NULL)
++                    js_free_shape(rt, pf->sites[si].shapes[sj]);
++    }

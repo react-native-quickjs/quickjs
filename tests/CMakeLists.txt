@@ -54,6 +54,10 @@ qjs_add_test_suite(quickjs_bytecode_tests bytecode_test.cpp)
 target_compile_definitions(quickjs_bytecode_tests
   PRIVATE QJSC_PATH="$<TARGET_FILE:qjsc>")
 add_dependencies(quickjs_bytecode_tests qjsc)
+# The register build writes a different function header (see firstFunctionBodyLengthOffset in bytecode_test.cpp).
+if(QJS_REGVM)
+  target_compile_definitions(quickjs_bytecode_tests PRIVATE QJS_TEST_REGVM=1)
+endif()
 
 # Drives the C API on JSRuntime/JSContext directly rather than through JSI,
 # because that is the surface a debugger bridge sits on.

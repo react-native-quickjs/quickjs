@@ -88,7 +88,10 @@ add_subdirectory(tests)
 
 # Added after tests/ on purpose: tests/CMakeLists.txt is where googletest is
 # fetched, and modules/cdp registers its own test against GTest::gtest.
-add_subdirectory(modules/cdp)
+# The protocol layer drives the engine's debugger interface, which a QUICKJS_ENABLE_DEBUGGER=OFF build (the AOT product configure) does not compile in.
+if(QUICKJS_ENABLE_DEBUGGER)
+  add_subdirectory(modules/cdp)
+endif()
 add_subdirectory(modules/hermes-compat)
 set(REACT_NATIVE_QUICKJS_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "" FORCE)
 add_subdirectory(modules/text-encoding)

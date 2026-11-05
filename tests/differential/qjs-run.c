@@ -21,6 +21,7 @@
  *   qjs-run <file.js|file.bc>
  */
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,7 +88,16 @@ static uint8_t *read_file(const char *path, size_t *out_size) {
   return buf;
 }
 
-int main(int argc, char **argv) {
+/* An optimised build keeps the 4 MB limit the fixtures were written against. */
+#if defined(NDEBUG) && !defined(__SANITIZE_ADDRESS__) && \
+    !defined(__SANITIZE_THREAD__)
+#define QJS_RUN_STACK_LIMIT (4 * 1024 * 1024)
+#else
+#define QJS_RUN_STACK_LIMIT (48 * 1024 * 1024)
+#endif
+#define QJS_RUN_THREAD_STACK ((size_t)128 * 1024 * 1024)
+
+static int run_main(int argc, char **argv) {
   if (argc != 2) {
     fprintf(stderr, "usage: qjs-run <file.js|file.bc>\n");
     return 2;
@@ -101,7 +111,9 @@ int main(int argc, char **argv) {
   }
 
   JSRuntime *rt = JS_NewRuntime();
-  JS_SetMaxStackSize(rt, 4 * 1024 * 1024);
+  /* The corpus has fixed-depth recursion fixtures; an unoptimised or sanitizer build needs more C stack for the same depth, so
+     the limit follows the build and the interpreter runs on a thread whose stack is far larger than any limit set here. */
+  JS_SetMaxStackSize(rt, QJS_RUN_STACK_LIMIT);
   JSContext *ctx = JS_NewContext(rt);
   JSValue global = JS_GetGlobalObject(ctx);
   JS_SetPropertyStr(
@@ -144,4 +156,29 @@ int main(int argc, char **argv) {
   free(buf);
   fflush(stdout);
   return status;
+}
+
+struct run_args {
+  int argc;
+  char **argv;
+  int status;
+};
+
+static void *run_thread(void *p) {
+  struct run_args *a = p;
+  a->status = run_main(a->argc, a->argv);
+  return NULL;
+}
+
+int main(int argc, char **argv) {
+  struct run_args a = {argc, argv, 2};
+  pthread_attr_t attr;
+  pthread_t th;
+  if (pthread_attr_init(&attr) != 0 ||
+      pthread_attr_setstacksize(&attr, QJS_RUN_THREAD_STACK) != 0 ||
+      pthread_create(&th, &attr, run_thread, &a) != 0) {
+    return run_main(argc, argv);
+  }
+  pthread_join(th, NULL);
+  return a.status;
 }

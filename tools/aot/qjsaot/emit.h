@@ -19,6 +19,13 @@
 
 /* Emit one function's body. Returns 0 on
    success, -1 on a generation error. */
+/* A bookkeeping inconsistency found while emitting one function: the function is refused. e_fatal reports it and sets a flag the driver reads after the function
+   (e_fatal_taken); the emitter goes on (the output of that function is thrown away), because leaving an emitter half way through corrupts its state. A generator must not
+   abort on valid input. */
+void e_fatal(const char *what, const char *hex);
+void e_fatal_set_hex(const char *h);
+int e_fatal_taken(void);
+void e_fatal_reset(void);
 int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]);
 
 /* The inline form `ei_HEX` of a small leaf, or 0 with `why`. */

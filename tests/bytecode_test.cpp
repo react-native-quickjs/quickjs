@@ -16,8 +16,10 @@
 #include <gtest/gtest.h>
 #include <jsi/jsi.h>
 #include <quickjs.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -92,20 +94,29 @@ bool engineAcceptsChecksum(JSContext *ctx, const std::vector<uint8_t> &body) {
   return checksumAccepted;
 }
 
-std::string tempPath(const char *suffix) {
+// A name no other process or call shares: two build trees under ctest, or tests run in parallel, must not overwrite or remove each
+// other's files. `stem` is made once per compile so the source and its container get matching names.
+std::string tempStem() {
+  static std::atomic<unsigned> counter{0};
   const char *dir = std::getenv("TMPDIR");
   std::string base = dir != nullptr ? dir : "/tmp";
   if (base.back() != '/') {
     base += '/';
   }
-  return base + "rnqjs-bytecode-test" + suffix;
+  return base + "rnqjs-bytecode-test-" +
+         std::to_string(static_cast<long>(getpid())) + "-" +
+         std::to_string(counter.fetch_add(1));
 }
 
-/// Compiles `source` with the qjsc tool and returns the container bytes.
+/// Compiles `source` with the qjsc tool and returns the container bytes. A
+/// caller that compares two compiles of one source passes the same `fixedStem`,
+/// so the script name the stack traces carry is the same too.
 std::vector<uint8_t> compileToBytecode(
-    const std::string &source, const char *extraFlags = "") {
-  const std::string jsPath = tempPath(".js");
-  const std::string bcPath = tempPath(".bc");
+    const std::string &source, const char *extraFlags = "",
+    const std::string &fixedStem = std::string()) {
+  const std::string stem = fixedStem.empty() ? tempStem() : fixedStem;
+  const std::string jsPath = stem + ".js";
+  const std::string bcPath = stem + ".bc";
 
   {
     std::ofstream out(jsPath, std::ios::binary);
@@ -163,27 +174,18 @@ size_t firstStringLengthOffset(const std::vector<uint8_t> &bytes) {
   return 0;
 }
 
+// The offset of the length field of the top-level function's deferrable region. That region runs to the end of the payload, so the
+// field is the 32-bit word that equals the number of bytes after it; the function header in front of it differs between the stack
+// and the register build, and a byte equal to the function tag also occurs inside atoms, so the header is not parsed.
 size_t firstFunctionBodyLengthOffset(const std::vector<uint8_t> &bytes) {
-  for (size_t tag = qjs::kBytecodeHeaderSize; tag + 1 < bytes.size(); ++tag) {
-    if (bytes[tag] != 12)  // BC_TAG_FUNCTION_BYTECODE
-      continue;
-    size_t pos = tag + 3;  // tag, flags, strict mode
-    uint32_t counts[10];
-    uint32_t functionName;
-    if (pos > bytes.size() || !readLeb128(bytes, &pos, &functionName) ||
-        !readLeb128(bytes, &pos, &counts[0]))
-      continue;
-    bool valid = true;
-    for (size_t i = 1; i < 10 && valid; ++i)
-      valid = readLeb128(bytes, &pos, &counts[i]);
-    if (!valid) continue;
-    for (uint32_t i = 0; i < counts[5] && valid; ++i) {
-      uint32_t ignored;
-      valid = readLeb128(bytes, &pos, &ignored) &&
-              readLeb128(bytes, &pos, &ignored) &&
-              readLeb128(bytes, &pos, &ignored);
-    }
-    if (valid && pos + sizeof(uint32_t) <= bytes.size()) return pos;
+  for (size_t pos = qjs::kBytecodeHeaderSize + 5;
+       pos + sizeof(uint32_t) <= bytes.size(); ++pos) {
+    const uint32_t declared = static_cast<uint32_t>(bytes[pos]) |
+                              (static_cast<uint32_t>(bytes[pos + 1]) << 8) |
+                              (static_cast<uint32_t>(bytes[pos + 2]) << 16) |
+                              (static_cast<uint32_t>(bytes[pos + 3]) << 24);
+    if (declared > 8 && declared == bytes.size() - pos - sizeof(uint32_t))
+      return pos;
   }
   return 0;
 }
@@ -651,6 +653,175 @@ TEST(Bytecode, CorruptBytecodeIsRejectedCleanly) {
       jsi::JSIException);
 }
 
+TEST(Bytecode, ModuleLoaderRejectsMalformedEntryCounts) {
+  // Module sections whose declared entry count is above INT32_MAX or negative. The loader used to record the count before it
+  // allocated the table, so freeing the half-built module walked entries nothing backed. Each input must fail with an exception
+  // and leave a runtime that frees cleanly (an assertion build or a sanitizer shows the old behaviour).
+  const std::vector<std::vector<uint8_t>> inputs = {
+      {0x1c, 0x27, 0x9e, 0x68, 0x09, 0x00, 0x0d, 0x7f, 0xff, 0xff, 0xff, 0x7f,
+       0x2c, 0x00, 0x00, 0x00, 0x00, 0x0d, 0x7f},
+      {0x1c, 0x74, 0x61, 0x89, 0xba, 0x00, 0x0d, 0xbb, 0xff, 0xff, 0xff, 0x32,
+       0xb7, 0xfe, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x32, 0xb7},
+  };
+  for (const auto &input : inputs) {
+    JSRuntime *rt = JS_NewRuntime();
+    ASSERT_NE(rt, nullptr);
+    JSContext *ctx = JS_NewContext(rt);
+    ASSERT_NE(ctx, nullptr);
+    JSValue value =
+        JS_ReadObject(ctx, input.data(), input.size(), JS_READ_OBJ_BYTECODE);
+    EXPECT_TRUE(JS_IsException(value));
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+  }
+}
+
+TEST(Bytecode, ModuleLoaderRejectsNonFunctionBody) {
+  // A module container whose body (the value after the has_tla byte) is a plain object instead of function bytecode. The module
+  // definition owns that object but the collector does not trace the definition, so the object counted as an outside reference
+  // and kept the realm alive: the context was never released and JS_FreeRuntime found objects left on the collector's list (an
+  // assertion build aborts, a sanitizer build reports the leak). The loader must reject the container.
+  const std::vector<uint8_t> input = {
+       0x1c, 0x96, 0x64, 0x86, 0xc8, 0x00, 0x0d, 0x01, 0x00, 0x00, 0x00, 0x02,
+       0x15, 0x0d, 0x0d, 0x00, 0x08, 0x7f, 0x00, 0x08, 0x7f, 0x00, 0x08, 0x00,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0xfc, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0xf2, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0xf2, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x0a, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+       0x01, 0x01, 0x01,
+  };
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+  JSValue value =
+      JS_ReadObject(ctx, input.data(), input.size(), JS_READ_OBJ_BYTECODE);
+  EXPECT_TRUE(JS_IsException(value));
+  JS_FreeValue(ctx, JS_GetException(ctx));
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+}
+
+// The reader stores constants and indices into typed places that the interpreter and the linker later trust. A valid container with
+// one byte moved (checksum fixed) must be rejected with a SyntaxError where that byte makes an index leave its table or a closure
+// constant stop being function bytecode. The check is reachability: over a handful of byte values at every offset, each message
+// must appear at least once. Without the checks the same mutations load and the expected messages never appear.
+static JSModuleDef *depLoader(JSContext *ctx, const char *name, void *, JSValueConst) {
+  static const char src[] = "export var m = 41; export function k() {}";
+  JSValue v = JS_Eval(ctx, src, sizeof(src) - 1, name,
+                      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+  if (JS_IsException(v)) return nullptr;
+  JSModuleDef *m = static_cast<JSModuleDef *>(JS_VALUE_GET_PTR(v));
+  JS_FreeValue(ctx, v);
+  return m;
+}
+
+static std::vector<std::string> mutationMessages(JSContext *ctx, const char *source, const char *name, int evalFlags) {
+  std::vector<std::string> messages;
+  JSValue fn = JS_Eval(ctx, source, std::strlen(source), name, evalFlags | JS_EVAL_FLAG_COMPILE_ONLY);
+  EXPECT_FALSE(JS_IsException(fn));
+  size_t size = 0;
+  uint8_t *buf = JS_WriteObject(ctx, &size, fn, JS_WRITE_OBJ_BYTECODE);
+  JS_FreeValue(ctx, fn);
+  EXPECT_NE(buf, nullptr);
+  if (buf == nullptr) return messages;
+  const std::vector<uint8_t> valid(buf, buf + size);
+  js_free(ctx, buf);
+  static const uint8_t values[] = {0x00, 0x01, 0x02, 0x0d, 0x1f, 0x7f, 0xff};
+  for (size_t off = 5; off < valid.size(); ++off) {
+    for (uint8_t v : values) {
+      if (valid[off] == v) continue;
+      std::vector<uint8_t> blob = valid;
+      blob[off] = v;
+      const uint32_t crc = crc32cReference(blob.data() + 5, blob.size() - 5);
+      for (int i = 0; i < 4; ++i) blob[1 + i] = static_cast<uint8_t>(crc >> (8 * i));
+      JSValue r = JS_ReadObject(ctx, blob.data(), blob.size(), JS_READ_OBJ_BYTECODE);
+      if (JS_IsException(r)) {
+        JSValue e = JS_GetException(ctx);
+        if (const char *m = JS_ToCString(ctx, e)) {
+          messages.emplace_back(m);
+          JS_FreeCString(ctx, m);
+        }
+        JS_FreeValue(ctx, e);
+      } else {
+        JS_FreeValue(ctx, r);
+      }
+    }
+  }
+  return messages;
+}
+
+static bool anyMessageHas(const std::vector<std::string> &messages, const char *needle) {
+  for (const auto &m : messages)
+    if (m.find(needle) != std::string::npos) return true;
+  return false;
+}
+
+TEST(Bytecode, ReaderRejectsOutOfRangeConstantsAndModuleIndices) {
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JS_SetModuleLoaderFunc2(rt, nullptr, depLoader, nullptr, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+  const auto script = mutationMessages(
+      ctx, "function a(x){ function b(y){ return y+x; } return b(2)+[1,2,3].map(function(z){return z*x;}).length; } a(3);",
+      "a.js", 0);
+  const auto module = mutationMessages(
+      ctx,
+      "import {m} from 'dep'; import * as ns from 'dep'; export var b = m + 1; export function g(){ return b + ns.m; }"
+      " export {m as mm} from 'dep'; export * from 'dep';",
+      "m.mjs", JS_EVAL_TYPE_MODULE);
+#if QJS_TEST_REGVM
+  EXPECT_TRUE(anyMessageHas(script, "closure constant is not a function"));
+#else
+  EXPECT_TRUE(anyMessageHas(script, "invalid constant operand"));
+#endif
+  EXPECT_TRUE(anyMessageHas(module, "invalid module entry index"));
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+}
+
+TEST(Engine, ComputeMemoryUsageWalksPlainObjects) {
+  // A plain object has no class data, so the walk must not read the union that other classes use for their records (an object
+  // with inline property room has no such union). The overread shows under AddressSanitizer; the CDP test that reported it is
+  // modules/cdp EveryAdvertisedMethodIsImplemented.
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+  JSValue global = JS_GetGlobalObject(ctx);
+  for (int i = 0; i < 64; ++i) {
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "a", JS_NewInt32(ctx, i));
+    JS_SetPropertyStr(ctx, obj, "b", JS_NewInt32(ctx, i * 2));
+    JS_SetPropertyStr(ctx, global, i % 2 ? "odd" : "even", obj);
+  }
+  JS_FreeValue(ctx, global);
+  JSMemoryUsage usage;
+  JS_ComputeMemoryUsage(rt, &usage);
+  EXPECT_GT(usage.obj_count, 0);
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+}
+
 TEST(Bytecode, CRC32CKnownVectorAndInputLengths) {
   const std::vector<uint8_t> knownVector = {'1', '2', '3', '4', '5',
                                             '6', '7', '8', '9'};
@@ -766,9 +937,10 @@ TEST(Bytecode, StrippedBytecodeKeepsLineAndColumnInformation) {
       "try { outer(); } catch (e) { globalThis.stack = e.stack; }\n"
       "globalThis.loc = probe.lineNumber + ':' + probe.columnNumber;\n";
 
+  const std::string stem = tempStem();
   auto runFor = [&](const char *flags) {
     auto runtime = qjs::makeQuickJSRuntime();
-    auto bytes = compileToBytecode(source, flags);
+    auto bytes = compileToBytecode(source, flags, stem);
     runtime->evaluateJavaScript(
         std::make_shared<VectorBuffer>(std::move(bytes)), "loc.bc");
     // The filename is the temp path qjsc was given, which is the same for

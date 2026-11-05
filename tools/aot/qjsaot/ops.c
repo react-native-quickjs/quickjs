@@ -322,9 +322,17 @@ static int role_reads_reg(const ERole *role, const Q2Insn *in, int r) {
 /* Whether the unit being generated will be compiled with -DE_POISON. The
    emitter sets it from the command line (`--poison`). */
 static int g_poison;
-int e_poison_on(void) {
-  return g_poison;
+static int g_e_fatal_hit;
+static char g_e_fatal_hex[40];
+void e_fatal_set_hex(const char *h) { snprintf(g_e_fatal_hex, sizeof(g_e_fatal_hex), "%s", h != NULL ? h : "?"); }
+void e_fatal(const char *what, const char *hex) {
+  if (hex == NULL) hex = g_e_fatal_hex;
+  fprintf(stderr, "qjsaot: function %s refused: internal inconsistency: %s\n", hex != NULL ? hex : "?", what);
+  if (getenv("QJS_AOT_ABORT_ON_FATAL") != NULL) abort();
+  g_e_fatal_hit = 1;
 }
+int e_fatal_taken(void) { return g_e_fatal_hit; }
+void e_fatal_reset(void) { g_e_fatal_hit = 0; }
 void e_set_poison(int on) {
   g_poison = on;
 }
@@ -1866,7 +1874,7 @@ static void emit_trivial(FILE *f, const Q2Insn *in, const ERole *role) {
           "qjsaot: GENERIC emitter: generic_is_trivial accepted rop %d but emit_trivial has "
           "no case for it (pc %d)\n",
           in->rop, in->pc);
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
       break;
   }
   (void)role;
@@ -2457,6 +2465,9 @@ static int g_e_ax_blk[E_MAX_STUBS];
 /* The compare COLD ARM: a TAG operand whose tag is neither INT nor FLOAT64. It is a
    hand-off at the branch's own pc, not a deopt. */
 /* the pcs after a suspension that the body can be entered at (they have an `osr_` label) */
+/* Audit aid (QJS_AOT_POISON_LOCALS=1): every unit local starts as a recognisable wrong value instead of 0/undefined, so a value that some entry path
+   (an OSR entry, a resume) uses without defining it shows up as a wrong result against the interpreter. */
+static int e_poison_locals(void) { static int v = -1; if (v < 0) v = getenv("QJS_AOT_POISON_LOCALS") != NULL; return v; }
 static int g_e_osr_res[16], g_e_osr_res_n;
 static int g_e_hx[E_MAX_STUBS];
 static Q2ValueId *g_e_hx_cur[E_MAX_STUBS];
@@ -2677,7 +2688,7 @@ static void e_sweep_guard(FILE *f, const char *kind, int pc) {
      reached. */
   if (sid >= (1 << 20)) {
     fprintf(stderr, "qjsaot: sweep site %d is past the coverage bitmap\n", sid);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   /* The trailing comment is the site map: the harness reads it from the unit to
      name an unreached site by function, kind and pc. */
@@ -2726,6 +2737,19 @@ static struct {
   char expr[64];
 } g_e_xtag[E_MAX_STUBS];
 static int g_e_xtag_n;
+/* The expression for the register at byte offset `off` of the combined program, read in an exit stub (text emitted outside the macros
+   an inlined copy rebinds around its own code): the caller's registers are in `fr`, a copy's in its own frame array `ifr_<k>`. */
+static void e_reg_stub_text(char *buf, size_t n, const Q2Func *fn, int off) {
+  int r = off / 16, k;
+  if (r < fn->norig || getenv("QJS_AOT_KO_STUBFR") != NULL) {   /* (the knock-out names the caller's frame for every register: the old behaviour) */
+    snprintf(buf, n, "AOT_REG(fr, %d)", off);
+    return;
+  }
+  for (k = 0; k < fn->ninl; k++)
+    if (r >= fn->inl[k].rbase && r < fn->inl[k].rbase + fn->inl[k].g->reg_count + fn->inl[k].nparam) break;
+  snprintf(buf, n, "AOT_REG(ifr_%d, %d)", k < fn->ninl ? k : 0, off);
+}
+
 static void e_note_tag(char kind, int pc, const char *expr) {
   int q;
   for (q = 0; q < g_e_xtag_n; q++)
@@ -2885,16 +2909,14 @@ static void e_note_stub(
     fprintf(
         stderr, "qjsaot: guard stub at pc %d has no sync set (%s)\n", pc,
         cur == NULL ? "no cur" : "table full");
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   snap = malloc(sizeof(*snap) * (size_t)(nr > 0 ? nr : 1));
   if (snap == NULL) abort();
   memcpy(snap, cur, sizeof(*snap) * (size_t)nr);
   if (wrote != NULL && wrote->ndef > 0 && wrote->def[0] != Q2_NO_VALUE) {
     char ex[64];
-    snprintf(
-        ex, sizeof(ex), "AOT_REG(fr, %d)",
-        g_e_fn->values[wrote->def[0]].reg * 16);
+    e_reg_stub_text(ex, sizeof(ex), g_e_fn, g_e_fn->values[wrote->def[0]].reg * 16);
     e_note_tag('d', pc, ex);
   }
   if (wrote != NULL)
@@ -3376,7 +3398,7 @@ static void e_note_defs(Q2ValueId *cur, const Q2Func *fn, const Q2Insn *in) {
           stderr,
           "qjsaot: def v%d of rop %d has register %d outside 0..%d\n", (int)d,
           in->rop, r, fn->nregs - 1);
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
     }
     cur[r] = d;
   }
@@ -3476,7 +3498,7 @@ static void emit_trivial_own(
         fprintf(f, "    {\n");
         if (!emit_hit_result(f, g_e_fn, in, g_e_types, d, dreg, raw)) {
           fprintf(stderr, "qjsaot: a guarded copy at pc %d has no guard for its def\n", in->pc);
-          abort();
+          e_fatal("internal inconsistency (see the message above)", NULL);
         }
         fprintf(f, "    }\n");
       } else if (d != Q2_NO_VALUE && sv != Q2_NO_VALUE)
@@ -3511,10 +3533,20 @@ static void emit_trivial_own(
       break;
     }
     case ROP_get_arg:
+      /* The exit note reads the argument buffer of the function being generated (`q2_arg_buf(f)`): a copy's arguments are register
+         moves, never get_arg, and a get_arg of a copy would make that note read the caller's buffer. */
+      if (in->own > 0) {
+        fprintf(stderr, "qjsaot: get_arg in an inlined copy at pc %d\n", in->pc);
+        e_fatal("internal inconsistency (see the message above)", NULL);
+      }
       if (d != Q2_NO_VALUE)
         e_load_arg_to_local(f, d, (int)in->arg[1].val, in->pc, cur);
       break;
     case ROP_get_arg2: {
+      if (in->own > 0) {
+        fprintf(stderr, "qjsaot: get_arg2 in an inlined copy at pc %d\n", in->pc);
+        e_fatal("internal inconsistency (see the message above)", NULL);
+      }
       /* Two argument slots in one instruction: the form nearly every function
          begins with, so without it no block's prefix reaches its arithmetic. */
       Q2ValueId d0 = in->ndef > 0 ? in->def[0] : Q2_NO_VALUE;
@@ -3640,7 +3672,7 @@ static int e_virt_expr(char *buf, size_t n, Q2ValueId v) {
     snprintf(cexp, sizeof(cexp), "JS_UNDEFINED");
   } else if (g_e_virt[cv]) {
     fprintf(stderr, "qjsaot: virtual object %u: its constructor value %u is itself virtual\n", (unsigned)v, (unsigned)cv);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   } else
     e_exit_expr(cexp, sizeof(cexp), cv);
   body[0] = 0;
@@ -3811,7 +3843,7 @@ static void e_emit_exit(
     fprintf(
         stderr, "qjsaot: exit names function %d inside function %d's body\n", fi,
         g_e_fi);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   g_e_exit_dirty = 0;
   /* A resumable copy keeps no undo log, so the ONLY exit it may take is the resume exit: a replay of the call after one of its stores would
@@ -3819,7 +3851,7 @@ static void e_emit_exit(
   if (g_e_exit_ins >= 0 && g_e_exit_ins < fn->ninsns && fn->insns[g_e_exit_ins].own > 0 && g_e_resume != NULL &&
       fn->insns[g_e_exit_ins].own <= g_e_resume_n && g_e_resume[fn->insns[g_e_exit_ins].own - 1]) {
     fprintf(stderr, "qjsaot: an exit of a resumable copy (fn %s, pc %d) was emitted as a replay\n", hex, pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   e_virt_compute(fn);
   g_e_stub_cur = cur;
@@ -3876,13 +3908,15 @@ static void e_emit_exit(
           /* The entry block legitimately has function-start state; anywhere
              else a live register with no value means the bookkeeping lost it. */
           if (blkidx != 0) {
+            if (getenv("QJS_AOT_DEBUG_FATAL") != NULL) {
             fprintf(
-                stderr,
-                "qjsaot: live register %d has no value at an exit in a non-entry "
-                "block (fn %s) pc %d exit_ins %d own %d\n",
-                r, hex, pc, g_e_exit_ins, g_e_exit_ins>=0?fn->insns[g_e_exit_ins].own:-9);
-            fprintf(stderr, "  INL %d dirty %d fl %d b %d\n", g_e_inl, g_e_exit_dirty, g_e_fl, blkidx); { int q_; for (q_ = 0; q_ < fn->ninsns; q_++) { const Q2Insn *x_ = &fn->insns[q_]; int d_; fprintf(stderr, "  i%d pc %d rop %d own %d xpc %d blk? def:", q_, x_->pc, (int)x_->rop, x_->own, x_->xpc); for (d_ = 0; d_ < x_->ndef; d_++) fprintf(stderr, " %d(r%d)", (int)x_->def[d_], (int)fn->values[x_->def[d_]].reg); fprintf(stderr, " ; uses:"); for (d_ = 0; d_ < x_->nuse; d_++) fprintf(stderr, " %d(r%d)", (int)x_->use[d_], (int)fn->values[x_->use[d_]].reg); fprintf(stderr, "\n"); } }
-            abort();
+                  stderr,
+                  "qjsaot: live register %d has no value at an exit in a non-entry "
+                  "block (fn %s) pc %d exit_ins %d own %d\n",
+                  r, hex, pc, g_e_exit_ins, g_e_exit_ins>=0?fn->insns[g_e_exit_ins].own:-9);
+              fprintf(stderr, "  INL %d dirty %d fl %d b %d\n", g_e_inl, g_e_exit_dirty, g_e_fl, blkidx); { int q_; for (q_ = 0; q_ < fn->ninsns; q_++) { const Q2Insn *x_ = &fn->insns[q_]; int d_; fprintf(stderr, "  i%d pc %d rop %d own %d xpc %d blk? def:", q_, x_->pc, (int)x_->rop, x_->own, x_->xpc); for (d_ = 0; d_ < x_->ndef; d_++) fprintf(stderr, " %d(r%d)", (int)x_->def[d_], (int)fn->values[x_->def[d_]].reg); fprintf(stderr, " ; uses:"); for (d_ = 0; d_ < x_->nuse; d_++) fprintf(stderr, " %d(r%d)", (int)x_->use[d_], (int)fn->values[x_->use[d_]].reg); fprintf(stderr, "\n"); } }
+            }
+            e_fatal("a live register has no value at an exit in a non-entry block", hex);
           }
           continue;
         }
@@ -3895,7 +3929,7 @@ static void e_emit_exit(
         } else if (cur[r] < (Q2ValueId)fn->nvalues && g_e_virt != NULL && g_e_virt[cur[r]]) {
           /* An object that is not made yet is built last: making it allocates, and the
              collector must find every other register in the frame by then. */
-          if (ndefer >= 64) abort();
+          if (ndefer >= 64) { e_fatal("more than 64 deferred exit stores", NULL); ndefer = 0; }
           defer[ndefer++] = r;
         } else {
           e_exit_store(f, cur[r], r);
@@ -4079,7 +4113,7 @@ static void e_emit_resume_exit(
         continue;
       }
       if (cur[r] < (Q2ValueId)fn->nvalues && g_e_virt != NULL && g_e_virt[cur[r]]) {
-        if (ndefer >= 64) abort();
+        if (ndefer >= 64) { e_fatal("more than 64 deferred exit stores", NULL); ndefer = 0; }
         defer[ndefer++] = r;
       } else {
         e_exit_store(f, cur[r], r);
@@ -4220,7 +4254,7 @@ static void e_emit_exit_at(
   if (cur == NULL) {
     fprintf(
         stderr, "qjsaot: exit stub at pc %d has no sync set (fn %s)\n", pc, hex);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   if (fn->insns[ins].own > 0 && g_e_resume != NULL && fn->insns[ins].own <= g_e_resume_n &&
       g_e_resume[fn->insns[ins].own - 1]) {
@@ -4358,7 +4392,7 @@ static void e_emit_arm(
         "qjsaot: arm %d of block %d targets block %d but the caller meant %d -- the "
         "RPO position and the block index have been conflated\n",
         k, b, sb, want_succ);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   if (sb < 0 || sb >= fn->nblocks) {
     /* A target that leaves the function: the caller hands off instead. */
@@ -4585,7 +4619,12 @@ static int emit_typed_var_ref_load(
       g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
   {
     char ex[64];
-    snprintf(ex, sizeof(ex), "qjs_aot_get_var_ref(f, %d)", slot);
+    /* The tag is read again in the exit stub, outside the macros an inlined copy rebinds around its own text: a copy names its callee's cell
+       vector (`nco_<n>`) explicitly, or the stub would read the CALLER's (NULL when it captures nothing). */
+    if (in->own > 0)
+      snprintf(ex, sizeof(ex), "q2_vref_get(nco_%d, %d)", in->own - 1, slot);
+    else
+      snprintf(ex, sizeof(ex), "qjs_aot_get_var_ref(f, %d)", slot);
     e_note_tag('v', in->pc, ex);
   }
   if (t->lb[d] != E_LB_TAG && e_def_dead(in, d)) {
@@ -4828,7 +4867,7 @@ static int emit_typed_opcall(
       e_rop_name(in->rop, nm, sizeof(nm));
       fprintf(stderr, "qjsaot: copied callee instruction %s at pc %d (rop %u, orig pc %d) needs the step engine (in %s, copy %d)\n",
               nm, in->pc, (unsigned)in->rop, (int)in->opc, fn->g->name, (int)in->own);
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
     }
     if (getenv("QJS_AOT_DEBUG_INL") != NULL) {
       e_rop_name(in->rop, nm, sizeof(nm));
@@ -6033,7 +6072,7 @@ static int emit_intrinsic_call(
   else if (cv == E_UNDEF || (cv != Q2_NO_VALUE && cv != E_INFRAME))
     snprintf(cexp, sizeof(cexp), "JS_UNDEFINED"); /* not an object: always exits */
   else
-    snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+    e_reg_stub_text(cexp, sizeof(cexp), fn, cc);
   /* In a frameless body the miss is an exit. A replaced builtin is rare and the
      profile saw the callee; parseInt can also miss on its argument's value, so in a
      loop that may run long it keeps the function framed. */
@@ -6084,7 +6123,7 @@ static int emit_intrinsic_call(
     if (t->lb[dv] == E_LB_BOT)
       fprintf(f, "        AOT_SET_B(ctx, fr, %d, _o);\n", off);
     else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o"))
-      abort();
+      e_fatal("an opcall hit has no guard for its def", NULL);
     fprintf(f, "        goto cd_%d;\n      }\n    }\n", in->pc);
     g_e_intr_cont = 1;
     emit_typed_call(f, fn, in, t, cur, 1, hex, fi, b);
@@ -6122,7 +6161,7 @@ static int emit_intrinsic_call(
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, _o);\n", off);
   } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
     fprintf(stderr, "qjsaot: intrinsic at pc %d: no guard for its def\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
@@ -6186,7 +6225,7 @@ static int e_emit_nested_result(
     fprintf(f, "%sif (_r == 1 && JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n", ind);
   } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
     fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   return 1;
 }
@@ -6302,7 +6341,7 @@ static int emit_array_op(
     fprintf(f, "      v%u = _o;\n      AOT_SET_B(ctx, fr, %d, _o);\n", (unsigned)dv, off);
   } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
     fprintf(stderr, "qjsaot: array call at pc %d: no guard for its def\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   fprintf(f, "    }\n");
   cur[dreg] = dv;
@@ -6450,7 +6489,7 @@ static int emit_inl_nested_call(
         cv < (Q2ValueId)t->nvalues && t->lb[cv] == E_LB_TAG)
       snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
     else
-      snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+      e_reg_stub_text(cexp, sizeof(cexp), fn, cc);
     if (th < 0)
       snprintf(recv, sizeof(recv), "JS_UNDEFINED");
     else if (tv != Q2_NO_VALUE && tv != E_UNDEF && tv != E_INFRAME &&
@@ -6683,7 +6722,7 @@ static int emit_inl_nested_call(
       fprintf(f, "        if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n");
     } else if (!emit_hit_result(f, fn, in, t, dv, dreg, "_o")) {
       fprintf(stderr, "qjsaot: nested call at pc %d: no guard for its def\n", in->pc);
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
     }
     if (g_e_epoch_skip || g_e_nolazy) e_store_typed_def(f, fn, in, t, dv);
     e_emit_group_recheck(f, fn, in, cur);
@@ -6904,6 +6943,13 @@ static int emit_inl_construct(
     fprintf(f, "            goto cd_%d;\n        }\n    }\n    goto vx_%d;\n#endif\n",
             in->pc, in->pc);
   }
+  /* No candidate was emitted (none in the unit, or its native entry macro is not defined in this translation unit): the construct has not
+     happened, so the body leaves for the call it was copied from. Without this the code falls through to the join with the result
+     still undefined (QJS_AOT_KO_CTORMISS=1 restores that). */
+  if (getenv("QJS_AOT_KO_CTORMISS") == NULL) {
+    e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+    fprintf(f, "    goto vx_%d;\n", in->pc);
+  }
   fprintf(f, "    cd_%d: ;\n", in->pc);
   e_inl_store_mark(f);
   g_e_miss_exit_seen = 1;
@@ -6949,7 +6995,7 @@ static int emit_typed_construct(
       cv < (Q2ValueId)t->nvalues && t->lb[cv] == E_LB_TAG)
     snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
   else
-    snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+    e_reg_stub_text(cexp, sizeof(cexp), fn, cc);
   if (nv != Q2_NO_VALUE && nv != E_UNDEF && nv != E_INFRAME &&
       nv < (Q2ValueId)t->nvalues && t->lb[nv] == E_LB_TAG)
     snprintf(ntexp, sizeof(ntexp), "v%u", (unsigned)nv);
@@ -7020,7 +7066,7 @@ static int emit_typed_construct(
   g_e_presynced = 1;
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
     fprintf(stderr, "qjsaot: construct at pc %d: the wrapper declined after output\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   g_e_presynced = 0;
   fprintf(f, "    cd_%d: ;\n", in->pc);
@@ -7822,7 +7868,7 @@ static int emit_alloc_op(
     g_e_presynced = 1;
     if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
       fprintf(stderr, "qjsaot: alloc op at pc %d: the wrapper declined after output\n", in->pc);
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
     }
     g_e_presynced = 0;
   }
@@ -7902,7 +7948,7 @@ static int emit_inl_guard(
       t->lb[cv] == E_LB_TAG)
     snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
   else
-    snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+    e_reg_stub_text(cexp, sizeof(cexp), fn, cc);
   tv = th >= 0 && th / 16 < fn->nregs ? cur[th / 16] : Q2_NO_VALUE;
   if (th < 0)
     snprintf(rexp, sizeof(rexp), "JS_UNDEFINED");
@@ -8168,7 +8214,7 @@ static int emit_inl_sel(
   if (!emit_inl_guard(f, fn, in, t, cur, have_types)) return 0;
   if (blk->nsucc != 2) {
     fprintf(stderr, "qjsaot: the guard of a polymorphic arm at pc %d has %d successors\n", in->pc, (int)blk->nsucc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   e_emit_arm(f, fn, b, 0, cur, hex, blk->succ_block[0]);
   fprintf(f, "    vx_%d:;\n#ifdef Q2_MXDEBUG\n    { static int n_; if (n_++ < 3) fprintf(stderr, \"selmiss pc=%d tag=%%d\\n\", (int)JS_VALUE_GET_TAG(AOT_REG(fr, %d))); }\n#endif\n", in->pc, in->pc, 0);
@@ -8202,7 +8248,7 @@ static int emit_virt_def(
       t->lb[cv] == E_LB_TAG)
     snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
   else
-    snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+    e_reg_stub_text(cexp, sizeof(cexp), fn, cc);
   e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
   e_note_tag('v', in->pc, cexp);
   e_sweep_guard(f, "vx", in->pc);
@@ -8270,7 +8316,7 @@ static int emit_virt_proto(
     fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
     fprintf(stderr, "qjsaot: virtual prototype read at pc %d: no guard for its def\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   fprintf(f, "    }\n");
   cur[dreg] = dv;
@@ -8308,7 +8354,7 @@ static int emit_pure_call(
         cv < (Q2ValueId)t->nvalues && t->lb[cv] == E_LB_TAG)
       snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
     else
-      snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+      e_reg_stub_text(cexp, sizeof(cexp), fn, cc);
     if (th < 0)
       snprintf(recv, sizeof(recv), "JS_UNDEFINED");
     else if (tv != Q2_NO_VALUE && tv != E_UNDEF && tv != E_INFRAME &&
@@ -8488,13 +8534,13 @@ static int emit_copy_ext_call(
   if (!have_types || t == NULL || cur == NULL || g_e_fl || g_e_inl || in->own == 0 || pf->rop != ROP_put_field ||
       pf->extcall != 2 || pf->nuse < 1 || na > 6) {
     fprintf(stderr, "qjsaot: a call in a copy at pc %d cannot be emitted\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   cc = call_callee_off(in);
   th = call_this_off(in);
   if (cc < 0 || th < 0) {
     fprintf(stderr, "qjsaot: a call in a copy at pc %d has no receiver\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   rootpc = fn->inl[in->own - 1].call_pc;
   e_reg_box(cexp, sizeof(cexp), fn, t, cur, cc / 16);
@@ -8531,7 +8577,7 @@ static int emit_copy_ext_call(
     if (pf->arg[i].kind == 's') site = (int)pf->arg[i].val;
   if (rv >= (Q2ValueId)t->nvalues || t->lb[rv] != E_LB_TAG || site < 0 || pf->arg[1].kind != 'a' || pf->arg[1].off < 0) {
     fprintf(stderr, "qjsaot: the store of a call in a copy at pc %d cannot be emitted\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
   g = g_e_facts != NULL ? e_exit_group(fn, pf, site) : -1;
@@ -8751,7 +8797,7 @@ static int emit_typed_call(
         cv < (Q2ValueId)t->nvalues && t->lb[cv] == E_LB_TAG)
       snprintf(cexp, sizeof(cexp), "v%u", (unsigned)cv);
     else
-      snprintf(cexp, sizeof(cexp), "AOT_REG(fr, %d)", cc);
+      e_reg_stub_text(cexp, sizeof(cexp), fn, cc);
     if (th < 0)
       snprintf(recv, sizeof(recv), "JS_UNDEFINED");
     else if (tv != Q2_NO_VALUE && tv != E_UNDEF && tv != E_INFRAME &&
@@ -8955,7 +9001,7 @@ static int emit_typed_call(
     fprintf(
         stderr, "qjsaot: call at pc %d: the wrapper declined after output\n",
         in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   g_e_presynced = 0;
   fprintf(f, "    cd_%d: ;\n", in->pc);
@@ -8994,7 +9040,7 @@ static int emit_typed_local_read(
   fprintf(f, "    { JSValue _lv = q2_var_buf(f)[%d];\n", slot);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_lv")) {
     fprintf(stderr, "qjsaot: local read at pc %d: no guard for the def\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   fprintf(f, "    }\n");
   cur[dreg] = dv;
@@ -9043,12 +9089,12 @@ static int emit_typed_binary_loc(
   fprintf(f, "      if (__builtin_expect(q2_arith(%d, %s, %s, &_r), 1)) {\n", sub, ea, eb);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_r")) {
     fprintf(stderr, "qjsaot: local arithmetic at pc %d: no guard for the def\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   fprintf(f, "      } else {\n");
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
     fprintf(stderr, "qjsaot: local arithmetic at pc %d: the wrapper declined after output\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   fprintf(f, "      }\n    }\n");
   cur[dreg] = dv;
@@ -9413,7 +9459,7 @@ static int emit_tag_cmp_value(
   fprintf(f, "      } else {\n");
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
     fprintf(stderr, "qjsaot: compare at pc %d: the wrapper declined after output\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   fprintf(f, "      }\n    }\n");
   cur[dreg] = dv;
@@ -9484,7 +9530,7 @@ static int emit_group_this_read(
   }
   if (!emit_hit_result(f, fn, in, t, fv, freg, "_f")) {
     fprintf(stderr, "qjsaot: grouped this read at pc %d: no guard for its def\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   fprintf(f, "    }\n");
   cur[freg] = fv;
@@ -9589,7 +9635,7 @@ static int emit_typed_this_field(
     e_fprint_hit(f, fn, "      ", "_t", site, "&_v", NULL);
     if (!emit_hit_result(f, fn, in, t, fv, freg, "_v")) {
       fprintf(stderr, "qjsaot: this read at pc %d: no guard for its def\n", in->pc);
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
     }
     fprintf(f, "      } else {\n");
     if (tl_lmt) {
@@ -9627,7 +9673,7 @@ static int emit_typed_this_field(
   e_fprint_hit(f, fn, "      ", "_t", site, "&_v", NULL);
   if (!emit_hit_result(f, fn, in, t, fv, freg, "_v")) {
     fprintf(stderr, "qjsaot: this read at pc %d: no guard for its def\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   /* The hit keeps `this`: an owned one is adopted by its frame slot, as the
      generic body's load_this does (the slot already holds it borrowed). The miss
@@ -9753,7 +9799,7 @@ static int emit_typed_field_chain(
   if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) {
     fprintf(
         stderr, "qjsaot: field chain at pc %d: second wrapper declined\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   g_e_fl_miss_ok = 0;
   fprintf(f, "      }\n");
@@ -9783,7 +9829,7 @@ static int emit_inl_field_write(
 static int e_np_bail(const Q2Func *fn, const Q2Insn *in) {
   if (g_e_facts != NULL && g_e_facts->noproto[e_insn_idx(fn, in)] != 0) {
     fprintf(stderr, "qjsaot: store at pc %d carries a no-prototype fact but is not a grouped write\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   return 0;
 }
@@ -10031,7 +10077,7 @@ static int e_ta_info(int cls, ETaInfo *o) {
    byte pointer), the length `an<root>`. */
 static void e_arr_region_start_cls(FILE *f, Q2ValueId av, Q2ValueId root, const char *fail, int cls) {
   ETaInfo ti;
-  if (!e_ta_info(cls, &ti)) abort();
+  if (!e_ta_info(cls, &ti)) { e_fatal("typed-array class without info", NULL); memset(&ti, 0, sizeof(ti)); }
   fprintf(
       f,
       "      if (__builtin_expect(Q2_FORCE_MISS || JS_VALUE_GET_TAG(v%u) != JS_TAG_OBJECT, 0)) %s;\n"
@@ -10166,10 +10212,12 @@ static int emit_ta_region_read(
     if (ti.is_float)
       fprintf(
           f,
-          "      { double _d = (double)_x; int32_t _y = (int32_t)_d;\n"
+          "      { double _d = (double)_x; int32_t _y;\n"
+          "        if (__builtin_expect(!(_d >= -2147483648.0 && _d <= 2147483647.0), 0)) goto vx_%d;\n"
+          "        _y = (int32_t)_d;\n"
           "        if (__builtin_expect(!(_y == _d && !(_y == 0 && signbit(_d))), 0)) goto vx_%d;\n"
           "        i%u = _y; }\n",
-          in->pc, (unsigned)dv);
+          in->pc, in->pc, (unsigned)dv);
     else if (ti.is_u32)
       fprintf(
           f, "      if (__builtin_expect(_x > 2147483647u, 0)) goto vx_%d;\n      i%u = (int32_t)_x;\n", in->pc,
@@ -10399,10 +10447,12 @@ static int emit_pk_region_write(
          stays in this region, and it stores the int32 the widening would have produced */
       fprintf(
           f,
-          "      { double _d = d%u; int32_t _y = (int32_t)_d;\n"
+          "      { double _d = d%u; int32_t _y;\n"
+          "        if (__builtin_expect(!(_d >= -2147483648.0 && _d <= 2147483647.0), 0)) goto vx_%d;\n"
+          "        _y = (int32_t)_d;\n"
           "        if (__builtin_expect(!(_y == _d && !(_y == 0 && signbit(_d))), 0)) goto vx_%d;\n"
           "        ((int32_t *)pkp%u)[_i] = _y; }\n",
-          (unsigned)vv, in->pc, (unsigned)root);
+          (unsigned)vv, in->pc, in->pc, (unsigned)root);
     else if (t->lb[vv] == E_LB_TAG)
       fprintf(
           f,
@@ -10710,7 +10760,7 @@ static int emit_group_read(
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
     fprintf(
         stderr, "qjsaot: grouped read at pc %d: no guard for its def\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   fprintf(f, "    }\n");
   /* The def is the method cell's value: a call on it knows the callee the entry validated (see emit_inl_guard). */
@@ -10779,7 +10829,7 @@ static int emit_group_chain(
     if (!emit_hit_result(f, fn, in, t, d1v, d1reg, "_c1")) {
       fprintf(
           stderr, "qjsaot: grouped chain at pc %d: no guard for its def\n", in->pc);
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
     }
     fprintf(f, "    }\n");
   }
@@ -10933,7 +10983,7 @@ static int emit_group_write(
   int np = g_e_facts->noproto[e_insn_idx(fn, in)];
   if (np != 0 && e_group_layout(g) == 0) {
     fprintf(stderr, "qjsaot: store at pc %d: a no-prototype fact for a group that is not contracted\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   snprintf(recv, sizeof(recv), "v%u", (unsigned)rv);
   e_slot_off(woff, sizeof(woff), g, site);
@@ -10979,7 +11029,7 @@ static int emit_group_write(
       g_e_undo_seq_own[g_e_undo_seq_n++] = e_dom(in->own);
     } else {
       fprintf(stderr, "qjsaot: too many stores in copied callees\n");
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
     }
     g_e_miss_exit_seen = 1;
     return 1;
@@ -11115,7 +11165,7 @@ static int emit_poly_read(
         in->pc);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
     fprintf(stderr, "qjsaot: polymorphic read at pc %d: no guard for its def\n", in->pc);
-    abort();
+    e_fatal("internal inconsistency (see the message above)", NULL);
   }
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
@@ -11329,7 +11379,7 @@ static int emit_typed_field_read(
     if (in->rop == ROP_get_field2) {
       if (g_pm_flag == NULL || (unsigned)dv >= (unsigned)g_pm_flag_n) {
         fprintf(stderr, "qjsaot: arm method read at pc %d has no entry slot\n", in->pc);
-        abort();
+        e_fatal("internal inconsistency (see the message above)", NULL);
       }
       g_pm_flag[dv] = 1;
       fprintf(f, "    pme%u = ame_%d_%d;\n    { JSValue _f = amv_%d_%d;\n", (unsigned)dv, in->own - 1, site, in->own - 1, site);
@@ -11340,7 +11390,7 @@ static int emit_typed_field_read(
     }
     if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
       fprintf(stderr, "qjsaot: arm read at pc %d: no guard for its def\n", in->pc);
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
     }
     fprintf(f, "    }\n");
     if (cur != NULL) cur[dreg] = dv;
@@ -11398,7 +11448,7 @@ static int emit_typed_field_read(
     }
     if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
       fprintf(stderr, "qjsaot: copy table read at pc %d: no guard for its def\n", in->pc);
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
     }
     fprintf(f, "    }\n");
     if (cur != NULL) cur[dreg] = dv;
@@ -11683,7 +11733,7 @@ static int emit_typed_var_ref_store(
       g_e_undo_seq_own[g_e_undo_seq_n++] = e_dom(in->own);
     } else {
       fprintf(stderr, "qjsaot: too many stores in copied callees\n");
-      abort();
+      e_fatal("internal inconsistency (see the message above)", NULL);
     }
     e_inl_store_mark(f);
     (void)cur;
@@ -14336,16 +14386,16 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         fprintf(f, "    void *pkp%u = NULL; uint32_t pkn%u = 0;\n", (unsigned)k, (unsigned)k);
       switch (e_rep_prefix((Q2ValueId)k)[0]) {
         case 'i':
-          fprintf(f, "    int32_t i%u = 0;\n", (unsigned)k);
+          fprintf(f, "    int32_t i%u = %s;\n", (unsigned)k, e_poison_locals() ? "987654321" : "0");
           break;
         case 'd':
-          fprintf(f, "    double d%u = 0;\n", (unsigned)k);
+          fprintf(f, "    double d%u = %s;\n", (unsigned)k, e_poison_locals() ? "-1234567.125" : "0");
           break;
         case 'b':
-          fprintf(f, "    int b%u = 0;\n", (unsigned)k);
+          fprintf(f, "    int b%u = %s;\n", (unsigned)k, e_poison_locals() ? "1" : "0");
           break;
         default:
-          fprintf(f, "    JSValue v%u = JS_UNDEFINED;\n", (unsigned)k);
+          fprintf(f, "    JSValue v%u = %s;\n", (unsigned)k, e_poison_locals() ? "JS_MKVAL(JS_TAG_INT, 777777)" : "JS_UNDEFINED");
           fprintf(f, "    const unsigned char *pp%u = NULL; (void)pp%u;\n", (unsigned)k, (unsigned)k);
           if (g_pm_n > 0 || g_pm_flag != NULL) fprintf(f, "    const void *pme%u = NULL; (void)pme%u;\n", (unsigned)k, (unsigned)k);
           break;
@@ -14649,7 +14699,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
               "qjsaot: pc %d (rop %u) is a miss-exit access but was not emitted as "
               "one\n",
               in->pc, (unsigned)in->rop);
-          abort();
+          e_fatal("internal inconsistency (see the message above)", NULL);
         }
         if (!emitted) {
           if (ftell(f) != before) {
@@ -14660,7 +14710,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
                 (unsigned)in->rop,
                 e_roles[in->rop] ? "see the role table" : "?", in->pc,
                 ftell(f) - before);
-            abort();
+            e_fatal("internal inconsistency (see the message above)", NULL);
           }
           break;
         }
@@ -14925,6 +14975,48 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
             "          return aot_g_%s(ctx, f, fr, (uint32_t)(ip_ - code_)); } }\n",
             osr_ypc[h], osr_ypc[h], osr_pc[h], hex);
       fprintf(f, "    osr_%d:;\n    {\n", osr_pc[h]);
+      /* A loop-invariant run (see plan_invariants) executes once per entry to its loop, at the first iteration. Entering at the header skips the code before
+         the loop, so a value such a run reads that is defined outside the loop and is not one of the registers reloaded below would be read uninitialised
+         (a forwarded field load: the bound of the loop read as 0 and the loop left at once). Such an entry is refused: the generic body keeps running the loop.
+         QJS_AOT_KO_OSRHV=1 restores the old behaviour. */
+      if (g_e_facts != NULL && g_e_facts->hvrun != NULL && g_e_facts->loop_mem != NULL && getenv("QJS_AOT_KO_OSRHV") == NULL) {
+        int li2, bad = 0, b2, ii;
+        for (li2 = 0; li2 < g_e_facts->nloops && !bad; li2++) {
+          if (g_e_facts->loop_hdr[li2] != osr_blk[h] || g_e_facts->loop_mem[li2] == NULL) continue;
+          for (b2 = 0; b2 < fn->nblocks && !bad; b2++) {
+            if (!g_e_facts->loop_mem[li2][b2]) continue;
+            for (ii = fn->blocks[b2].first_insn; ii < fn->blocks[b2].first_insn + fn->blocks[b2].ninsns && !bad; ii++) {
+              const Q2Insn *x = &fn->insns[ii];
+              int k2, q3;
+              /* a load forwarded from an earlier load: the source value is read where the load was */
+              if (g_e_facts->fwd != NULL && g_e_facts->fwd[ii] != Q2_NO_VALUE) {
+                Q2ValueId w = g_e_facts->fwd[ii];
+                int live = 0;
+                if (w < (Q2ValueId)fn->nvalues && !fn->values[w].is_const && fn->values[w].block >= 0 &&
+                    !g_e_facts->loop_mem[li2][fn->values[w].block]) {
+                  for (q3 = 0; q3 < hb->nlive_in; q3++)
+                    if (hb->in_val[q3] == w) live = 1;
+                  if (!live) bad = 1;
+                }
+              }
+              if (g_e_facts->hvrun[ii] == 0) continue;
+              for (k2 = 0; k2 < x->nuse && !bad; k2++) {
+                Q2ValueId u = x->use[k2];
+                int live = 0;
+                if (u >= (Q2ValueId)fn->nvalues || fn->values[u].is_const) continue;
+                if (fn->values[u].block < 0 || g_e_facts->loop_mem[li2][fn->values[u].block]) continue;
+                for (q3 = 0; q3 < hb->nlive_in; q3++)
+                  if (hb->in_val[q3] == u) live = 1;
+                if (!live) bad = 1;
+              }
+            }
+          }
+        }
+        if (bad) {
+          fprintf(f, "      goto osr_fail;\n    }\n");
+          continue;
+        }
+      }
       for (q = 0; q < hb->nlive_in; q++) {
         int rr = hb->in_reg[q];
         Q2ValueId vv = hb->in_val[q];

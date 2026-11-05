@@ -102,15 +102,19 @@ static int rg_native_call(RCtx *c, int ii, const char *method, const Q2Insn *cal
   if (!c->emit) { c->opaque = 1; c->nnative++; return 1; }   /* an out-of-line call runs code the region cannot see */
   rg_mark_eff(c, ii);
   {
-    char xr[32], xo[32], rel_[96], rv[48];
+    char xr[32], xn[32], xo[32], rel_[96], rv[48];
     snprintf(rv, sizeof(rv), "%sv%d", I->pfx, recv_val);
     snprintf(rel_, sizeof(rel_), held_ ? "rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, rn_%d)" : "JS_FreeValue(ctx, rn_%d)", ki);
     rg_xlabel(c, rg_xit(c, ii, exit_pc), call->pc, "native-recv", xr, sizeof(xr));
+    /* The null/undefined receiver leaves at the method read itself, not at a stretched exit past it (rg_xit may return the instance's snapshot, taken after a pure method read that the engine
+       would have thrown on): the generic body redoes the read and throws its own message. QJS_AOT_KO_NULLEXIT=1 uses the stretched exit again. */
+    if (getenv("QJS_AOT_KO_NULLEXIT") == NULL) rg_xlabel(c, rg_xit_x(c, ii, exit_pc), call->pc, "native-null", xn, sizeof(xn));
+    else snprintf(xn, sizeof(xn), "%s", xr);
     fprintf(o, "    { /* .%s() at pc %d: a native or unresolved callee, called out of line */\n", method, call->pc);
     fprintf(o, "        JSValue av_[%d];\n", call->win_n > 0 ? call->win_n : 1);
     for (k = 0; k < call->win_n; k++) fprintf(o, "        av_[%d] = %sv%u;\n", k, I->pfx, (unsigned)call->win_val[k]);
     /* a receiver the engine's read would throw on: the generic body throws it, with its message */
-    fprintf(o, "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) == JS_TAG_UNDEFINED || JS_VALUE_GET_TAG(%s) == JS_TAG_NULL, 0)) goto %s;\n", rv, rv, xr);
+    fprintf(o, "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) == JS_TAG_UNDEFINED || JS_VALUE_GET_TAG(%s) == JS_TAG_NULL, 0)) goto %s;\n", rv, rv, xn);
     rg_nat_atom(o, call->pc, method);
     if (rg_nat_kn()) rg_nat_kn_decl(o);
     if (fast != NULL && call->win_n == 1) {

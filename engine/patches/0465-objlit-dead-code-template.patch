@@ -1,0 +1,28 @@
+Subject: An object literal in dead code no longer leaves a stale template slot
+
+What this does
+  - After the bytecode copy loop of `js_create_function`, every object-literal site the loop never reached gets the same "no template" state the loop gives a skipped site: `template_index` is `UINT16_MAX`, `tab_idx` is -1 and `pos` is -1.
+
+Why we need it
+  The loop visits sites as it meets their position in the bytecode. Code after a `return` is removed before the loop, so a literal there is never met and its site kept the parse-time `pos` and `eligible` flag. The template table was sized from the sites that still looked live and filled in site order, so the unreached site claimed a table entry with a stale position and the sites after it were off by one.
+
+Failure
+  `function g() { return 1; ({a: 1}); }` fails `assert(st->template_index == (uint16_t)t)` in `js_create_function` in any build with assertions (both VMs). With assertions off the table gets an entry whose pc points into other code and every later literal in the function is paired with the wrong template.
+
+Soundness
+  - Only sites at positions past the last visited bytecode position change, and they change to the state the loop already gives dropped sites; a reached site is untouched.
+  - The count of live templates is now the number of sites that were reached and eligible, which is what the table is filled from.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62130,0 +62131,10 @@
++    }
++
++    /* A literal in code the pass dropped (what follows a return) was never reached:
++       it keeps no template, so the template table counts only the live ones. */
++    for (; objlit_k < s->objlit_count; objlit_k++) {
++        JSObjLitSite *site = &s->objlit_sites[objlit_k];
++
++        site->template_index = UINT16_MAX;
++        site->tab_idx = -1;
++        site->pos = -1;

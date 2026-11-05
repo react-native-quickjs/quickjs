@@ -15,6 +15,7 @@ int qjs_aot_bundle_report(const char *path);
 int qjs_aot_bundle_field(const JSAotGenFunc *g, int pc, int kind, int *slot, unsigned *cls, int *is_add);
 int qjs_aot_bundle_field_named(const JSAotGenFunc *g, int pc, int kind, const char *name, int *slot, unsigned *cls, int *is_add);
 int qjs_aot_bundle_cls_plain(unsigned cls);
+int qjs_aot_bundle_cls_object(unsigned cls);
 int qjs_aot_bundle_atom_name(uint32_t atom, char *out, size_t cap);
 int qjs_aot_bundle_targets(const JSAotGenFunc *g, int pc, const JSAotGenFunc **out, int max);
 int qjs_aot_bundle_thru_targets(const JSAotGenFunc *g, int pc, const JSAotGenFunc **out, int max);

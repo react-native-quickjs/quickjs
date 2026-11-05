@@ -48,8 +48,8 @@ static JSValue js_print(
 /* Runs the cycle collector: the cases that need to know an object graph is freed or kept. */
 #ifdef QJS_KIT_HTMLDDA
 /* Kit only: an object that compares equal to null, the host's way of making one. */
-static JSValue js_make_htmldda(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
-{
+static JSValue js_make_htmldda(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   JSValue f = JS_NewCFunction(ctx, js_print, "htmldda", 0);
   JS_SetIsHTMLDDA(ctx, f);
   return f;
@@ -146,15 +146,20 @@ static int bench_irq_period, bench_irq_count;
 
 static int bench_interrupt_cb(JSRuntime *rt, void *opaque) {
   (void)opaque;
-  if (bench_irq_period > 0 && ++bench_irq_count % bench_irq_period == 0 && !JS_IsUndefined(bench_irq_obj)) {
+  if (bench_irq_period > 0 && ++bench_irq_count % bench_irq_period == 0 &&
+      !JS_IsUndefined(bench_irq_obj)) {
     JSContext *c = bench_irq_ctx;
-    JSValue oc = JS_GetPropertyStr(c, bench_irq_obj, "child"), oa = JS_GetPropertyStr(c, bench_irq_obj, "arr");
+    JSValue oc = JS_GetPropertyStr(c, bench_irq_obj, "child"),
+            oa = JS_GetPropertyStr(c, bench_irq_obj, "arr");
     JSValue nc = JS_NewObject(c), na = JS_NewArray(c);
-    JSValue len = JS_GetPropertyStr(c, oa, "length"), v = JS_GetPropertyStr(c, oc, "v");
+    JSValue len = JS_GetPropertyStr(c, oa, "length"),
+            v = JS_GetPropertyStr(c, oc, "v");
     int32_t n = 0, i;
     JS_ToInt32(c, &n, len);
     JS_SetPropertyStr(c, nc, "v", v);
-    for (i = 0; i < n; i++) JS_SetPropertyUint32(c, na, (uint32_t)i, JS_GetPropertyUint32(c, oa, (uint32_t)i));
+    for (i = 0; i < n; i++)
+      JS_SetPropertyUint32(
+          c, na, (uint32_t)i, JS_GetPropertyUint32(c, oa, (uint32_t)i));
     JS_SetPropertyStr(c, bench_irq_obj, "child", nc);
     JS_SetPropertyStr(c, bench_irq_obj, "arr", na);
     JS_FreeValue(c, oc);
@@ -166,7 +171,8 @@ static int bench_interrupt_cb(JSRuntime *rt, void *opaque) {
   return 0;
 }
 
-static JSValue js_host_irq_target(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_host_irq_target(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   (void)this_val;
   if (argc > 0) {
     JS_FreeValue(ctx, bench_irq_obj);
@@ -200,7 +206,8 @@ static JSValue js_new_realm(
 
 /* ---- the verification kit's host hooks (.local/kit/vkit.sh) ---------------------------------
    Writes through the C API (a native module changing the heap), fact groups for the watchpoint cases, and a second runtime. */
-static JSValue js_host_set(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_host_set(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   const char *k;
   int r;
   (void)this_val;
@@ -212,19 +219,22 @@ static JSValue js_host_set(JSContext *ctx, JSValueConst this_val, int argc, JSVa
   return JS_NewInt32(ctx, r);
 }
 
-static JSValue js_host_define(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_host_define(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   const char *k;
   int r;
   (void)this_val;
   if (argc < 3) return JS_ThrowTypeError(ctx, "host_define(obj, name, value)");
   k = JS_ToCString(ctx, argv[1]);
   if (!k) return JS_EXCEPTION;
-  r = JS_DefinePropertyValueStr(ctx, argv[0], k, JS_DupValue(ctx, argv[2]), JS_PROP_C_W_E);
+  r = JS_DefinePropertyValueStr(
+      ctx, argv[0], k, JS_DupValue(ctx, argv[2]), JS_PROP_C_W_E);
   JS_FreeCString(ctx, k);
   return JS_NewInt32(ctx, r);
 }
 
-static JSValue js_host_delete(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_host_delete(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   JSAtom a;
   int r;
   const char *k;
@@ -239,7 +249,8 @@ static JSValue js_host_delete(JSContext *ctx, JSValueConst this_val, int argc, J
   return JS_NewInt32(ctx, r);
 }
 
-static JSValue js_host_setproto(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_host_setproto(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   (void)this_val;
   if (argc < 2) return JS_ThrowTypeError(ctx, "host_setproto(obj, proto)");
   return JS_NewInt32(ctx, JS_SetPrototype(ctx, argv[0], argv[1]));
@@ -252,7 +263,8 @@ static JSValue bench_path(JSContext *ctx, const char *path) {
   JSValue cur = JS_GetGlobalObject(ctx);
   char buf[256], *tok, *save = NULL;
   snprintf(buf, sizeof(buf), "%s", path);
-  for (tok = strtok_r(buf, ".", &save); tok != NULL; tok = strtok_r(NULL, ".", &save)) {
+  for (tok = strtok_r(buf, ".", &save); tok != NULL;
+       tok = strtok_r(NULL, ".", &save)) {
     JSValue nx = JS_GetPropertyStr(ctx, cur, tok);
     JS_FreeValue(ctx, cur);
     cur = nx;
@@ -264,12 +276,17 @@ static JSValue bench_pval(JSContext *ctx, JSValueConst v) {
   if (JS_IsString(v)) {
     const char *s = JS_ToCString(ctx, v);
     JSValue r;
-    if (s != NULL && s[0] == '@') { r = bench_path(ctx, s + 1); JS_FreeCString(ctx, s); return r; }
+    if (s != NULL && s[0] == '@') {
+      r = bench_path(ctx, s + 1);
+      JS_FreeCString(ctx, s);
+      return r;
+    }
     if (s != NULL) JS_FreeCString(ctx, s);
   }
   return JS_DupValue(ctx, v);
 }
-static JSValue js_host_p_op(JSContext *ctx, int argc, JSValueConst *argv, int op) {
+static JSValue js_host_p_op(
+    JSContext *ctx, int argc, JSValueConst *argv, int op) {
   const char *pth, *k = NULL;
   JSValue o, v = JS_UNDEFINED;
   int r = -1;
@@ -282,19 +299,46 @@ static JSValue js_host_p_op(JSContext *ctx, int argc, JSValueConst *argv, int op
   JS_FreeCString(ctx, pth);
   if (op != 3) k = JS_ToCString(ctx, argv[1]);
   if (JS_IsObject(o)) {
-    if (op == 0 && argc >= 3) { v = bench_pval(ctx, argv[2]); r = JS_SetPropertyStr(ctx, o, k, v); }
-    else if (op == 1 && argc >= 3) { v = bench_pval(ctx, argv[2]); r = JS_DefinePropertyValueStr(ctx, o, k, v, JS_PROP_C_W_E); }
-    else if (op == 2) { JSAtom a = JS_NewAtom(ctx, k); r = JS_DeleteProperty(ctx, o, a, 0); JS_FreeAtom(ctx, a); }
-    else if (op == 3) { JSValue pr = bench_pval(ctx, argv[1]); r = JS_SetPrototype(ctx, o, pr); JS_FreeValue(ctx, pr); }
+    if (op == 0 && argc >= 3) {
+      v = bench_pval(ctx, argv[2]);
+      r = JS_SetPropertyStr(ctx, o, k, v);
+    } else if (op == 1 && argc >= 3) {
+      v = bench_pval(ctx, argv[2]);
+      r = JS_DefinePropertyValueStr(ctx, o, k, v, JS_PROP_C_W_E);
+    } else if (op == 2) {
+      JSAtom a = JS_NewAtom(ctx, k);
+      r = JS_DeleteProperty(ctx, o, a, 0);
+      JS_FreeAtom(ctx, a);
+    } else if (op == 3) {
+      JSValue pr = bench_pval(ctx, argv[1]);
+      r = JS_SetPrototype(ctx, o, pr);
+      JS_FreeValue(ctx, pr);
+    }
   }
   if (k) JS_FreeCString(ctx, k);
   JS_FreeValue(ctx, o);
   return JS_NewInt32(ctx, r);
 }
-static JSValue js_host_p_set(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)t; return js_host_p_op(ctx, argc, argv, 0); }
-static JSValue js_host_p_define(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)t; return js_host_p_op(ctx, argc, argv, 1); }
-static JSValue js_host_p_delete(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)t; return js_host_p_op(ctx, argc, argv, 2); }
-static JSValue js_host_p_setproto(JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) { (void)t; return js_host_p_op(ctx, argc, argv, 3); }
+static JSValue js_host_p_set(
+    JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+  (void)t;
+  return js_host_p_op(ctx, argc, argv, 0);
+}
+static JSValue js_host_p_define(
+    JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+  (void)t;
+  return js_host_p_op(ctx, argc, argv, 1);
+}
+static JSValue js_host_p_delete(
+    JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+  (void)t;
+  return js_host_p_op(ctx, argc, argv, 2);
+}
+static JSValue js_host_p_setproto(
+    JSContext *ctx, JSValueConst t, int argc, JSValueConst *argv) {
+  (void)t;
+  return js_host_p_op(ctx, argc, argv, 3);
+}
 
 #define BENCH_MAX_FACTS 64
 static JSAotFact *bench_facts[BENCH_MAX_FACTS];
@@ -302,12 +346,14 @@ static uint32_t bench_fact_word[BENCH_MAX_FACTS];
 static int bench_nfacts;
 
 /* fact_new(obj, flags, proto, [names]) -> handle */
-static JSValue js_fact_new(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_fact_new(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   JSAtom atoms[16];
   int32_t flags = 0, n = 0, i;
   JSAotFact *g;
   (void)this_val;
-  if (argc < 3 || bench_nfacts >= BENCH_MAX_FACTS) return JS_ThrowTypeError(ctx, "fact_new(obj, flags, proto, [names])");
+  if (argc < 3 || bench_nfacts >= BENCH_MAX_FACTS)
+    return JS_ThrowTypeError(ctx, "fact_new(obj, flags, proto, [names])");
   JS_ToInt32(ctx, &flags, argv[1]);
   if (argc > 3 && JS_IsArray(argv[3])) {
     JSValue len = JS_GetPropertyStr(ctx, argv[3], "length");
@@ -338,28 +384,33 @@ static JSAotFact *bench_fact_of(JSContext *ctx, JSValueConst v) {
   return h >= 0 && h < bench_nfacts ? bench_facts[h] : NULL;
 }
 
-static JSValue js_fact_validate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_fact_validate(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   JSAotFact *g = argc > 0 ? bench_fact_of(ctx, argv[0]) : NULL;
   (void)this_val;
   return JS_NewInt32(ctx, g ? qjs_aot_fact_validate(ctx, g) : -1);
 }
 
-static JSValue js_fact_state(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_fact_state(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   JSAotFact *g = argc > 0 ? bench_fact_of(ctx, argv[0]) : NULL;
   (void)this_val;
   return JS_NewInt32(ctx, g ? qjs_aot_fact_state(g) : -1);
 }
 
 /* the dependent bit: what a compiled body's facts_valid word would hold */
-static JSValue js_fact_bit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_fact_bit(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   int32_t h = -1;
   (void)this_val;
   if (argc > 0) JS_ToInt32(ctx, &h, argv[0]);
-  return JS_NewInt32(ctx, h >= 0 && h < bench_nfacts ? (int)(bench_fact_word[h] & 1u) : -1);
+  return JS_NewInt32(
+      ctx, h >= 0 && h < bench_nfacts ? (int)(bench_fact_word[h] & 1u) : -1);
 }
 
 /* fact_expect(h, name, value) / fact_expect_proto(h, proto) */
-static JSValue js_fact_expect(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_fact_expect(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   JSAotFact *g = argc > 2 ? bench_fact_of(ctx, argv[0]) : NULL;
   const char *s;
   JSAtom a;
@@ -375,13 +426,15 @@ static JSValue js_fact_expect(JSContext *ctx, JSValueConst this_val, int argc, J
   return JS_NewInt32(ctx, r);
 }
 
-static JSValue js_fact_expect_proto(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_fact_expect_proto(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   JSAotFact *g = argc > 1 ? bench_fact_of(ctx, argv[0]) : NULL;
   (void)this_val;
   return JS_NewInt32(ctx, g ? qjs_aot_fact_expect_proto(ctx, g, argv[1]) : -1);
 }
 
-static JSValue js_fact_break(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_fact_break(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   JSAotFact *g = argc > 0 ? bench_fact_of(ctx, argv[0]) : NULL;
   (void)this_val;
   if (g) qjs_aot_fact_break(ctx, g);
@@ -389,12 +442,16 @@ static JSValue js_fact_break(JSContext *ctx, JSValueConst this_val, int argc, JS
 }
 
 /* a second runtime evaluating `src`: how many compiled functions did it bind (a unit serves one runtime), and how many did this one */
-static JSValue js_host_bound(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-  (void)this_val; (void)argc; (void)argv;
+static JSValue js_host_bound(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  (void)argv;
   return JS_NewInt32(ctx, (int)qjs_aot_runtime_bound(JS_GetRuntime(ctx)));
 }
 
-static JSValue js_host_second_runtime(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue js_host_second_runtime(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   const char *src;
   JSRuntime *rt2;
   JSContext *c2;
@@ -469,7 +526,8 @@ int main(int argc, char **argv) {
      interpreter's is: the same script must stop at the same point. Driven by
      the environment so the poll test needs no separate harness. */
   {
-    const char *ip = getenv("QJS_BENCH_INTERRUPT"), *irq = getenv("QJS_BENCH_IRQ_HEAP");
+    const char *ip = getenv("QJS_BENCH_INTERRUPT"),
+               *irq = getenv("QJS_BENCH_IRQ_HEAP");
     if (irq && *irq) bench_irq_period = atoi(irq);
     if ((ip && *ip) || bench_irq_period > 0) {
       if (ip && *ip) bench_interrupt_left = atoi(ip);
@@ -487,10 +545,12 @@ int main(int argc, char **argv) {
       ctx, global, "gc", JS_NewCFunction(ctx, js_force_gc, "gc", 0));
 #ifdef QJS_KIT_HTMLDDA
   JS_SetPropertyStr(
-      ctx, global, "makeHTMLDDA", JS_NewCFunction(ctx, js_make_htmldda, "makeHTMLDDA", 0));
+      ctx, global, "makeHTMLDDA",
+      JS_NewCFunction(ctx, js_make_htmldda, "makeHTMLDDA", 0));
 #endif
   JS_SetPropertyStr(
-      ctx, global, "newRealm", JS_NewCFunction(ctx, js_new_realm, "newRealm", 0));
+      ctx, global, "newRealm",
+      JS_NewCFunction(ctx, js_new_realm, "newRealm", 0));
   JS_SetPropertyStr(
       ctx, global, "host_opt",
       JS_NewCFunction(ctx, js_host_opt, "host_opt", 2));
@@ -498,24 +558,60 @@ int main(int argc, char **argv) {
      only at run time (never seen by qjsaot) to exercise the compiled ->
      interpreted -> compiled unwind path. */
   JS_SetPropertyStr(ctx, global, "__aot_bench_driver__", JS_NewBool(ctx, 1));
-  JS_SetPropertyStr(ctx, global, "host_set", JS_NewCFunction(ctx, js_host_set, "host_set", 3));
-  JS_SetPropertyStr(ctx, global, "host_define", JS_NewCFunction(ctx, js_host_define, "host_define", 3));
-  JS_SetPropertyStr(ctx, global, "host_delete", JS_NewCFunction(ctx, js_host_delete, "host_delete", 2));
-  JS_SetPropertyStr(ctx, global, "host_setproto", JS_NewCFunction(ctx, js_host_setproto, "host_setproto", 2));
-  JS_SetPropertyStr(ctx, global, "host_p_set", JS_NewCFunction(ctx, js_host_p_set, "host_p_set", 3));
-  JS_SetPropertyStr(ctx, global, "host_p_define", JS_NewCFunction(ctx, js_host_p_define, "host_p_define", 3));
-  JS_SetPropertyStr(ctx, global, "host_p_delete", JS_NewCFunction(ctx, js_host_p_delete, "host_p_delete", 2));
-  JS_SetPropertyStr(ctx, global, "host_p_setproto", JS_NewCFunction(ctx, js_host_p_setproto, "host_p_setproto", 2));
-  JS_SetPropertyStr(ctx, global, "host_bound", JS_NewCFunction(ctx, js_host_bound, "host_bound", 0));
-  JS_SetPropertyStr(ctx, global, "host_second_runtime", JS_NewCFunction(ctx, js_host_second_runtime, "host_second_runtime", 1));
-  JS_SetPropertyStr(ctx, global, "host_irq_target", JS_NewCFunction(ctx, js_host_irq_target, "host_irq_target", 1));
-  JS_SetPropertyStr(ctx, global, "fact_new", JS_NewCFunction(ctx, js_fact_new, "fact_new", 4));
-  JS_SetPropertyStr(ctx, global, "fact_validate", JS_NewCFunction(ctx, js_fact_validate, "fact_validate", 1));
-  JS_SetPropertyStr(ctx, global, "fact_state", JS_NewCFunction(ctx, js_fact_state, "fact_state", 1));
-  JS_SetPropertyStr(ctx, global, "fact_bit", JS_NewCFunction(ctx, js_fact_bit, "fact_bit", 1));
-  JS_SetPropertyStr(ctx, global, "fact_break", JS_NewCFunction(ctx, js_fact_break, "fact_break", 1));
-  JS_SetPropertyStr(ctx, global, "fact_expect", JS_NewCFunction(ctx, js_fact_expect, "fact_expect", 3));
-  JS_SetPropertyStr(ctx, global, "fact_expect_proto", JS_NewCFunction(ctx, js_fact_expect_proto, "fact_expect_proto", 2));
+  JS_SetPropertyStr(
+      ctx, global, "host_set",
+      JS_NewCFunction(ctx, js_host_set, "host_set", 3));
+  JS_SetPropertyStr(
+      ctx, global, "host_define",
+      JS_NewCFunction(ctx, js_host_define, "host_define", 3));
+  JS_SetPropertyStr(
+      ctx, global, "host_delete",
+      JS_NewCFunction(ctx, js_host_delete, "host_delete", 2));
+  JS_SetPropertyStr(
+      ctx, global, "host_setproto",
+      JS_NewCFunction(ctx, js_host_setproto, "host_setproto", 2));
+  JS_SetPropertyStr(
+      ctx, global, "host_p_set",
+      JS_NewCFunction(ctx, js_host_p_set, "host_p_set", 3));
+  JS_SetPropertyStr(
+      ctx, global, "host_p_define",
+      JS_NewCFunction(ctx, js_host_p_define, "host_p_define", 3));
+  JS_SetPropertyStr(
+      ctx, global, "host_p_delete",
+      JS_NewCFunction(ctx, js_host_p_delete, "host_p_delete", 2));
+  JS_SetPropertyStr(
+      ctx, global, "host_p_setproto",
+      JS_NewCFunction(ctx, js_host_p_setproto, "host_p_setproto", 2));
+  JS_SetPropertyStr(
+      ctx, global, "host_bound",
+      JS_NewCFunction(ctx, js_host_bound, "host_bound", 0));
+  JS_SetPropertyStr(
+      ctx, global, "host_second_runtime",
+      JS_NewCFunction(ctx, js_host_second_runtime, "host_second_runtime", 1));
+  JS_SetPropertyStr(
+      ctx, global, "host_irq_target",
+      JS_NewCFunction(ctx, js_host_irq_target, "host_irq_target", 1));
+  JS_SetPropertyStr(
+      ctx, global, "fact_new",
+      JS_NewCFunction(ctx, js_fact_new, "fact_new", 4));
+  JS_SetPropertyStr(
+      ctx, global, "fact_validate",
+      JS_NewCFunction(ctx, js_fact_validate, "fact_validate", 1));
+  JS_SetPropertyStr(
+      ctx, global, "fact_state",
+      JS_NewCFunction(ctx, js_fact_state, "fact_state", 1));
+  JS_SetPropertyStr(
+      ctx, global, "fact_bit",
+      JS_NewCFunction(ctx, js_fact_bit, "fact_bit", 1));
+  JS_SetPropertyStr(
+      ctx, global, "fact_break",
+      JS_NewCFunction(ctx, js_fact_break, "fact_break", 1));
+  JS_SetPropertyStr(
+      ctx, global, "fact_expect",
+      JS_NewCFunction(ctx, js_fact_expect, "fact_expect", 3));
+  JS_SetPropertyStr(
+      ctx, global, "fact_expect_proto",
+      JS_NewCFunction(ctx, js_fact_expect_proto, "fact_expect_proto", 2));
   JS_FreeValue(ctx, global);
   double t_start = now_ms();
   JSValue result;

@@ -3073,6 +3073,8 @@ int qjs_aot_bundle_field(const JSAotGenFunc *g, int pc, int kind, int *slot, uns
 
 /* Whether a class set (qjs_aot_bundle_field's cls) is non-empty and holds no reference-counted value and nothing unknown. */
 int qjs_aot_bundle_cls_plain(unsigned cls) { return cls != 0 && !(cls & (K_STR | K_OBJ | K_UNK)); }
+/* a field that holds objects and nothing else: a read of it is an object (a receiver the claims already cover) */
+int qjs_aot_bundle_cls_object(unsigned cls) { return cls == K_OBJ; }
 
 /* The name of an atom, for the generated text. */
 int qjs_aot_bundle_atom_name(uint32_t atom, char *out, size_t cap) {

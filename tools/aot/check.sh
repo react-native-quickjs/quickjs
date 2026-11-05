@@ -32,7 +32,12 @@ S=engine/quickjs-ng
 K2=tools/aot/kernels2
 GOLDEN=$K2/golden
 CC=${CC:-clang}
+# The engine is built with QJS_AOT and tests the unit's symbols for NULL when no unit is linked; Apple's linker needs to be told those references may stay undefined.
+LDX=; [ "$(uname)" = Darwin ] && LDX="-Wl,-undefined,dynamic_lookup"
 WORK=${WORK:-$(dirname "$0")/../../.local/scratch/qjs-check}
+# The generated units include their layout header by the path they were given: an absolute work directory keeps that include resolvable
+# from any directory the compiler looks in.
+mkdir -p "$WORK" && WORK=$(cd "$WORK" && pwd)
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 GEN=qjsaot
 BOX2D=${BOX2D:-.local/box2d-gap/check.js}
@@ -59,7 +64,7 @@ hash_of() { sha256sum -- "$@" 2>/dev/null | sha256sum | cut -c1-16; }
 ENG_HASH=$(hash_of $S/quickjs.c $S/libregexp.c $S/libunicode.c $S/dtoa.c $S/*.h)
 select_gen() {
   GEN_SRC=(tools/aot/qjsaot/*.c)
-  GEN_HASH=$(hash_of "${GEN_SRC[@]}" tools/benchmark/qjs-bench.c "$S/quickjs.h")
+  GEN_HASH=$(hash_of "${GEN_SRC[@]}" tools/benchmark/qjs-bench.c "$S/quickjs.h" tools/aot/check.sh)
   BIN="$WORK/gen/$GEN_HASH/$GEN"
   GEN_BASE="$WORK/gen/$GEN_HASH"
 }
@@ -75,13 +80,13 @@ build_gen() {
   if [ ! -f "$g/libgen.a" ]; then
     local o="$WORK/eng/$ENG_HASH/gen"
     mkdir -p "$o"
-    "$CC" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT_GEN=1 -c $S/quickjs.c -o "$o/quickjs.o" || return 1
+    "$CC" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT_GEN=1 -DJS_ENABLE_DEBUGGER=0 -c $S/quickjs.c -o "$o/quickjs.o" || return 1
     for f in libregexp libunicode dtoa; do
       "$CC" -O2 $BASE -c $S/$f.c -o "$o/$f.o" || return 1
     done
     ar rcs "$g/libgen.a" "$o"/*.o || return 1
   fi
-  "$CC" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT_GEN=1 -o "$BIN" \
+  "$CC" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT_GEN=1 -DJS_ENABLE_DEBUGGER=0 -o "$BIN" \
     "${GEN_SRC[@]}" "$g/libgen.a" -lm || return 1
 }
 
@@ -99,7 +104,7 @@ build_rt() {
   done
   "$CC" -O2 $BASE -c tools/benchmark/qjs-bench.c -o "$o/qjs-bench.o" || return 1
   "$CC" -o "$o/run" "$o/qjs-bench.o" "$o/quickjs.o" "$o/libregexp.o" \
-    "$o/libunicode.o" "$o/dtoa.o" -lm || return 1
+    "$o/libunicode.o" "$o/dtoa.o" -lm $LDX || return 1
 }
 
 # ---- one kernel ------------------------------------------------------------
@@ -118,13 +123,17 @@ build_unit() {
     > /dev/null 2> "$u.census" || { warn "generator failed on $js"; return 1; }
   "$CC" -fsyntax-only $BASE -DQJS_REGVM=1 -DQJS_AOT=1 "$u.c" || {
     warn "emitted C does not parse: $u.c"; return 1; }
-  # A brace-less `if (...)` followed by a statement makes only that statement
-  # conditional. The lowering's leaves print a write-back then a return, so a
-  # brace-less guard would make the write-back conditional and the deopt
-  # unconditional. Flag an `if (...)` line whose next line does not open a
-  # block.
-  if awk '/^[[:space:]]*if \(.*\)[[:space:]]*$/ { n = NR; getline nxt;
-        if (nxt !~ /^[[:space:]]*\{/) { print n ": " $0; bad = 1 } }
+  # A brace-less `if (...)` guarding a frame write-back makes only that write-back
+  # conditional: the lowering's leaves print a write-back then a return, so a
+  # brace-less guard would leave the write-back conditional and the deopt
+  # unconditional. Flag an `if (...)` line whose next line is a write-back that
+  # does not open a block and is followed by a return or goto. (A brace-less guard
+  # around a lone call or return, which the prelude and the entry gates use, is
+  # fine.)
+  if awk '/^[[:space:]]*if \(.*\)[[:space:]]*$/ { n = NR; l = $0; getline nxt;
+        if (nxt ~ /AOT_SET_B|qjs_aot_set_reg/ && nxt !~ /^[[:space:]]*\{/) {
+          getline nxt2;
+          if (nxt2 ~ /^[[:space:]]*(return|goto)/) { print n ": " l; bad = 1 } } }
         END { exit bad ? 0 : 1 }' "$u.c" > "$u.braceif"; then
     warn "emitted C has a brace-less if: $u.c"
     head -3 "$u.braceif"
@@ -134,7 +143,7 @@ build_unit() {
     -c "$u.c" -o "$u.o" || return 1
   local o="$WORK/eng/$ENG_HASH/rt"
   "$CC" -o "$u.bin" "$o/qjs-bench.o" "$u.o" "$o/quickjs.o" "$o/libregexp.o" \
-    "$o/libunicode.o" "$o/dtoa.o" -lm || return 1
+    "$o/libunicode.o" "$o/dtoa.o" -lm $LDX || return 1
 }
 
 # run_pair <name> <js> [flags...]: interpreter against the unit, whole output.

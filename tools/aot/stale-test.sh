@@ -18,9 +18,11 @@ set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
 CLANG=${CLANG:-clang}
+# The engine is built with QJS_AOT and tests the unit's symbols for NULL when no unit is linked; Apple's linker needs to be told those references may stay undefined.
+LDX=; [ "$(uname)" = Darwin ] && LDX="-Wl,-undefined,dynamic_lookup"
 S=engine/quickjs-ng
 O=${AOT_OUT:-${TMPDIR:-$(dirname "$0")/../../.local/scratch}/qjs-aot-stale}
-BASE="-g -std=gnu11 -D_GNU_SOURCE -DJS_ENABLE_DEBUGGER=1 -I$S"
+BASE="-g -std=gnu11 -D_GNU_SOURCE -DJS_ENABLE_DEBUGGER=0 -I$S"   # AOT is release-only: the generator, the engine and the unit must agree on the debugger layout
 mkdir -p "$O/obj"
 fail=0
 
@@ -46,19 +48,19 @@ fi
 log "build generator + engine + plain interpreter"
 "$CLANG" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT_GEN=1 -o "$O/qjsaot" \
   tools/aot/qjsaot/*.c $S/quickjs.c $S/libregexp.c $S/libunicode.c $S/dtoa.c -lm || exit 1
-"$CLANG" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT=1 -DJS_ENABLE_DEBUGGER=0 -c $S/quickjs.c -o "$O/obj/quickjs.o" || exit 1
+"$CLANG" -O2 $BASE -DQJS_REGVM=1 -DQJS_AOT=1 -c $S/quickjs.c -o "$O/obj/quickjs.o" || exit 1
 for f in libregexp libunicode dtoa; do
   "$CLANG" -O2 $BASE -c $S/$f.c -o "$O/obj/$f.o" || exit 1
 done
 "$CLANG" -O2 $BASE -c tools/benchmark/qjs-bench.c -o "$O/obj/qjs-bench.o" || exit 1
 "$CLANG" -o "$O/plain-run" "$O/obj/qjs-bench.o" \
-  "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm || exit 1
+  "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm $LDX || exit 1
 
 log "generate unit from bundle A"
 "$O/qjsaot" --out "$O/unitA.c" --layout-header "$O/unitA-layout.h" --all "$O/bundleA.js" 2>"$O/unitA.census" || exit 1
 "$CLANG" -O2 $BASE -I"$O" -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/unitA.c" -o "$O/obj/unitA.o" || exit 1
 "$CLANG" -o "$O/bench-A" "$O/obj/qjs-bench.o" "$O/obj/unitA.o" \
-  "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm || exit 1
+  "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm $LDX || exit 1
 
 # --- run --------------------------------------------------------------------
 log "run plain interpreter on both bundles"

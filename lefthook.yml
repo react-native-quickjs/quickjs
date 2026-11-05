@@ -9,6 +9,7 @@ pre-commit:
       # match, and vendored code gets checked against our style.
       exclude:
         - "engine/**"
+        - "tools/aot/**"   # the AOT generator and its tests are tooling that has never been formatted
         - "tests/third_party/**"
         # modules/napi/include/*.h are Node's own headers, copied verbatim,
         # and modules/napi/cpp/** is a fork of an external node-api

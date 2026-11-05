@@ -2796,6 +2796,8 @@ static void js_proxy_mark(JSRuntime *rt, JSValueConst val,
 static void js_map_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_map_mark(JSRuntime *rt, JSValueConst val,
                                 JS_MarkFunc *mark_func);
+static void js_weakmap_mark(JSRuntime *rt, JSValueConst val,
+                            JS_MarkFunc *mark_func);
 static void js_map_iterator_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_map_iterator_mark(JSRuntime *rt, JSValueConst val,
                                 JS_MarkFunc *mark_func);
@@ -3951,7 +3953,7 @@ static JSClassShortDef const js_std_class_def[] = {
     { JS_ATOM_BigInt, js_object_data_finalizer, js_object_data_mark },      /* JS_CLASS_BIG_INT */
     { JS_ATOM_Map, js_map_finalizer, js_map_mark },             /* JS_CLASS_MAP */
     { JS_ATOM_Set, js_map_finalizer, js_map_mark },             /* JS_CLASS_SET */
-    { JS_ATOM_WeakMap, js_map_finalizer, NULL },         /* JS_CLASS_WEAKMAP */
+    { JS_ATOM_WeakMap, js_map_finalizer, js_weakmap_mark }, /* JS_CLASS_WEAKMAP */
     { JS_ATOM_WeakSet, js_map_finalizer, NULL },         /* JS_CLASS_WEAKSET */
     { JS_ATOM_Iterator, NULL, NULL },                           /* JS_CLASS_ITERATOR */
     { JS_ATOM_IteratorConcat, js_iterator_concat_finalizer, js_iterator_concat_mark }, /* JS_CLASS_ITERATOR_CONCAT */
@@ -10944,6 +10946,20 @@ static void free_zero_refcount(JSRuntime *rt)
         if (el == &rt->gc_zero_ref_count_list)
             break;
         p = list_entry(el, JSGCObjectHeader, link);
+#if QJS_DRC
+        if (JS_REF_COUNT(p) > 0) {
+            /* A parked object that a register (or a job) took a reference on again: it is not garbage. A drain started
+               from inside the reconcile (freeing a symbol runs its weak-reference records, which free values) meets such
+               objects before the reconcile's own pass has put them back. */
+            list_del(&p->link);
+            JS_GC_IN_ZCT(p) = 0;
+            if (JS_GC_NOTRACE(p))
+                list_add_tail(&p->link, &rt->gc_notrace_list);
+            else
+                list_add_tail(&p->link, &rt->gc_obj_list);
+            continue;
+        }
+#endif
         assert(JS_REF_COUNT(p) == 0);
         if (likely(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT &&
                    ((JSObject *)p)->class_id == JS_CLASS_OBJECT &&
@@ -12126,6 +12142,8 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
         case JS_CLASS_DATE:              /* u.object_data */
         case JS_CLASS_BIG_INT:           /* u.object_data */
             compute_value_size(p->u.object_data, hp);
+            break;
+        case JS_CLASS_OBJECT:            /* no class data: the union is not used */
             break;
         case JS_CLASS_C_FUNCTION:        /* u.cfunc */
             s->c_func_count++;
@@ -15581,7 +15599,10 @@ static inline bool js_arr_packed_num_int(JSValueConst v, int32_t *i)
     }
     if (JS_TAG_IS_FLOAT64(tag)) {
         double d = JS_VALUE_GET_FLOAT64(v);
-        int32_t k = (int32_t)d;
+        int32_t k;
+        if (!(d >= -2147483648.0 && d <= 2147483647.0))
+            return false;
+        k = (int32_t)d;
         if ((double)k == d && !(k == 0 && signbit(d))) {
             *i = k;
             return true;
@@ -62130,6 +62151,16 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         }
     }
 
+    /* A literal in code the pass dropped (what follows a return) was never reached:
+       it keeps no template, so the template table counts only the live ones. */
+    for (; objlit_k < s->objlit_count; objlit_k++) {
+        JSObjLitSite *site = &s->objlit_sites[objlit_k];
+
+        site->template_index = UINT16_MAX;
+        site->tab_idx = -1;
+        site->pos = -1;
+    }
+
     /* check that there were no missing labels */
     for(i = 0; i < s->label_count; i++) {
         assert(label_slots[i].first_reloc == NULL);
@@ -65089,6 +65120,13 @@ static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b)
         for (pi = 0; pi < pf->pc_n; pi++)
             if (pf->pcs[pi].rshape != NULL)
                 js_free_shape(rt, pf->pcs[pi].rshape);
+    }
+    if (pf->sites != NULL) {
+        int si, sj;
+        for (si = 0; si < pf->nsites; si++)
+            for (sj = 0; sj < pf->sites[si].nshapes; sj++)
+                if (pf->sites[si].shapes[sj] != NULL)
+                    js_free_shape(rt, pf->sites[si].shapes[sj]);
     }
     js_free_rt(rt, pf->pcs);
     js_free_rt(rt, pf->cov);
@@ -84542,6 +84580,20 @@ static int bc_get_leb128_int(BCReaderState *s, int *pval)
     return bc_get_leb128(s, (uint32_t *)pval);
 }
 
+/* An entry count: a value that does not fit an int is not one any writer produced. */
+static int bc_get_leb128_count(BCReaderState *s, int *pval)
+{
+    uint32_t val;
+    if (bc_get_leb128(s, &val))
+        return -1;
+    if (val > INT32_MAX) {
+        JS_ThrowSyntaxError(s->ctx, "invalid count");
+        return -1;
+    }
+    *pval = (int)val;
+    return 0;
+}
+
 static int bc_get_leb128_u16(BCReaderState *s, uint16_t *pval)
 {
     uint32_t val;
@@ -85129,6 +85181,11 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
             JS_ThrowSyntaxError(ctx, "invalid register constant kind %d", ops[1]);
             goto fail_ins;
         }
+        if (op == ROP_make_closure &&
+            JS_VALUE_GET_TAG(b->cpool[ops[1]]) != JS_TAG_FUNCTION_BYTECODE) {
+            JS_ThrowSyntaxError(ctx, "register closure constant is not a function");
+            goto fail_ins;
+        }
         if (!regvm_slot_operands_ok(b, op, ops)) {
             JS_ThrowSyntaxError(ctx, "register slot out of range");
             goto fail_ins;
@@ -85319,6 +85376,21 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
                 return -1;
             }
             put_u32(bc_buf + pos + 1, atom);
+            break;
+        case OP_FMT_const:
+        case OP_FMT_const8:
+            /* The constant pool was read before the code: an operand must name
+               an entry, and a closure must name function bytecode, which the
+               interpreter takes as such. */
+            idx = short_opcode_info(op).fmt == OP_FMT_const ?
+                get_u32(bc_buf + pos + 1) : bc_buf[pos + 1];
+            if (idx >= (uint32_t)b->cpool_count ||
+                ((op == OP_fclosure || op == OP_fclosure8) &&
+                 JS_VALUE_GET_TAG(b->cpool[idx]) != JS_TAG_FUNCTION_BYTECODE)) {
+                JS_ThrowSyntaxError(s->ctx, "invalid constant operand");
+                b->byte_code_len = pos;
+                return -1;
+            }
             break;
         default:
             break;
@@ -85641,6 +85713,11 @@ static int regvm_validate_code(JSContext *ctx, const JSFunctionBytecode *b)
         if (op == ROP_load_const &&
             ops[1] != REG_CONST_CPOOL && ops[1] != REG_CONST_ATOM) {
             JS_ThrowSyntaxError(ctx, "invalid register constant kind %d", ops[1]);
+            goto done;
+        }
+        if (op == ROP_make_closure &&
+            JS_VALUE_GET_TAG(b->cpool[ops[1]]) != JS_TAG_FUNCTION_BYTECODE) {
+            JS_ThrowSyntaxError(ctx, "register closure constant is not a function");
             goto done;
         }
         for (m = 0; fmt[m]; m++) {
@@ -86247,18 +86324,20 @@ static JSValue JS_ReadModule(BCReaderState *s)
         printf("\n");
     }
 #endif
+    int rd_cnt = 0;
     m = js_new_module_def(ctx, module_name);
     if (!m)
         goto fail;
     obj = js_dup(JS_MKPTR(JS_TAG_MODULE, m));
-    if (bc_get_leb128_int(s, &m->req_module_entries_count))
+    if (bc_get_leb128_count(s, &rd_cnt))
         goto fail;
     obj = JS_NewModuleValue(ctx, m);
-    if (m->req_module_entries_count != 0) {
-        m->req_module_entries_size = m->req_module_entries_count;
+    if (rd_cnt != 0) {
+        m->req_module_entries_size = rd_cnt;
         m->req_module_entries = js_mallocz(ctx, sizeof(m->req_module_entries[0]) * m->req_module_entries_size);
         if (!m->req_module_entries)
             goto fail;
+        m->req_module_entries_count = rd_cnt;
         for(i = 0; i < m->req_module_entries_count; i++) {
             JSReqModuleEntry *rme = &m->req_module_entries[i];
             JSModuleDef **pm = &rme->module;
@@ -86281,13 +86360,14 @@ static JSValue JS_ReadModule(BCReaderState *s)
         }
     }
 
-    if (bc_get_leb128_int(s, &m->export_entries_count))
+    if (bc_get_leb128_count(s, &rd_cnt))
         goto fail;
-    if (m->export_entries_count != 0) {
-        m->export_entries_size = m->export_entries_count;
+    if (rd_cnt != 0) {
+        m->export_entries_size = rd_cnt;
         m->export_entries = js_mallocz(ctx, sizeof(m->export_entries[0]) * m->export_entries_size);
         if (!m->export_entries)
             goto fail;
+        m->export_entries_count = rd_cnt;
         for(i = 0; i < m->export_entries_count; i++) {
             JSExportEntry *me = &m->export_entries[i];
             if (bc_get_u8(s, &v8))
@@ -86299,6 +86379,8 @@ static JSValue JS_ReadModule(BCReaderState *s)
             } else {
                 if (bc_get_leb128_int(s, &me->u.req_module_idx))
                     goto fail;
+                if ((uint32_t)me->u.req_module_idx >= (uint32_t)m->req_module_entries_count)
+                    goto fail_index;
                 if (bc_get_atom(s, &me->local_name))
                     goto fail;
             }
@@ -86307,27 +86389,31 @@ static JSValue JS_ReadModule(BCReaderState *s)
         }
     }
 
-    if (bc_get_leb128_int(s, &m->star_export_entries_count))
+    if (bc_get_leb128_count(s, &rd_cnt))
         goto fail;
-    if (m->star_export_entries_count != 0) {
-        m->star_export_entries_size = m->star_export_entries_count;
+    if (rd_cnt != 0) {
+        m->star_export_entries_size = rd_cnt;
         m->star_export_entries = js_mallocz(ctx, sizeof(m->star_export_entries[0]) * m->star_export_entries_size);
         if (!m->star_export_entries)
             goto fail;
+        m->star_export_entries_count = rd_cnt;
         for(i = 0; i < m->star_export_entries_count; i++) {
             JSStarExportEntry *se = &m->star_export_entries[i];
             if (bc_get_leb128_int(s, &se->req_module_idx))
                 goto fail;
+            if ((uint32_t)se->req_module_idx >= (uint32_t)m->req_module_entries_count)
+                goto fail_index;
         }
     }
 
-    if (bc_get_leb128_int(s, &m->import_entries_count))
+    if (bc_get_leb128_count(s, &rd_cnt))
         goto fail;
-    if (m->import_entries_count != 0) {
-        m->import_entries_size = m->import_entries_count;
+    if (rd_cnt != 0) {
+        m->import_entries_size = rd_cnt;
         m->import_entries = js_mallocz(ctx, sizeof(m->import_entries[0]) * m->import_entries_size);
         if (!m->import_entries)
             goto fail;
+        m->import_entries_count = rd_cnt;
         for(i = 0; i < m->import_entries_count; i++) {
             JSImportEntry *mi = &m->import_entries[i];
             if (bc_get_leb128_int(s, &mi->var_idx))
@@ -86336,6 +86422,8 @@ static JSValue JS_ReadModule(BCReaderState *s)
                 goto fail;
             if (bc_get_leb128_int(s, &mi->req_module_idx))
                 goto fail;
+            if ((uint32_t)mi->req_module_idx >= (uint32_t)m->req_module_entries_count)
+                goto fail_index;
         }
     }
 
@@ -86346,7 +86434,32 @@ static JSValue JS_ReadModule(BCReaderState *s)
     m->func_obj = JS_ReadObjectRec(s);
     if (JS_IsException(m->func_obj))
         goto fail;
+    /* A module's body is function bytecode. Any other value is owned by the
+       module definition, which the collector does not trace: a plain object
+       there counts as an outside reference and keeps its prototype chain, and
+       through it the whole realm, alive after the context is released. */
+    if (JS_VALUE_GET_TAG(m->func_obj) != JS_TAG_FUNCTION_BYTECODE) {
+        JS_ThrowSyntaxError(ctx, "invalid module function");
+        goto fail;
+    }
+    /* The variable indices select entries of the body's closure variables
+       (the module's var_refs array). */
+    {
+        const JSFunctionBytecode *mb = JS_VALUE_GET_PTR(m->func_obj);
+        for(i = 0; i < m->export_entries_count; i++) {
+            const JSExportEntry *me = &m->export_entries[i];
+            if (me->export_type == JS_EXPORT_TYPE_LOCAL &&
+                (uint32_t)me->u.local.var_idx >= (uint32_t)mb->closure_var_count)
+                goto fail_index;
+        }
+        for(i = 0; i < m->import_entries_count; i++) {
+            if ((uint32_t)m->import_entries[i].var_idx >= (uint32_t)mb->closure_var_count)
+                goto fail_index;
+        }
+    }
     return obj;
+ fail_index:
+    JS_ThrowSyntaxError(ctx, "invalid module entry index");
  fail:
     if (m) {
         js_free_module_def(ctx, m);
@@ -103606,6 +103719,25 @@ static void js_map_finalizer(JSRuntime *rt, JSValueConst val)
         }
         js_free_rt(rt, s->hash_table);
         js_free_rt(rt, s);
+    }
+}
+
+/* The values of a WeakMap entry whose key is an object are marked from that key (mark_weak_map_value). A symbol is not a collectable
+   object, so nothing marks the values of entries keyed by one: the collector would count the map's reference to such a value as
+   external and keep the value, and everything it reaches, alive for as long as the runtime lives. The map marks them itself. */
+static void js_weakmap_mark(JSRuntime *rt, JSValueConst val,
+                            JS_MarkFunc *mark_func)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JSMapState *s = p->u.map_state;
+    struct list_head *el;
+
+    if (s) {
+        list_for_each(el, &s->records) {
+            JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+            if (!mr->empty && JS_VALUE_GET_TAG(mr->key) == JS_TAG_SYMBOL)
+                JS_MarkValue(rt, mr->value, mark_func);
+        }
     }
 }
 

@@ -1,0 +1,32 @@
+Subject: A drain started inside the reconcile puts re-referenced objects back instead of freeing them
+
+What this does
+  - `free_zero_refcount` (register VM builds with deferred counts) moves a parked object whose count is above zero back onto its live list instead of freeing it (and asserting).
+
+Why we need it
+  `js_drc_reconcile_locked` first frees the parked non-collectable values (strings, symbols), and only afterwards puts back the parked objects that something took a reference on again. Freeing a symbol runs its weak-reference records (`reset_weak_ref`): a WeakMap entry whose value is the last reference to a FinalizationRegistry frees the registry, and that free drains the zero-count list from inside the reconcile, where it still holds the re-referenced objects the reconcile has not yet filtered. The drain freed them (a release build) or failed `assert(JS_REF_COUNT(p) == 0)`.
+
+Failure
+  `let key = Symbol("k"); let wm = new WeakMap(); let fr = new FinalizationRegistry(() => {}); fr.register(key, 42); wm.set(key, fr); fr = null; key = null` in a register-VM build with assertions aborted in `free_zero_refcount` while the runtime was freed; found by the eval fuzzer. The stack VM is unaffected.
+
+Soundness
+  - Only an object with a non-zero count is moved, and it goes where the reconcile's own filter puts it (`gc_obj_list`, or `gc_notrace_list` for no-trace objects, with the parked flag cleared); an object at count zero is freed as before.
+  - The reconcile's later pass finds those objects already back and has nothing to do for them.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -10946,0 +10947,14 @@
++#if QJS_DRC
++        if (JS_REF_COUNT(p) > 0) {
++            /* A parked object that a register (or a job) took a reference on again: it is not garbage. A drain started
++               from inside the reconcile (freeing a symbol runs its weak-reference records, which free values) meets such
++               objects before the reconcile's own pass has put them back. */
++            list_del(&p->link);
++            JS_GC_IN_ZCT(p) = 0;
++            if (JS_GC_NOTRACE(p))
++                list_add_tail(&p->link, &rt->gc_notrace_list);
++            else
++                list_add_tail(&p->link, &rt->gc_obj_list);
++            continue;
++        }
++#endif

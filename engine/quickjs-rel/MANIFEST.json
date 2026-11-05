@@ -1835,12 +1835,52 @@
       "sha256": "0a52914608e939e2f35c208d17f648925dbd269ad4d5ea330472db0d37c370ac"
     },
     {
+      "name": "0465-objlit-dead-code-template.patch",
+      "sha256": "8154904a1b49b970a70f56e46fe6f68765c25b8c5601c4ee310d387a6e1734e6"
+    },
+    {
+      "name": "0466-aot-prof-site-shapes-released.patch",
+      "sha256": "dfed48f0ecb59803758c065f06a2ce03fde269872039efe7a634df906f664f5f"
+    },
+    {
+      "name": "0467-run-test262-error-file-name.patch",
+      "sha256": "8c383a4e5305dfa7acbb58283391a267d958a3214a02ab778ab080907a76f247"
+    },
+    {
+      "name": "0468-module-loader-count-before-alloc.patch",
+      "sha256": "cdb988a3a86d1559b1705b4a390653ee3adf1c47e221f1a33c61e47fda88ed36"
+    },
+    {
+      "name": "0469-memory-usage-plain-object.patch",
+      "sha256": "9bf0c42f71f7d631789688b4e666e0b75085345855cd1e88505f80fa3304d246"
+    },
+    {
+      "name": "0471-drc-drain-skips-rereferenced.patch",
+      "sha256": "64c244aee55c57bd54d336a91b86e9f7acbecb89faad2d0326c9c8ef40556980"
+    },
+    {
+      "name": "0472-weakmap-symbol-key-values-marked.patch",
+      "sha256": "75ab412dca03a277e8291083ccec2b7580bf1ce4b256f24c16be4aefee5c3ab7"
+    },
+    {
+      "name": "0473-packed-num-int-range-test.patch",
+      "sha256": "b33605ad6c294c4493cfa2eb12f947a636ba5c62012379c1a0660fba46f2601b"
+    },
+    {
+      "name": "0474-module-body-must-be-bytecode.patch",
+      "sha256": "a6fc35f7ab9fda07726749cd5f2cd3c19c88ca42f2bd4a6088d41b7c19a74beb"
+    },
+    {
+      "name": "0475-reader-typed-slot-checks.patch",
+      "sha256": "d2b07807e7ce5bd434a010bbdb4fdd83af5a84b0038ec6455f9229413ddaf5b3"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "a2b196ac39cdd2ad36b3d88077d974f6494a8b550ab22b1508ddcf253686f653",
+    "quickjs.c": "f2ab1fa020eadf8b0bd84391e548c8bc1b84923532f448f5fc0bf24d5798585d",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

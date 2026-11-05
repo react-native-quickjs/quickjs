@@ -1,0 +1,21 @@
+Subject: A float64 outside the int32 range is not converted before the range test in the packed-array kind check
+
+What this does
+  - `js_arr_packed_num_int` tests that the double lies in [-2^31, 2^31-1] before it converts it to int32_t.
+
+Why we need it
+  The function answered "does this number fit an int32 element" by converting first and comparing the round trip. Converting a double outside the int32 range is undefined behaviour in C, so an optimizing compiler may assume the round trip always holds and return true with a garbage element.
+
+Failure
+  Storing a number such as 1e10 into a packed array whose kind is int32 could be taken as an int and stored as a garbage int32 (observed class: the same defect in the AOT region number normaliser returned NaN under -O1 and above). Found by auditing double-to-int casts after that bug; no failing run of this function was observed.
+
+Soundness
+  The new test only rejects values the old code could not have converted defined-ly; every in-range value takes the unchanged path, NaN fails the comparison and returns false as before.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -15602 +15602,4 @@
+-        int32_t k = (int32_t)d;
++        int32_t k;
++        if (!(d >= -2147483648.0 && d <= 2147483647.0))
++            return false;
++        k = (int32_t)d;

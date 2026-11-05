@@ -1,0 +1,20 @@
+Subject: run-test262 owns the error-file name it was given with -e
+
+What this does
+  - The `-e FILE` option copies the file name (`strdup`) and releases a name set earlier by the configuration, instead of keeping a pointer into `argv`.
+
+Why we need it
+  `main` ends with `free(error_filename)`. A name from the configuration is allocated, but the one from `-e` pointed into `argv`, so the final `free` released a pointer `malloc` never returned.
+
+Failure
+  `run-test262 -e FILE ...` ended in SIGABRT (exit 134) after printing its results, on macOS (`pointer being freed was not allocated`), in every build, and the result line was the last thing a script saw.
+
+Soundness
+  - Only the process-exit path of the test runner changes; a name taken from the configuration is freed once, as before.
+
+--- a/run-test262.c
++++ b/run-test262.c
+@@ -2225 +2225,2 @@
+-            error_filename = get_opt_arg(arg, argv[optind++]);
++            free(error_filename);
++            error_filename = strdup(get_opt_arg(arg, argv[optind++]));

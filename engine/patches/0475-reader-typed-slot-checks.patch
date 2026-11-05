@@ -1,0 +1,71 @@
+Subject: The bytecode loader checks the constant operands and module indices it later trusts
+
+What this does
+  - Stack bytecode: an `OP_push_const`/`OP_fclosure` operand (and the 8-bit forms) must name an entry of the constant pool, and a closure operand must name function bytecode.
+  - Register bytecode: an `ROP_make_closure` operand must name function bytecode (the index range was already checked).
+  - Module containers: the required-module index of an export, a star export and an import must be below the required-module count, and the variable index of a local export and of an import must be below the closure-variable count of the module body.
+  - Every violation fails the load with a SyntaxError and the half-built function or module is released as on the other malformed-container paths.
+
+Why we need it
+  The loader stored the values and indices it read into typed places and checked only that they were readable. The interpreter takes `cpool[idx]` as function bytecode for a closure, indexes the constant pool with the operand as written, indexes a module's required-module table and variable references with the stored indices. A container that is checksum-valid but mutated therefore reached out-of-range reads or type confusion at link or run time. The reader audit (every `JS_ReadObjectRec` result and every stored index) found these unchecked; the other stored values (object properties, array elements, map entries, template raw) are generic values that no later path treats as typed, the typed array buffer and the date value are checked already, and object references are bounds-checked.
+
+Soundness
+  Containers the writer produces satisfy every new check (operands name pool entries, closures name bytecode, indices come from the compiler's own tables), so valid containers load as before.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -85181,0 +85182,5 @@
++            goto fail_ins;
++        }
++        if (op == ROP_make_closure &&
++            JS_VALUE_GET_TAG(b->cpool[ops[1]]) != JS_TAG_FUNCTION_BYTECODE) {
++            JS_ThrowSyntaxError(ctx, "register closure constant is not a function");
+@@ -85373,0 +85379,15 @@
++            break;
++        case OP_FMT_const:
++        case OP_FMT_const8:
++            /* The constant pool was read before the code: an operand must name
++               an entry, and a closure must name function bytecode, which the
++               interpreter takes as such. */
++            idx = short_opcode_info(op).fmt == OP_FMT_const ?
++                get_u32(bc_buf + pos + 1) : bc_buf[pos + 1];
++            if (idx >= (uint32_t)b->cpool_count ||
++                ((op == OP_fclosure || op == OP_fclosure8) &&
++                 JS_VALUE_GET_TAG(b->cpool[idx]) != JS_TAG_FUNCTION_BYTECODE)) {
++                JS_ThrowSyntaxError(s->ctx, "invalid constant operand");
++                b->byte_code_len = pos;
++                return -1;
++            }
+@@ -85695,0 +85716,5 @@
++            goto done;
++        }
++        if (op == ROP_make_closure &&
++            JS_VALUE_GET_TAG(b->cpool[ops[1]]) != JS_TAG_FUNCTION_BYTECODE) {
++            JS_ThrowSyntaxError(ctx, "register closure constant is not a function");
+@@ -86356,0 +86382,2 @@
++                if ((uint32_t)me->u.req_module_idx >= (uint32_t)m->req_module_entries_count)
++                    goto fail_index;
+@@ -86376,0 +86404,2 @@
++            if ((uint32_t)se->req_module_idx >= (uint32_t)m->req_module_entries_count)
++                goto fail_index;
+@@ -86395,0 +86425,2 @@
++            if ((uint32_t)mi->req_module_idx >= (uint32_t)m->req_module_entries_count)
++                goto fail_index;
+@@ -86413,0 +86445,15 @@
++    /* The variable indices select entries of the body's closure variables
++       (the module's var_refs array). */
++    {
++        const JSFunctionBytecode *mb = JS_VALUE_GET_PTR(m->func_obj);
++        for(i = 0; i < m->export_entries_count; i++) {
++            const JSExportEntry *me = &m->export_entries[i];
++            if (me->export_type == JS_EXPORT_TYPE_LOCAL &&
++                (uint32_t)me->u.local.var_idx >= (uint32_t)mb->closure_var_count)
++                goto fail_index;
++        }
++        for(i = 0; i < m->import_entries_count; i++) {
++            if ((uint32_t)m->import_entries[i].var_idx >= (uint32_t)mb->closure_var_count)
++                goto fail_index;
++        }
++    }
+@@ -86414,0 +86461,2 @@
++ fail_index:
++    JS_ThrowSyntaxError(ctx, "invalid module entry index");
