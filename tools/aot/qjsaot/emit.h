@@ -25,6 +25,7 @@
 void e_fatal(const char *what, const char *hex);
 void e_fatal_set_hex(const char *h);
 int e_fatal_taken(void);
+int e_body_stub_taken(void);
 void e_fatal_reset(void);
 int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]);
 
@@ -240,5 +241,9 @@ void qjs_aot_note_frame_regs(int index, int nregs);
 /* How many registers the unit compiled the function at unit index `i` for: the
    program's own count until a body publishes a wider one. */
 int qjs_aot_frame_regs(int index);
+
+/* The interpreter finishes an activation an exit leaves (no compiled generic body). QJS_AOT_GENERIC=1 restores the generic bodies. */
+#include <stdlib.h>
+static inline int e_nogeneric(void) { return getenv("QJS_AOT_GENERIC") == NULL; }
 
 #endif /* QJSAOT_EMIT_H */

@@ -88,9 +88,18 @@ static uint8_t *read_file(const char *path, size_t *out_size) {
   return buf;
 }
 
+/* A sanitizer build: gcc defines __SANITIZE_*, clang only answers __has_feature. */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define QJS_RUN_SANITIZED 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+    __has_feature(memory_sanitizer)
+#define QJS_RUN_SANITIZED 1
+#endif
+#endif
+
 /* An optimised build keeps the 4 MB limit the fixtures were written against. */
-#if defined(NDEBUG) && !defined(__SANITIZE_ADDRESS__) && \
-    !defined(__SANITIZE_THREAD__)
+#if defined(NDEBUG) && !defined(QJS_RUN_SANITIZED)
 #define QJS_RUN_STACK_LIMIT (4 * 1024 * 1024)
 #else
 #define QJS_RUN_STACK_LIMIT (48 * 1024 * 1024)

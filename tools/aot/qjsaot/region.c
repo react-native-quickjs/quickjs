@@ -58,6 +58,9 @@ typedef struct RGuard {
   int crecv;              /* TRUST: the receiver is a constant path (a static method `G.m()`): one arm, the method bound at init */
 } RGuard;
 
+unsigned long long qjs_aot_prof_site_calls(const uint8_t dg[16], int next_pc);
+unsigned long long qjs_aot_prof_entries(const uint8_t dg[16]);
+int qjs_aot_regs_of_gen(const JSAotGenFunc *g);
 typedef struct RInst {
   Q2Func q;
   const JSAotGenFunc *g;
@@ -89,6 +92,7 @@ typedef struct RInst {
   int *mpc;               /* ... and the pc of that read */
   int kcls;               /* TRUST: 1 + the class (region class table) of `this`, known from the arm that expanded this instance */
   int ctp;                /* TRUST: 1 + the constant path that `this` is (an arm of a static method `G.m()`) */
+  uint64_t key;           /* identifies the instance across the walks of one region (its parent's key, the call pc, the arm): the line cap names the instances it cuts by it */
   int ool;                /* TRUST: the arm is called out of line (a callee with a loop of its own runs its own compiled body), not expanded */
   int wrap;               /* a forwarding constructor `function () { this.m.apply(this, arguments); }`: its variable area is the two slots the pattern uses (see rg_wrapper) */
   int wr_uninit_pc, wr_put_pc, wr_read_pc;
@@ -144,7 +148,7 @@ static int rg_img_ok(const RCons *K) {
 }
 
 /* An exit stub: the root's frame state (`root`, AOT_SET_B lines), and for an exit inside inlined code the chain of inlined frames to materialise (`rest`). */
-typedef struct RXit { int pc, d, rpc, cep, cii; unsigned long long h; char *root, *rest; } RXit;
+typedef struct RXit { int pc, d, rpc, cep, cii; unsigned long long h; char *root, *rest; char *t3, *t3pre; int nofpc; } RXit;   /* t3: the stub's frame-state code as one call to the region's shared builder with a per-site descriptor (tier 3) */
 typedef struct RStr { char *p; size_t n, cap; } RStr;
 
 typedef struct RCtx {
@@ -176,6 +180,7 @@ typedef struct RCtx {
   char why[200];
   char ownres[256][24];   /* TRUST: the names of call results every path of whose call put in the owned list (held to the region's end) */
   int nownres;
+  int t3used;   /* some stub calls the tier-3 builder: emit it */
   RStr ools;              /* TRUST: the frame states the out-of-line calls hold (their values must be set where their instances begin) */
   int nsc; int sc_site[96]; char sc_text[96][48]; char sc_dg[96][33];   /* TRUST: the constructor path (`NS.P`) of an allocation site whose constructor is not a global, from the construct that makes it */
   RCls cls[RG_MAXCL];     /* TRUST: the class table */
@@ -697,6 +702,16 @@ static void rs_add(RStr *s, const char *fmt, ...) {
 }
 
 /* The instance table grows: an instance is allocated when it is first asked for and never moves. */
+/* The emitted-line cap per compiled function (QJS_AOT_FN_LINE_CAP=N, off when unset): a region whose inlined instances are estimated to emit more than N C
+   lines has the coldest (then the largest) instances cut: a cut instance is called out of line, as the callee's own compiled body (or the interpreter when it
+   has none). The estimate is QJS_AOT_FN_LINES_PER_VALUE (default 12) lines per value of an instance. The cut set is found after the first walk, and the region
+   is walked again with it (region_emit retries). */
+static uint64_t g_cut[1024];
+static int g_ncut, g_cut_retry;
+static int rg_cut_has(uint64_t k) { int i; for (i = 0; i < g_ncut; i++) if (g_cut[i] == k) return 1; return 0; }
+static int rg_line_cap(void) { const char *e = getenv("QJS_AOT_FN_LINE_CAP"); return e != NULL ? atoi(e) : 0; }
+static int rg_lines_per_value(void) { const char *e = getenv("QJS_AOT_FN_LINES_PER_VALUE"); return e != NULL && atoi(e) > 0 ? atoi(e) : 12; }
+
 static RInst *rg_newinst(RCtx *c, int i) {
   if (i >= c->nincap) {
     int ncap = c->nincap ? c->nincap * 2 : 32, k;
@@ -856,10 +871,19 @@ static int rg_acc_cons(const RCtx *c) {
 }
 static int rg_has_retslot(const RCtx *c) { return rg_retslot_on() && rg_acc_cons(c) >= 0; }
 static int rg_skf(const RCtx *c) { return c->nstack > 0 || c->lent != 0; }
+/* Tier 3 (the default; QJS_AOT_REGION_NOT3=1 turns it off): an exit stub's frame state (the stores of the root frame, then the chain of inlined frames) is not code at the stub. The stub names the live values in
+   an array and describes the rest in static data (offsets, the frame table), and one shared builder per region (rg_t3b_HEX) stores, builds the chain and runs it. It returns 0 (go
+   on: free the owned list, return to the generic body), 1 (the no-frames knob: return at the call's read pc) or 2 (an exception). */
+typedef struct RT3 { RStr vals, cos, offs, fcs; int nv, nc, nroot, noffs, on, bad, nst; } RT3;
+static int rg_t3_on(void) { static int v = -1; if (v < 0) v = getenv("QJS_AOT_REGION_NOT3") == NULL; return v; }
+static int rg_t3_min(void) { static int v = -1; if (v < 0) v = getenv("QJS_AOT_REGION_T3_MIN") ? atoi(getenv("QJS_AOT_REGION_T3_MIN")) : 6; return v; }
+static void t3_free(RT3 *t) { free(t->vals.p); free(t->cos.p); free(t->offs.p); free(t->fcs.p); }
 static int rg_xit_x(RCtx *c, int ii, int pc) {
   int chain[16], d = 0, k, i, j, r, rpc, total = 0, off, nlv;
   RInst *I0 = c->in[0], *C1 = NULL;
   RStr rt = {0}, rs = {0};
+  RT3 t3;
+  int foffs_[16];
   unsigned long long h = 1469598103934665603ull;
   const char *cp;
   RXit *x;
@@ -870,6 +894,8 @@ static int rg_xit_x(RCtx *c, int ii, int pc) {
   for (i = 0; i < d / 2; i++) { k = chain[i]; chain[i] = chain[d - 1 - i]; chain[d - 1 - i] = k; }
   if (d > 0) C1 = c->in[chain[0]];
   rpc = d ? C1->par_pc_after : pc;
+  memset(&t3, 0, sizeof t3);
+  t3.on = rg_t3_on() && e_nogeneric() && getenv("QJS_AOT_REGION_NOWRAPSKFIX") == NULL && getenv("QJS_AOT_REGION_NOSKFIXCTOR") == NULL && getenv("QJS_AOT_FASTSTATS") == NULL;
   if (c->lent != 0) rs_add(&rt, "    (void)RG_BORP();\n");   /* a block lent to this function moves to the heap before any name below is read */
   if (c->nstack > 0) {
     /* a stack object alive at this exit moves to the heap first (its references move: qjs_aot_stack_migrate); sk_ho / sk_ha are the heap object and Array, and every
@@ -919,11 +945,15 @@ static int rg_xit_x(RCtx *c, int ii, int pc) {
       }
     }
   }
+  size_t t3pre = rt.n;   /* the stub's prelude (lent block, stack migration, virtual objects) stays at the stub; the stores and the chain become the descriptor */
   uint8_t keep0[256], keepj[16][256];
   int cen_ok, cen_ep;
   rg_exit_keep(I0, rpc, keep0);
   for (j = 0; j < d; j++) rg_exit_keep(c->in[chain[j]], j + 1 < d ? c->in[chain[j + 1]]->par_pc_after : pc, keepj[j]);
-  for (r = 0; r < 256; r++) if (I0->cur[r][0] && keep0[r]) rs_add(&rt, rg_skf(c) ? "    AOT_SET_B(ctx, fr, %d, SKFIX(%s));\n" : "    AOT_SET_B(ctx, fr, %d, %s);\n", r * 16, I0->cur[r]);
+  for (r = 0; r < 256; r++) if (I0->cur[r][0] && keep0[r]) {
+    rs_add(&rt, rg_skf(c) ? "    AOT_SET_B(ctx, fr, %d, SKFIX(%s));\n" : "    AOT_SET_B(ctx, fr, %d, %s);\n", r * 16, I0->cur[r]);
+    if (t3.on) { rs_add(&t3.vals, rg_skf(c) ? "%sSKFIX(%s)" : "%s%s", t3.nv ? ", " : "", I0->cur[r]); rs_add(&t3.offs, "%s%d", t3.noffs ? ", " : "", r * 16); t3.nv++; t3.noffs++; t3.nroot++; t3.nst++; }
+  }
   if (d > 0) {
     for (j = 0; j < d; j++) {
       RInst *J = c->in[chain[j]];
@@ -937,16 +967,19 @@ static int rg_xit_x(RCtx *c, int ii, int pc) {
     if (C1->par_kind == 1) rs_add(&rs, rg_skf(c) ? "      AOT_SET_B(ctx, fr, %d, SKFIX(rn_%d));\n" : "      AOT_SET_B(ctx, fr, %d, rn_%d);\n", C1->par_dst * 16, C1->par_cons);
     rs_add(&rs, "      *(const uint8_t **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_CAP_IP) = *(const uint8_t *const *)(*(uint8_t **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_B) + QJS_AOT_OFF_FNBC_REGVM_CODE) + %d;\n", C1->par_call_pc);
     off = 0;
+    if (t3.on && C1->par_kind == 1) { char rn_[24]; snprintf(rn_, sizeof rn_, "rn_%d", C1->par_cons); rs_add(&t3.vals, rg_skf(c) ? "%sSKFIX(%s)" : "%s%s", t3.nv ? ", " : "", rn_); t3.nv++; }
     for (j = 0; j < d; j++) {
       RInst *J = c->in[chain[j]];
       int n = 0;
+      foffs_[j] = t3.noffs;
       rs_add(&rs, rg_skf(c) && !(J->wrap && getenv("QJS_AOT_REGION_NOWRAPSKFIX") != NULL) ? "      cos_[%d] = %s;\n      dv_[%d] = SKFIX(%s);\n" : "      cos_[%d] = %s;\n      dv_[%d] = %s;\n", j, J->co, off, J->self);   /* NOWRAPSKFIX: a vkit knock-out (a wrapper's slot 0 would hold the stale stack pointer) */
-      for (i = 0; i < J->nargs; i++) rs_add(&rs, rg_skf(c) ? "      dv_[%d] = SKFIX(%s);\n" : "      dv_[%d] = %s;\n", off + 1 + i, J->arg[i]);
+      if (t3.on) { rs_add(&t3.cos, "%s%s", t3.nc ? ", " : "", J->co); t3.nc++; rs_add(&t3.vals, rg_skf(c) ? "%sSKFIX(%s)" : "%s%s", t3.nv ? ", " : "", J->self); t3.nv++; }
+      for (i = 0; i < J->nargs; i++) { rs_add(&rs, rg_skf(c) ? "      dv_[%d] = SKFIX(%s);\n" : "      dv_[%d] = %s;\n", off + 1 + i, J->arg[i]); if (t3.on) { rs_add(&t3.vals, rg_skf(c) ? ", SKFIX(%s)" : ", %s", J->arg[i]); t3.nv++; } }
       nlv = 0;
-      for (r = 0; r < 256; r++) if (J->cur[r][0] && keepj[j][r]) { rs_add(&rs, rg_skf(c) ? "      dv_[%d] = SKFIX(%s);\n" : "      dv_[%d] = %s;\n", off + 1 + J->nargs + nlv, J->cur[r]); nlv++; }
+      for (r = 0; r < 256; r++) if (J->cur[r][0] && keepj[j][r]) { rs_add(&rs, rg_skf(c) ? "      dv_[%d] = SKFIX(%s);\n" : "      dv_[%d] = %s;\n", off + 1 + J->nargs + nlv, J->cur[r]); if (t3.on) { rs_add(&t3.vals, rg_skf(c) ? ", SKFIX(%s)" : ", %s", J->cur[r]); t3.nv++; } nlv++; }
       rs_add(&rs, "      static const uint16_t of_%d[] = {", j);
-      for (r = 0; r < 256; r++) if (J->cur[r][0] && keepj[j][r]) rs_add(&rs, "%s%d", n++ ? ", " : " ", r * 16);
-      if (n == 0) rs_add(&rs, " 0");
+      for (r = 0; r < 256; r++) if (J->cur[r][0] && keepj[j][r]) { rs_add(&rs, "%s%d", n++ ? ", " : " ", r * 16); if (t3.on) { rs_add(&t3.offs, "%s%d", t3.noffs ? ", " : "", r * 16); t3.noffs++; } }
+      if (n == 0) { rs_add(&rs, " 0"); if (t3.on) { rs_add(&t3.offs, "%s0", t3.noffs ? ", " : ""); t3.noffs++; } }
       rs_add(&rs, " };\n");
       off += 1 + J->nargs + nlv;
     }
@@ -961,6 +994,15 @@ static int rg_xit_x(RCtx *c, int ii, int pc) {
         /* a forwarding constructor's frame has its two-slot variable area: slot 0 holds `this` once the put_local_s0 has run, slot 1 is uninitialised once the local_uninit has: by the pc the generic body
            resumes at (static, not a run-time flag). QJS_AOT_REGION_NOWRAPVARS (a vkit knock-out build): the area is not built. */
         int rj_ = N ? N->par_pc_after : pc, nv_ = J->wrap && getenv("QJS_AOT_REGION_NOWRAPVARS") == NULL ? J->g->var_count : 0;
+        if (e_nogeneric()) {
+          /* the interpreter continues the level: a callee need not be in the unit, its frame size is its program's register count */
+          rs_add(&rs, "        { rg_cont_%s, %du, %du, %d, QJS_AOT_LIGHT_PREFIX_SLOTS + %d + %d, %d, %d, %d, %d, %d, %d, %d, of_%d },\n", c->hex,
+                 rj_, N ? N->par_call_pc : 0, N ? N->par_dst * 16 : 0xffff, nv_, qjs_aot_regs_of_gen(J->g), nlv, J->nargs, J->par_kind == 1, J->g->pic_count > 0,
+                 nv_, nv_ && rj_ > J->wr_put_pc, nv_ && rj_ > J->wr_uninit_pc, j);
+          if (t3.on) rs_add(&t3.fcs, "        { rg_cont_%s, %du, %du, %d, QJS_AOT_LIGHT_PREFIX_SLOTS + %d + %d, %d, %d, %d, %d, %d, %d, %d, of_ + %d },\n", c->hex,
+                 rj_, N ? N->par_call_pc : 0, N ? N->par_dst * 16 : 0xffff, nv_, qjs_aot_regs_of_gen(J->g), nlv, J->nargs, J->par_kind == 1, J->g->pic_count > 0,
+                 nv_, nv_ && rj_ > J->wr_put_pc, nv_ && rj_ > J->wr_uninit_pc, foffs_[j]);
+        } else
         rs_add(&rs, "        { aot_g_%s, %du, %du, %d, QJS_AOT_LIGHT_PREFIX_SLOTS + %d + Q2_FR_%s, %d, %d, %d, %d, %d, %d, %d, of_%d },\n", hx,
                rj_, N ? N->par_call_pc : 0, N ? N->par_dst * 16 : 0xffff, nv_, hx, nlv, J->nargs, J->par_kind == 1, J->g->pic_count > 0,
                nv_, nv_ && rj_ > J->wr_put_pc, nv_ && rj_ > J->wr_uninit_pc, j);
@@ -992,6 +1034,7 @@ static int rg_xit_x(RCtx *c, int ii, int pc) {
     if (strcmp(x->root, rt.p ? rt.p : "") != 0 || strcmp(x->rest, rs.p ? rs.p : "") != 0) continue;
     free(rt.p);
     free(rs.p);
+    t3_free(&t3);
     rg_cen_rec(c, i, cen_ep, d, cen_ok);
     return i;
   }
@@ -1010,6 +1053,21 @@ static int rg_xit_x(RCtx *c, int ii, int pc) {
   x->h = h;
   x->root = rt.p ? rt.p : strdup("");
   x->rest = rs.p ? rs.p : strdup("");
+  x->t3 = NULL; x->t3pre = NULL; x->nofpc = d ? C1->par_read_pc : 0;
+  if (t3.on && !t3.bad && (d > 0 || t3.nst >= rg_t3_min())) {
+    RStr o = {0};
+    x->t3pre = rt.p != NULL && t3pre > 0 ? strndup(rt.p, t3pre) : NULL;
+    rs_add(&o, "    { static const uint16_t of_[] = { %s };\n", t3.offs.p ? t3.offs.p : "0");
+    if (d > 0) rs_add(&o, "      static const RgFC fc_[%d] = {\n%s      };\n", d, t3.fcs.p ? t3.fcs.p : "");
+    rs_add(&o, "      static const RgX3 x_ = { %d, %d, %d, %d, %du, %d, %s, of_ };\n", t3.nroot, d, d && C1->par_kind == 1, d ? C1->par_dst * 16 : 0, d ? C1->par_call_pc : 0, total, d ? "fc_" : "NULL");
+    rs_add(&o, "      const JSValue v_[] = { %s };\n", t3.vals.p ? t3.vals.p : "JS_UNDEFINED");
+    if (d > 0) rs_add(&o, "      JSObject *const co_[] = { %s };\n", t3.cos.p ? t3.cos.p : "NULL");
+    rs_add(&o, "      int s_ = rg_t3b_%s(ctx, f, fr, &x_, v_, %s);\n", c->hex, d > 0 ? "co_" : "NULL");
+    rs_add(&o, "      if (__builtin_expect(s_ != 0, 0)) { RG_FREE_OWNED(); if (s_ == 1) E_RET_G(%s, %d); return JS_EXCEPTION; } }\n", c->hex, x->nofpc);
+    x->t3 = o.p;
+    c->t3used = 1;
+  }
+  t3_free(&t3);
   rg_cen_rec(c, c->nxit, cen_ep, d, cen_ok);
   return c->nxit++;
 }
@@ -2520,6 +2578,7 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
     }
     J->owner_g = thru ? -1 : gi;
     J->owner_t = thru ? 0 : t;
+    J->key = I->key * 1000003ull + (uint64_t)call->pc * 131u + (uint64_t)t + 1u;
     J->par = ii;
     J->par_call_pc = call->pc;
     J->par_read_pc = exit_pc;
@@ -2541,6 +2600,7 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
       if (!rec_) J->ool = 0;
       if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "loopinl: %s (%d values) at pc %d: %s\n", J->g->name[0] ? J->g->name : "<anon>", J->q.nvalues, call->pc, rec_ ? "recursive, out of line" : "inlined");
     } else if (J->ool && c->loopinl && getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "loopinl: %s (%d values) at pc %d: out of line (%s)\n", J->g->name[0] ? J->g->name : "<anon>", J->q.nvalues, call->pc, nt != 1 ? "several targets" : "too large");
+    if (rg_trust_on() && g_ncut > 0 && rg_cut_has(J->key)) J->ool = 1;   /* cut by the line cap */
     if (J->ool && !c->emit) c->opaque = 1;
     if (rg_trust_on() && thru && I->kcls > 0 && call->win_n >= 1 && rg_is_this(&I->q, call->win_val[0])) { J->kcls = I->kcls; J->cls1 = I->cls1; }
     /* a super-constructor call on the object this region is constructing: the callee builds the same object */
@@ -3446,7 +3506,7 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
               break;
             }
           }
-          if (c->emit && rg_trust_on() && getenv("QJS_AOT_REGION_LENCOUNT") == NULL) {
+          if (c->emit && getenv("QJS_AOT_REGION_LENCOUNT") == NULL) {   /* also without TRUST: the element count is not the length of `new Array(n)` */
             /* TRUST: an array's `length` is its first property, whatever its storage (a fast array's element count is not its length when it ends
                in holes): an int there, anything else leaves */
             fprintf(o, "        { if (__builtin_expect(JS_VALUE_GET_TAG(%sv%d) != JS_TAG_OBJECT || *(const uint16_t *)((const unsigned char *)JS_VALUE_GET_PTR(%sv%d) + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_ARRAY, 0)) goto %s;\n"
@@ -3544,8 +3604,8 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
               for (k2 = 0; k2 < B2->nedge_args[s2]; k2++)
                 if (rg_base(fn, B2->edge_arg[s2][k2]) == dv) { need_val = 1; snprintf(usern, sizeof(usern), "a value passed on an edge of block %d", j2); usepc = in->pc; }
           }
-          if (need_val && rg_trust_on()) {
-            /* TRUST: the value is read from the binding every time (a global such as `planner` changes between runs; nothing is assumed about it beyond what the
+          if (need_val) {
+            /* the value is read from the binding every time (also without TRUST) (a global such as `planner` changes between runs; nothing is assumed about it beyond what the
                dispatch on it checks): the binding's own data value, borrowed, or an exit when it is not one */
             char gn_[40];
             int q_;
@@ -3773,8 +3833,8 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
             {
               /* the fields the class's objects gain after the construction walk (stores in the code that fills them) get room in the object, so that their adds are made in place:
                  a property array that has to grow is the engine's to grow, and the add leaves the region */
-              fprintf(o, "        { JSValue t_ = qjs_aot_new_from_shape_cap(ctx, rgc_s_%s_%d, %du);\n"
-                         "          if (__builtin_expect(JS_IsException(t_), 0)) { JS_FreeValue(ctx, JS_GetException(ctx)); goto %s; }\n          %s; rn_%d = t_; }\n", c->hex, ki, rg_cons_cap(K), xl, rel_, ki);
+              fprintf(o, "        { JSValue t_ = %s(ctx, rgc_s_%s_%d, %du);\n"
+                         "          if (__builtin_expect(JS_IsException(t_), 0)) { JS_FreeValue(ctx, JS_GetException(ctx)); goto %s; }\n          %s; rn_%d = t_; }\n", getenv("QJS_AOT_NOINLALLOC") == NULL ? "q2_new_from_shape_cap" : "qjs_aot_new_from_shape_cap", c->hex, ki, rg_cons_cap(K), xl, rel_, ki);
             }
             else if (c->emit) {
               fprintf(o, "        { JSValue t_; int rc_ = qjs_aot_construct_this_cap(ctx, (JSObject *)JS_VALUE_GET_PTR(rgc_f_%s_%d), &t_, %du);\n"
@@ -3815,7 +3875,7 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
              value is held to the region's end (the region may borrow from it), and the word is tested after: the binding may be one a fact watches */
           char gn_[40], xo[32];
           int q_;
-          if (!rg_trust_on() || rg_cold(I, in)) {
+          if (rg_cold(I, in)) {
             if (rg_cold(I, in)) { if (c->emit) fprintf(o, "        goto %s; /* put_global: never executed in the profile */\n", xl); break; }
             return rg_fail(c, "pc %d: put_global is not in the region subset (and the profile executed it)", in->pc);
           }
@@ -3830,7 +3890,8 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
             fprintf(o, "          if (__builtin_expect(r_ < 0, 0)) { RG_FREE_OWNED(); return JS_EXCEPTION; }\n");
             fprintf(o, "          if (__builtin_expect(r_ == 0, 0)) goto %s;\n", xl);
             fprintf(o, "          rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, o_);\n");
-            fprintf(o, "          if (__builtin_expect(!QJS_AOT_FACTS_OK(&rg_fw_%s, 1) || rgon_ >= RG_OWNCAP, 0)) goto %s; }\n", c->hex, xo);
+            if (rg_trust_on()) fprintf(o, "          if (__builtin_expect(!QJS_AOT_FACTS_OK(&rg_fw_%s, 1) || rgon_ >= RG_OWNCAP, 0)) goto %s; }\n", c->hex, xo);
+            else fprintf(o, "          if (__builtin_expect(rgon_ >= RG_OWNCAP, 0)) goto %s; }\n", xl);
           }
           {
             /* the IR gives the store new versions of the registers it keeps (a store to a binding changes none of them): each is the register's value before it */
@@ -5943,15 +6004,63 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
        hot callee out of line, such a tree stays with the regions of its parts */
     int vt = 0, ia;
     for (ia = 0; ia < c->nin; ia++) if (!c->in[ia]->ool) vt += c->in[ia]->q.nvalues;
+    if (rg_line_cap() > 0 && g_ncut < 1000) {
+      /* the line cap: estimate = lines-per-value * values of the instances not called out of line; cut the coldest (then the largest) subtrees until it fits */
+      int cap = rg_line_cap(), lpv = rg_lines_per_value(), nin = c->nin, cut_any = 0, rounds = 0;
+      long est;
+      int *sub = calloc((size_t)nin, sizeof(int)), *gone = calloc((size_t)nin, sizeof(int));
+      unsigned long long *cnt = calloc((size_t)nin, sizeof(unsigned long long));
+      if (sub == NULL || gone == NULL || cnt == NULL) { free(sub); free(gone); free(cnt); snprintf(why, whyn, "no memory"); goto cleanup; }
+      for (ia = 0; ia < nin; ia++) {
+        const RInst *Ia = c->in[ia];
+        cnt[ia] = Ia != NULL && Ia->par >= 0 && c->in[Ia->par] != NULL && c->in[Ia->par]->g != NULL ? qjs_aot_prof_site_calls(c->in[Ia->par]->g->digest, Ia->par_pc_after) : ~0ull;
+      }
+      for (;;) {
+        int best = -1, k, a;
+        est = 0;
+        for (ia = 0; ia < nin; ia++) { sub[ia] = 0; }
+        for (ia = nin - 1; ia >= 0; ia--) {
+          const RInst *Ia = c->in[ia];
+          int anc_gone = 0;
+          if (Ia == NULL) continue;
+          for (a = ia; a >= 0 && !anc_gone; a = c->in[a]->par) { if (gone[a]) anc_gone = 1; if (a == 0) break; }
+          if (anc_gone || Ia->ool) continue;
+          sub[ia] += Ia->q.nvalues;
+          if (Ia->par >= 0) sub[Ia->par] += sub[ia];
+          est += (long)Ia->q.nvalues * lpv;
+        }
+        if (est <= cap || rounds++ > 400) break;
+        for (k = 1; k < nin; k++) {
+          const RInst *Ik = c->in[k];
+          int anc_gone = 0;
+          if (Ik == NULL || gone[k] || Ik->ool || Ik->fresh || Ik->wrap || Ik->cons > 0 || Ik->par < 0) continue;
+          for (a = Ik->par; a >= 0 && !anc_gone; a = c->in[a]->par) { if (gone[a]) anc_gone = 1; if (a == 0) break; }
+          if (anc_gone) continue;
+          if (best < 0 || cnt[k] < cnt[best] || (cnt[k] == cnt[best] && sub[k] > sub[best])) best = k;
+        }
+        if (best < 0) break;
+        gone[best] = 1;
+        if (g_ncut < 1024) { g_cut[g_ncut++] = c->in[best]->key; cut_any = 1; }
+      }
+      if (cut_any) {
+        if (getenv("QJS_AOT_REGION_INSTS") != NULL || getenv("QJS_AOT_FN_LINE_CAP_LOG") != NULL)
+          fprintf(stderr, "fn-line-cap root=%s cap=%d est_before=%ld est_after=%ld cut=%d of %d instances\n", hex, cap, (long)vt * lpv, est, g_ncut, nin);
+        free(sub); free(gone); free(cnt);
+        g_cut_retry = 1;
+        snprintf(why, whyn, "line cap: walking again with %d instances out of line", g_ncut);
+        goto cleanup;
+      }
+      free(sub); free(gone); free(cnt);
+    }
     if (vt > (getenv("QJS_AOT_REGION_MAXV") ? atoi(getenv("QJS_AOT_REGION_MAXV")) : 2800)) { snprintf(why, whyn, "too large: %d values in %d inlined instances (profitability)", vt, c->nin); goto cleanup; }
   }
   if (rg_trust_on() && getenv("QJS_AOT_REGION_NUMERIC") == NULL && !rg_any_construct(c) && !rg_any_ool(c) &&
-      ((c->ncls == 0 && (c->nin == 1 || getenv("QJS_AOT_REGION_NOINLGATE") == NULL) && !rg_any_dispatch(c)) || (getenv("QJS_AOT_REGION_DBLGATE") != NULL && c->ngd == 0 && rg_stores_double(c)))) {   /* rule (b) is off by default (f64 S2): QJS_AOT_REGION_DBLGATE=1 brings it back */
+      ((c->ncls == 0 && (c->nin == 1 || (getenv("QJS_AOT_REGION_NOINLGATE") == NULL && rg_stores_double(c))) && !rg_any_dispatch(c)) || (getenv("QJS_AOT_REGION_DBLGATE") != NULL && c->ngd == 0 && rg_stores_double(c)))) {   /* rule (b) is off by default (f64 S2): QJS_AOT_REGION_DBLGATE=1 brings it back */
     /* nothing a region does better than the ordinary body: no object is made, nothing is called out of line, and either nothing is inlined and no class is bound (a loop of
        numbers and arrays), or no call is resolved by class or method (no guard at all: plain calls of constant functions,
        field reads and writes of one known class, element reads, numbers), nothing is called out of line, and the work stores doubles. The ordinary body is typed and unboxed
        (a double stays in a register); the region would box every double it stores. */
-    snprintf(why, whyn, "nothing for a region (monomorphic field, element and double work only: the ordinary body is typed and unboxed)%s", c->nin > 1 && c->ncls == 0 ? " [TEMPORARY gate until the unboxed-double work: numeric work after inlining; QJS_AOT_REGION_NOINLGATE=1 lifts it]" : "");
+    snprintf(why, whyn, "nothing for a region (monomorphic field, element and double work only: the ordinary body is typed and unboxed)%s", c->nin > 1 && c->ncls == 0 ? " [inlined numeric work that stores doubles; QJS_AOT_REGION_NOINLGATE=1 lifts it]" : "");
     goto cleanup;
   }
   if (g_rg_dry) {
@@ -6036,6 +6145,22 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
     if (getenv("QJS_AOT_REGION_NOCPK") == NULL) rg_gfold(c);   /* F64: a global the profile saw hold one int is a literal too */
   }
   rg_emit_learners(c);
+  if (getenv("QJS_AOT_REGION_INSTS") != NULL) {
+    /* census: the instances of this region (r<id> in the C text), for tools/aot/inline-census.py */
+    int ia;
+    for (ia = 0; ia < c->nin_total; ia++) {
+      char hx[33];
+      if (c->in[ia] == NULL) continue;
+      rg_hexof(c->in[ia]->g, hx);
+      {
+        const RInst *Ia = c->in[ia];
+        unsigned long long sc = 0;
+        if (Ia->par >= 0 && c->in[Ia->par] != NULL) sc = qjs_aot_prof_site_calls(c->in[Ia->par]->g->digest, Ia->par_pc_after);
+        else sc = qjs_aot_prof_entries(Ia->g->digest);
+        fprintf(stderr, "region-inst root=%s id=%d fn=%s name=%s line=%d par=%d depth=%d call_pc=%d sitecalls=%llu entries=%llu rootent=%llu\n", hex, ia, hx, Ia->g->name[0] ? Ia->g->name : "<anon>", Ia->g->line, Ia->par, Ia->depth, Ia->par_call_pc, sc, qjs_aot_prof_entries(Ia->g->digest), qjs_aot_prof_entries(c->in[0]->g->digest));
+      }
+    }
+  }
   if (c->nin_total > 1) {
     /* what an exit inside inlined code needs: the callees' generic bodies, their frame sizes, and the function that builds the chain of frames and runs it */
     int ia, ib;
@@ -6045,8 +6170,11 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
       rg_hexof(c->in[ia]->g, hx);
       for (ib = 1; ib < ia && !dup; ib++) { rg_hexof(c->in[ib]->g, hy); dup = strcmp(hx, hy) == 0; }
       if (dup) continue;
-      fprintf(o, "%sJSValue aot_g_%s(JSContext *, JSRegRun *, JSValue *, uint32_t);\n#ifndef Q2_FR_%s\n#error \"region %s: the inlined function %s is not in the unit\"\n#endif\n", e_linkage(), hx, hx, hex, hx);
+      if (!e_nogeneric())
+        fprintf(o, "%sJSValue aot_g_%s(JSContext *, JSRegRun *, JSValue *, uint32_t);\n#ifndef Q2_FR_%s\n#error \"region %s: the inlined function %s is not in the unit\"\n#endif\n", e_linkage(), hx, hx, hex, hx);
     }
+    if (e_nogeneric())
+      fprintf(o, "static JSValue rg_cont_%s(JSContext *c_, JSRegRun *f_, JSValue *fr_, uint32_t pc_) { return qjs_aot_deopt(c_, f_, fr_, pc_, QJS_AOT_NO_SITE); }\n", hex);
     fprintf(o, "static int rg_pollp_%s;\n", hex);
     if (getenv("QJS_AOT_REGION_WRAPEXIT_BUILD") != NULL) fprintf(o, "static int rg_wrapexit_%s(void) { static int n = -1, k; if (n < 0) { const char *e = getenv(\"QJS_AOT_REGION_WRAPEXIT\"); n = e ? atoi(e) : 0; } return n > 0 && ++k %% n == 0; }\n", hex);
     fprintf(o, "static int rg_nof_%s(void) { static int v = -1; if (v < 0) v = getenv(\"QJS_AOT_REGION_NOFRAMES\") != NULL; return v; }\n", hex);
@@ -6249,6 +6377,7 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
     fprintf(o, " 0; })\n");
     fprintf(o, "#define aot_g_%s(a_, b_, c_, d_) (RG_BORP(), (aot_g_%s)(a_, b_, c_, d_))\n#define aot_fs_%s(a_, b_, c_, d_) (RG_BORP(), (aot_fs_%s)(a_, b_, c_, d_))\n", hex, hex, hex, hex);
   }
+  fprintf(o, "/*@RGT3@*/\n");
   fprintf(o, "E_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f, JSValue *fr, uint32_t entry_pc)\n{\n", e_linkage(), hex);
   if (rg_has_retslot(c)) fprintf(o, "    JSValue *rs_ = q2_rs_pending; q2_rs_pending = NULL;   /* the shell the entry handed over, if any */\n");
   fprintf(o, "    if (__builtin_expect(e_gate[%d] != 0 || entry_pc != 0, 0)) return aot_g_%s(ctx, f, fr, entry_pc);\n", fi, hex);
@@ -6345,7 +6474,7 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   else fprintf(o, "#define SKFIX(...) (__VA_ARGS__)\n");
   fprintf(o, "#define RG_PM(R_, I_) ({ JSValue pmr_ = JS_GetPropertyStr(ctx, SKFIX(R_), rg_pmn_[I_]); JS_FreeValue(ctx, pmr_); pmr_; })\n");
   fprintf(o, "    JSValue rgo_b_[64]; JSValue *rgo_ = rgo_b_; int rgon_ = 0, rgoc_ = -64; (void)rgon_; (void)rgoc_;\n");
-  fprintf(o, "    int rgmk_[48] = {0}; (void)rgmk_;\n");
+  fprintf(o, "    int rgmk_[48] = {0}; (void)rgmk_;\n    int rg_xi_ = 0; (void)rg_xi_;\n");
   /* the owned list is bounded: past this many entries a site that parked one leaves the region through its ordinary exit (the frame state takes what it needs, the list is freed, the
      generic body goes on). QJS_AOT_REGION_OWNCAP=n sets the bound; QJS_AOT_REGION_NOOWNCAP removes it (the test knock-out) */
   if (getenv("QJS_AOT_REGION_KNOCKOWNCAP") != NULL) fprintf(o, "#define RG_OWNCAP (getenv(\"QJS_AOT_REGION_NOOWNCAP\") || getenv(\"QJS_AOT_REGION_NOCOMPACT\") ? 0x7fffffff : 65536)   /* the knock-out build: the run lifts the bound */\n");
@@ -6413,22 +6542,57 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
       fprintf(stderr, "epcensus %s: used stubs %d, distinct effect points %d, stubs in a stretch of 2+ exits %d, summed live-in values %d, stubs in inlined frames %d, of those with no effect in the inner frames %d\n", hex, nus, nep, multi, sumlive, nd, ndok);
       free(seen); free(cnt); free(cu);
     }
+    /* tier 3: the prelude of a stub (lent block, virtual objects, stack migration) is the same text for every stub of the region, so it is written once (rx_pre) and the stubs reach it by a jump and
+       come back through a switch on the stub's number (rg_xi_): a cold path, the fast path is untouched */
+    int pre_shared = 0;
+    {
+      const char *p0 = NULL;
+      int n_ = 0, same = 1;
+      for (i = 0; i < c->nxit; i++) {
+        RXit *x = &c->xit[i];
+        if (!used[i] || x->t3 == NULL || x->t3pre == NULL) continue;
+        if (p0 == NULL) p0 = x->t3pre; else if (strcmp(p0, x->t3pre) != 0) same = 0;
+        n_++;
+      }
+      pre_shared = same && n_ >= 2 && getenv("QJS_AOT_REGION_T3PRE") != NULL;   /* opt-in: measured +1.9% Minstr on deltablue/raytrace (the stub-number local and the switch cost the fast path) */
+    }
     for (i = 0; i < c->nxit; i++) {
       RXit *x = &c->xit[i];
       if (!used[i]) continue;
       fprintf(o, "    rx_%d:;\n    E_EXIT_NOTE_PC(%d, %d, \"%s\");\n", i, fi, x->pc, hex);
+      if (pre_shared && x->t3 != NULL && x->t3pre != NULL) fprintf(o, "    rg_xi_ = %d; goto rx_pre;\n    rxb_%d:;\n", i, i);
+      else if (x->t3pre != NULL && x->t3 != NULL) fputs(x->t3pre, o);
       if (getenv("QJS_AOT_FASTSTATS") != NULL) fprintf(o, "    rgx_%s[%d]++; rgxpc_%s[%d] = %d;\n", hex, i, hex, i, x->pc);
-      fputs(x->root, o);
-      fputs(x->rest, o);
+      if (x->t3 != NULL) fputs(x->t3, o);
+      else {
+        fputs(x->root, o);
+        fputs(x->rest, o);
+      }
       fprintf(o, "    RG_FREE_OWNED();\n    E_RET_G(%s, %d);\n", hex, x->rpc);
       if (x->d > 0) {
         /* a poll in an inlined loop: the frames are materialised as at any exit and the innermost one polls (rg_chain) before it goes on in its generic body */
         fprintf(o, "    rp_%d:; rg_pollp_%s = 1; goto rx_%d;\n", i, hex, i);
       } else {
         fprintf(o, "    rp_%d:;\n", i);
+        if (pre_shared && x->t3 != NULL && x->t3pre != NULL) fprintf(o, "    rg_xi_ = %d; goto rx_pre;\n    rpb_%d:;\n", RG_MAXX + i, i);
+        else if (x->t3pre != NULL && x->t3 != NULL) fputs(x->t3pre, o);
+        if (x->t3 != NULL) fputs(x->t3, o);
+        else
         fputs(x->root, o);
         fprintf(o, "    RG_FREE_OWNED();\n    if (qjs_aot_poll_fl(ctx) < 0) return JS_EXCEPTION;\n    E_RET_G(%s, %d);\n", hex, x->rpc);
       }
+    }
+    if (pre_shared) {
+      const char *p0 = NULL;
+      for (i = 0; i < c->nxit && p0 == NULL; i++) if (used[i] && c->xit[i].t3 != NULL && c->xit[i].t3pre != NULL) p0 = c->xit[i].t3pre;
+      fprintf(o, "    rx_pre:;\n%s    switch (rg_xi_) {\n", p0);
+      for (i = 0; i < c->nxit; i++) {
+        RXit *x = &c->xit[i];
+        if (!used[i] || x->t3 == NULL || x->t3pre == NULL) continue;
+        fprintf(o, "    case %d: goto rxb_%d;\n", i, i);
+        if (x->d <= 0) fprintf(o, "    case %d: goto rpb_%d;\n", RG_MAXX + i, i);
+      }
+      fprintf(o, "    default: __builtin_unreachable();\n    }\n");
     }
     free(used);
   }
@@ -6537,6 +6701,39 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
     }
   }
   {
+    char *m3_ = blen ? memmem(buf, blen, "/*@RGT3@*/\n", 11) : NULL;
+    if (m3_ != NULL) {
+      size_t pre_ = (size_t)(m3_ - buf);
+      RStr b3 = {0};
+      char *nb_;
+      if (c->t3used) {
+        rs_add(&b3, "#ifndef RGX3_T\n#define RGX3_T 1\n/* an exit's frame state, described: root stores, the chain of inlined frames (tier 3) */\n"
+                    "typedef struct RgX3 { uint16_t nroot, d, par_kind, dst; uint32_t call_pc; uint16_t total; const void *fc; const uint16_t *offs; } RgX3;\n#endif\n");
+        rs_add(&b3, "static __attribute__((noinline, cold)) int rg_t3b_%s(JSContext *ctx, JSRegRun *f, JSValue *fr, const RgX3 *x, const JSValue *v, JSObject *const *cos)\n{\n", hex);
+        rs_add(&b3, "  int i;\n  for (i = 0; i < x->nroot; i++) AOT_SET_B(ctx, fr, x->offs[i], v[i]);\n  if (x->d == 0) return 0;\n");
+        if (c->nin_total > 1)
+          rs_add(&b3, "  if (__builtin_expect(rg_nof_%s(), 0)) return 1;\n"
+                      "  if (x->par_kind) AOT_SET_B(ctx, fr, x->dst, v[x->nroot]);\n"
+                      "  *(const uint8_t **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_CAP_IP) = *(const uint8_t *const *)(*(uint8_t **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_B) + QJS_AOT_OFF_FNBC_REGVM_CODE) + x->call_pc;\n"
+                      "  {\n    JSValue rr_ = rg_chain_%s(ctx, f, (const RgFC *)x->fc, cos, v + x->nroot + (x->par_kind != 0), x->d);\n"
+                      "    if (__builtin_expect(JS_IsException(rr_), 0)) return 2;\n"
+                      "    if (x->par_kind) { JS_FreeValue(ctx, rr_); AOT_SET_B(ctx, fr, x->dst, v[x->nroot]); }\n"
+                      "    else if (JS_VALUE_HAS_REF_COUNT(rr_)) qjs_aot_set_reg_p(ctx, fr, x->dst, rr_);\n"
+                      "    else AOT_SET_B(ctx, fr, x->dst, rr_);\n  }\n", hex, hex);
+        rs_add(&b3, "  (void)cos;\n  return 0;\n}\n");
+      }
+      nb_ = malloc(blen - 11 + b3.n + 1);
+      if (nb_ == NULL) abort();
+      memcpy(nb_, buf, pre_);
+      if (b3.n) memcpy(nb_ + pre_, b3.p, b3.n);
+      memcpy(nb_ + pre_ + b3.n, m3_ + 11, blen - pre_ - 11);
+      free(buf);
+      free(b3.p);
+      buf = nb_;
+      blen = blen - 11 + b3.n;
+    }
+  }
+  {
     /* the memo slots of invariant reads, declared where the marker stands */
     char *mk_ = blen ? memmem(buf, blen, "/*@RGM@*/", 9) : NULL;
     if (mk_ != NULL) {
@@ -6554,7 +6751,7 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   free(buf);
   {
     int ia;
-    for (ia = 1; ia < c->nin_total; ia++) { char hy[33]; rg_hexof(c->in[ia]->g, hy); qjs_aot_region_dep(hex, hy); }
+    if (!e_nogeneric()) for (ia = 1; ia < c->nin_total; ia++) { char hy[33]; rg_hexof(c->in[ia]->g, hy); qjs_aot_region_dep(hex, hy); }
     /* QJS_AOT_REGION_CENSUS: which functions an emitted region holds (the census script reads the generator's stderr) */
     if (f != NULL && getenv("QJS_AOT_REGION_CENSUS") != NULL) {
       fprintf(stderr, "census: region %s inlines", hex);
@@ -6574,7 +6771,7 @@ cleanup:
 done:
   if (ok) for (i = 1; i < c->nincap; i++) if (c->in[i] != NULL && c->in[i]->g != NULL) q2_free(&c->in[i]->q);
   for (i = 0; i < c->nincap; i++) if (c->in[i] != NULL) { free(c->in[i]->mname); free(c->in[i]->mpc); free(c->in[i]->ty); free(c->in[i]->rw); if (i > 0) free(c->in[i]->cur); free(c->in[i]); }
-  for (i = 0; i < c->nxit; i++) { free(c->xit[i].root); free(c->xit[i].rest); }
+  for (i = 0; i < c->nxit; i++) { free(c->xit[i].root); free(c->xit[i].rest); free(c->xit[i].t3); free(c->xit[i].t3pre); }
   free(c->cen); free(c->effcnt);
   free(c->in);
   free(c->xit);
@@ -6587,11 +6784,41 @@ done:
 }
 
 /* A region with the small loop callees expanded in place, else the same region as before (they out of line): a root that compiled without the first still does. */
+static int region_emit_capped(FILE *f, const Q2Func *root, const char hex[33], int fi, char *why, size_t whyn);
 int region_emit(FILE *f, const Q2Func *root, const char hex[33], int fi, char *why, size_t whyn) {
+  int r, k;
+  {   /* bisect aid: QJS_AOT_REGION_ONLYHEX="prefix,prefix" keeps only these roots, QJS_AOT_REGION_SKIPHEX removes these */
+    const char *on = getenv("QJS_AOT_REGION_ONLYHEX"), *sk = getenv("QJS_AOT_REGION_SKIPHEX");
+    if (on != NULL || sk != NULL) {
+      const char *q;
+      int hit_on = 0, hit_sk = 0;
+      for (q = on; q != NULL && *q;) { char t[40]; int n = 0; while (*q && *q != ',' && n < 38) t[n++] = *q++; t[n] = 0; if (*q == ',') q++; if (n > 0 && strncmp(hex, t, (size_t)n) == 0) hit_on = 1; }
+      for (q = sk; q != NULL && *q;) { char t[40]; int n = 0; while (*q && *q != ',' && n < 38) t[n++] = *q++; t[n] = 0; if (*q == ',') q++; if (n > 0 && strncmp(hex, t, (size_t)n) == 0) hit_sk = 1; }
+      if ((on != NULL && !hit_on) || hit_sk) { snprintf(why, whyn, "excluded by QJS_AOT_REGION_ONLYHEX/SKIPHEX"); return 0; }
+    }
+  }
+  if (rg_line_cap() <= 0) return region_emit_capped(f, root, hex, fi, why, whyn);
+  g_ncut = 0;
+  for (k = 0; k < 8; k++) {
+    g_cut_retry = 0;
+    r = region_emit_capped(f, root, hex, fi, why, whyn);
+    if (!g_cut_retry) break;
+  }
+  if (g_cut_retry && !r) {
+    /* the cut set kept moving: the region without a cap */
+    g_cut_retry = 0;
+    g_ncut = 0;
+    r = region_emit_capped(f, root, hex, fi, why, whyn);
+  }
+  g_ncut = 0;
+  return r;
+}
+static int region_emit_capped(FILE *f, const Q2Func *root, const char hex[33], int fi, char *why, size_t whyn) {
   int r;
   if (getenv("QJS_AOT_REGION_OOLLOOP") == NULL && rg_trust_on()) {
     r = region_emit1(f, root, hex, fi, why, whyn, 1);
     if (r) return 1;
+    if (g_cut_retry) return 0;   /* the line cap asks for another walk with its cut set */
     if (getenv("QJS_AOT_REGION_WHY")) fprintf(stderr, "loopinl: root %.8s [%s@%d] refused with loops inlined (%s); retrying out of line\n", hex, root->g->name[0] ? root->g->name : "<anon>", root->g->line, why);
   }
   return region_emit1(f, root, hex, fi, why, whyn, 0);

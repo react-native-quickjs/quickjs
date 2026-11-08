@@ -44,7 +44,7 @@ static void report_mshapes(FILE *f);
 enum { K_UNDEF = 1, K_NULL = 2, K_BOOL = 4, K_INT = 8, K_INTOV = 16, K_DBL = 32, K_NUM = 64, K_STR = 128, K_OBJ = 256, K_UNK = 512 };
 #define K_NUMERIC (K_INT | K_DBL | K_NUM | K_INTOV)
 
-#define BN_W 16
+#define BN_W 32
 #define BN_MAXSITES (BN_W * 64)
 typedef struct BSet { uint64_t w[BN_W]; } BSet;
 typedef struct BNode { BSet pts; uint16_t cls; } BNode;
@@ -216,6 +216,23 @@ static int bn_atom(const Q2Insn *in, int *which, char *out, size_t cap, int skip
   return 0;
 }
 
+/* QJS_AOT_BUNDLE_UNKPROV=<function name substring>: where the unknown class of a node came from (the first instruction that added K_UNK, and the node it flowed from) */
+typedef struct { int src, fn, pc, rop; } UProv;
+static UProv *g_uprov, *g_eprov; static int g_uprov_cap, g_uprov_on = -1;
+static int g_cur_fn, g_cur_pc, g_cur_rop;
+static void uprov_set(int d, int s) {
+  if (g_uprov_on < 0) g_uprov_on = getenv("QJS_AOT_BUNDLE_UNKPROV") != NULL;
+  if (!g_uprov_on || d < 0) return;
+  if (d >= g_uprov_cap) { int nc = g_uprov_cap ? g_uprov_cap : 4096; while (nc <= d) nc *= 2; g_uprov = realloc(g_uprov, (size_t)nc * sizeof(UProv)); memset(g_uprov + g_uprov_cap, 0, (size_t)(nc - g_uprov_cap) * sizeof(UProv)); g_uprov_cap = nc; }
+  g_uprov[d].src = s; g_uprov[d].fn = g_cur_fn; g_uprov[d].pc = g_cur_pc; g_uprov[d].rop = g_cur_rop;
+}
+static void eprov_set(int d, int s) {
+  if (g_uprov_on < 0) g_uprov_on = getenv("QJS_AOT_BUNDLE_UNKPROV") != NULL;
+  if (!g_uprov_on || d < 0) return;
+  if (d >= g_uprov_cap) { uprov_set(d, -1); }
+  if (g_eprov == NULL || d >= g_uprov_cap) { g_eprov = realloc(g_eprov, (size_t)g_uprov_cap * sizeof(UProv)); }
+  g_eprov[d].src = s; g_eprov[d].fn = g_cur_fn; g_eprov[d].pc = g_cur_pc; g_eprov[d].rop = g_cur_rop;
+}
 static int nd_new(void) {
   if (R->nnd >= R->ndcap) {
     R->ndcap = R->ndcap ? R->ndcap * 2 : 4096;
@@ -228,17 +245,19 @@ static int nd_new(void) {
 static int nd_flow(int d, int s) {
   int ch = 0;
   if (d == s || s < 0 || d < 0) return 0;
+  if (g_uprov_on > 0 && bs_has(&R->nd[s].pts, 0) && !bs_has(&R->nd[d].pts, 0)) eprov_set(d, s);
   if (bs_or(&R->nd[d].pts, &R->nd[s].pts)) ch = 1;
-  if ((R->nd[d].cls | R->nd[s].cls) != R->nd[d].cls) { R->nd[d].cls |= R->nd[s].cls; ch = 1; }
+  if ((R->nd[d].cls | R->nd[s].cls) != R->nd[d].cls) { if ((R->nd[s].cls & K_UNK) && !(R->nd[d].cls & K_UNK)) uprov_set(d, s); R->nd[d].cls |= R->nd[s].cls; ch = 1; }
   if (ch) R->changed = 1;
   return ch;
 }
 static void nd_cls(int d, int k) {
   if (d < 0) return;
-  if ((R->nd[d].cls | k) != R->nd[d].cls) { R->nd[d].cls |= k; R->changed = 1; }
+  if ((R->nd[d].cls | k) != R->nd[d].cls) { if ((k & K_UNK) && !(R->nd[d].cls & K_UNK)) uprov_set(d, -1); R->nd[d].cls |= k; R->changed = 1; }
 }
 static void nd_site(int d, int s) {
   if (d < 0) return;
+  if (s == 0 && g_uprov_on > 0 && !bs_has(&R->nd[d].pts, 0)) eprov_set(d, -1);
   if (bs_add(&R->nd[d].pts, s)) R->changed = 1;
   nd_cls(d, K_OBJ);
 }
@@ -250,6 +269,20 @@ static int st_new(int kind, int fn, int afn, int apc, int ctx, const char *label
     if (R->st[i].kind == kind && R->st[i].afn == afn && R->st[i].apc == apc && R->st[i].ctx == ctx && R->st[i].fn == fn &&
         (kind != SK_PROTO || 1))
       return i;
+  /* A function with thousands of allocation sites of one kind (a long top level building constant structures: 27 674 `new sc_Pair` literals in the Boyer/Earley file) must
+     not fill the site table, since every site past the cap is merged into EXT, and with it the function sites created after them (every global function defined late in
+     that top level became EXT: 223 calls unresolved, no region on any hot function). Past SITE_SUMMARY allocation sites of the same kind, constructor and function, the
+     next ones share the last real site as a summary: a sound weak merge of same-shaped objects. QJS_AOT_BUNDLE_NOSITESUM=1 turns it off. */
+  if (kind == SK_OBJ || kind == SK_ARR || kind == SK_INST) {
+    static int off = -1;
+    int n = 0, last = -1;
+    if (off < 0) off = getenv("QJS_AOT_BUNDLE_NOSITESUM") != NULL;
+    if (!off) {
+      for (i = 0; i < R->nst; i++)
+        if (R->st[i].kind == kind && R->st[i].afn == afn && R->st[i].fn == fn) { n++; last = i; }
+      if (n >= 24) return last;
+    }
+  }
   if (R->nst >= BN_MAXSITES) { R->overflow_sites++; return 0; }
   memset(&R->st[R->nst], 0, sizeof(BSite));
   R->st[R->nst].kind = kind;
@@ -398,6 +431,40 @@ static int locnode(const BInst *I, int k) {
   if (CELLS_ON && g_bfn[I->fn].cap_loc != NULL && g_bfn[I->fn].cap_loc[k]) return cell_node(I->fn, 0, k);
   return I->locbase + k;
 }
+
+/* The value a read of local `slot` at instruction `in` provably gets: the value of the closest earlier put_local of the same slot in the SAME block, when nothing between them
+   can change the slot (another put, a read-modify-write, an uninit, a close) and no inner function captures the slot (a captured local is a program-wide cell). The per-slot node
+   merges every value that ever lives in the slot index, which in a function that reuses a few slots for hundreds of unrelated temporaries (a long top level) pollutes a function value
+   stored through a temporary with every unknown call result stored through the same slot. QJS_AOT_BUNDLE_NOLOCFWD=1 turns this off. Returns the value id or -1. */
+static int local_fwd(const BInst *I, const Q2Insn *in, int slot) {
+  const BFn *F = &g_bfn[I->fn];
+  const Q2Func *q = &F->q;
+  int k, b, lo = -1, j;
+  static int off = -1;
+  if (off < 0) off = getenv("QJS_AOT_BUNDLE_NOLOCFWD") != NULL;
+  if (off || slot < 0 || slot >= I->nloc || in < q->insns || in >= q->insns + q->ninsns) return -1;
+  if (CELLS_ON && F->cap_loc != NULL && F->cap_loc[slot]) return -1;
+  k = (int)(in - q->insns);
+  for (b = 0; b < q->nblocks; b++)
+    if (k >= q->blocks[b].first_insn && k < q->blocks[b].first_insn + q->blocks[b].ninsns) { lo = q->blocks[b].first_insn; break; }
+  if (lo < 0) return -1;
+  for (j = k - 1; j >= lo; j--) {
+    const Q2Insn *p = &q->insns[j];
+    int ps = -1;
+    switch (p->rop) {
+      case ROP_put_local: case ROP_put_local_xfer: case ROP_put_local_probe: ps = p->narg > 0 ? (int)p->arg[0].val : -1; break;
+      case ROP_put_local_s0: case ROP_put_local_s1: case ROP_put_local_s2: case ROP_put_local_s3: ps = p->rop - ROP_put_local_s0; break;
+      case ROP_put_local_xfer_s0: case ROP_put_local_xfer_s1: case ROP_put_local_xfer_s2: case ROP_put_local_xfer_s3: ps = p->rop - ROP_put_local_xfer_s0; break;
+      case ROP_local_rmw_imm: case ROP_local_rmw_branch: case ROP_local_uninit: case ROP_close_local:
+        if (p->narg > 0 && (int)p->arg[0].val == slot) return -1;
+        continue;
+      default: continue;
+    }
+    if (ps != slot) continue;
+    return p->nuse >= 1 ? (int)p->use[0] : -1;
+  }
+  return -1;
+}
 static int parnode(const BInst *I, int k) { return k >= 0 && k < 16 ? I->parn[k] : I->parn[16]; }
 /* the node a read or write of argument k of this instance uses: the cell when an inner function captures it */
 static int argnode(const BInst *I, int k) {
@@ -414,13 +481,29 @@ static int g_cur_fn, g_cur_pc, g_cur_rop;
 static const char *g_cur_why = "";
 
 /* the objects in `src` reach unknown code; the first cause is kept for the report */
+static int diag_noesc(int fn, int pc) {   /* DIAGNOSTIC ONLY (unsound): QJS_AOT_BUNDLE_DIAG_NOESC="fn:pc,fn:*,..." escapes made at these instructions are dropped */
+  const char *e = getenv("QJS_AOT_BUNDLE_DIAG_NOESC"), *q;
+  char tok[32];
+  if (e == NULL) return 0;
+  snprintf(tok, sizeof(tok), "%d:%d", fn, pc);
+  for (q = e; *q;) {
+    char t2[32]; int n = 0;
+    while (*q && *q != ',' && n < 30) t2[n++] = *q++;
+    t2[n] = 0;
+    if (*q == ',') q++;
+    if (strcmp(t2, tok) == 0) return 1;
+    { char *c = strchr(t2, ':'); if (c && c[1] == '*') { *c = 0; if (atoi(t2) == fn) return 1; } }
+  }
+  return 0;
+}
 static void esc_add(const BSet *src) {
   int s;
+  if (g_cur_fn >= 0 && diag_noesc(g_cur_fn, g_cur_pc)) return;
   for (s = 0; s < BN_MAXSITES; s++)
     if (bs_has(src, s) && !bs_has(&R->esc, s)) {
       bs_add(&R->esc, s);
       R->changed = 1;
-      if (getenv("QJS_AOT_BUNDLE_ESCALL") != NULL) fprintf(stderr, "escape-all: %s <- %s (fn %d pc %d) pts=%d phase %d\n", R->st[s].label, g_cur_why, g_cur_fn, g_cur_pc, R->pts, R->phase);
+      if (getenv("QJS_AOT_BUNDLE_ESCALL") != NULL) fprintf(stderr, "escape-all: %s <- %s (fn %d pc %d%s%s) pts=%d phase %d\n", R->st[s].label, g_cur_why, g_cur_fn, g_cur_pc, g_cur_fn == -1 && g_cur_pc >= 0 && g_cur_pc < R->nst ? " from site " : "", g_cur_fn == -1 && g_cur_pc >= 0 && g_cur_pc < R->nst ? R->st[g_cur_pc].label : "", R->pts, R->phase);
       if (R->st[s].esc_fn == 0 && R->st[s].esc_pc == 0 && R->st[s].esc_why == NULL) {
         R->st[s].esc_fn = g_cur_fn + 1;
         R->st[s].esc_pc = g_cur_pc;
@@ -476,6 +559,17 @@ static void read_field(int dst, int recv, int name, int fn, int pc) {
   int s;
   const char *nm = g_bn_names[name];
   seal_recv(recv, fn, pc);
+  if (R->pts && R->collect && getenv("QJS_AOT_BUNDLE_READDBG") != NULL) {
+    char want_[96]; int wpc_ = -1; char *col_;
+    snprintf(want_, sizeof(want_), "%s", getenv("QJS_AOT_BUNDLE_READDBG"));
+    col_ = strrchr(want_, ':');
+    if (col_) { *col_ = 0; wpc_ = atoi(col_ + 1); }
+    if (pc == wpc_ && strstr(fn_name(fn), want_) != NULL) {
+      int ss_, shown_ = 0;
+      fprintf(stderr, "readdbg: %s pc %d .%s recv cls=%u nsites=%d\n", fn_name(fn), pc, nm, (unsigned)R->nd[recv].cls, bs_count(&R->nd[recv].pts));
+      BS_FOR(ss_, &R->nd[recv].pts) if (site_is_ext(ss_) || bs_has(&R->esc, ss_) || shown_ < 4) { shown_++; fprintf(stderr, "readdbg:   site %d %s kind=%s ext=%d esc=%d\n", ss_, R->st[ss_].label, sk_names[R->st[ss_].kind], site_is_ext(ss_), bs_has(&R->esc, ss_)); }
+    }
+  }
   if (!R->pts) {
     int f = fnode(-1, name, 1);
     nd_flow(dst, f);
@@ -486,7 +580,7 @@ static void read_field(int dst, int recv, int name, int fn, int pc) {
   }
   BS_FOR(s, &R->nd[recv].pts) {
     BSet seen;
-    int stack[64], sp = 0, found = 0, depth = 0;
+    int stack[64], sp = 0, found = 0, depth = 0, clean = 1;
     if (site_is_ext(s) || bs_has(&R->esc, s)) {
       nd_cls(dst, K_UNK);
       nd_site(dst, 0);
@@ -498,6 +592,7 @@ static void read_field(int dst, int recv, int name, int fn, int pc) {
     bs_add(&seen, s);
     while (sp > 0 && depth++ < 200) {
       int c = stack[--sp], f, p;
+      if (site_is_ext(c) || bs_has(&R->esc, c) || (R->st[c].kind == SK_INST && bs_count(&R->st[c].proto) == 0) || R->st[c].kind == SK_NATIVE) clean = 0;
       f = fl_find(c, name, 0);
       if (f >= 0) {
         nd_flow(dst, R->fl[f].node);
@@ -547,6 +642,16 @@ static void read_field(int dst, int recv, int name, int fn, int pc) {
         }
         nd_site(dst, bi);
       } else {
+        /* a miss on a site whose whole prototype chain is modelled (no escaped or external site on it) and a name that is not an Object.prototype builtin is exactly undefined.
+           QJS_AOT_BUNDLE_NOPRECISEMISS=1 restores undefined|unknown. */
+        static int nopm = -1;
+        static const char *const objbi_[] = {"toString", "valueOf", "toLocaleString", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "constructor", "__proto__",
+                                             "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "[]", NULL};
+        int isb2_ = 0, k2_;
+        if (nopm < 0) nopm = getenv("QJS_AOT_BUNDLE_NOPRECISEMISS") != NULL;
+        for (k2_ = 0; objbi_[k2_]; k2_++) if (strcmp(nm, objbi_[k2_]) == 0) isb2_ = 1;
+        if (!nopm && clean && !isb2_ && (R->st[s].kind == SK_OBJ || R->st[s].kind == SK_INST) && R->phase == 1) nd_cls(dst, K_UNDEF);
+        else
         nd_cls(dst, K_UNDEF | K_UNK);
         nd_site(dst, 0);
         if (R->pts && R->phase == 1 && g_dbg_events < g_dbg_max && getenv("QJS_AOT_BUNDLE_EVENTS") != NULL)
@@ -951,6 +1056,34 @@ static void do_call(const BInst *I, const Q2Insn *in, int kind, int inloop) {
     }
   }
   if (R->collect) cs = note_call(I->fn, in->pc, in->rop, inloop, cname);
+  /* A pure String.prototype method on a receiver that can only be a string, with arguments that can only be primitives: it runs no user code (no valueOf/toString on an
+     argument), keeps nothing of its arguments and returns a string / number / boolean. Only while the program never stores to a property of that name (nothing replaced
+     the builtin). QJS_AOT_BUNDLE_NOSTRBI=1 turns it off. */
+  if (kind == 1 && R->pts && recv_node >= 0 && cname[0] == '.' && !(R->nd[callee_node].cls & K_STR && 0)) {
+    static const struct { const char *n; unsigned res; } T[] = {
+      {"charAt", K_STR}, {"substring", K_STR}, {"substr", K_STR}, {"slice", K_STR}, {"toString", K_STR}, {"valueOf", K_STR}, {"toLowerCase", K_STR}, {"toUpperCase", K_STR},
+      {"trim", K_STR}, {"trimStart", K_STR}, {"trimEnd", K_STR}, {"padStart", K_STR}, {"padEnd", K_STR}, {"repeat", K_STR}, {"concat", K_STR},
+      {"charCodeAt", K_INT | K_DBL | K_NUM}, {"codePointAt", K_INT | K_DBL | K_NUM | K_UNDEF}, {"indexOf", K_INT}, {"lastIndexOf", K_INT}, {"localeCompare", K_INT},
+      {"startsWith", K_BOOL}, {"endsWith", K_BOOL}, {"includes", K_BOOL}, {NULL, 0}};
+    static int off = -1;
+    int ti;
+    if (off < 0) off = getenv("QJS_AOT_BUNDLE_NOSTRBI") != NULL;
+    if (!off && R->nd[recv_node].cls == K_STR && bs_count(&R->nd[recv_node].pts) == 0)
+      for (ti = 0; T[ti].n != NULL; ti++)
+        if (strcmp(cname + 1, T[ti].n) == 0) {
+          int w_ = bn_name(T[ti].n), k, pure = 1, fi_, wr_ = 0;
+          for (fi_ = 0; fi_ < g_bnfuncs && !wr_; fi_++) if (g_bfn[fi_].ok && ((g_bfn[fi_].wn[w_ >> 6] >> (w_ & 63)) & 1)) wr_ = 1;
+          if (wr_) break;
+          for (k = 0; k < in->win_n && in->win_val != NULL; k++) {
+            int an = vnode(I, in->win_val[k]);
+            if ((R->nd[an].cls & (K_OBJ | K_UNK)) || bs_count(&R->nd[an].pts) > 0) pure = 0;
+          }
+          if (!pure) break;
+          nd_cls(dst, (int)T[ti].res);
+          if (cs) cs->builtin = 1;
+          return;
+        }
+  }
   if (kind != 1 && in->nuse >= 1) {
     /* `new Array(...)` and `Array(...)`: an array of this site */
     const Q2Insn *cd = bn_def(I, in->use[0]);
@@ -1404,6 +1537,43 @@ static void do_insn(const BInst *I, int ii, int blk, int inloop) {
   g_cur_pc = in->pc;
   g_cur_rop = in->rop;
   g_cur_why = "operand of an instruction the model does not know";
+  if (g_uprov_on > 0 && R->collect && R->pts && in->nuse >= 1 && (in->rop == ROP_get_field || in->rop == ROP_get_field_own || in->rop == ROP_get_field2 || in->rop == ROP_get_field2_own || in->rop == ROP_get_length || in->rop == ROP_get_field_chain || in->rop == ROP_get_field_chain_own) &&
+      strstr(fn_name(I->fn), getenv("QJS_AOT_BUNDLE_UNKPROV")) != NULL) {
+    int n = vnode(I, in->use[0]), hop = 0;
+    if (R->nd[n].cls & K_UNK) {
+      fprintf(stderr, "unkprov: %s pc %d receiver node %d is UNK; chain:\n", fn_name(I->fn), in->pc, n);
+      { int e_ = vnode(I, in->use[0]), h2_ = 0;
+        fprintf(stderr, "unkprov: EXT chain of the receiver:\n");
+        while (e_ >= 0 && h2_++ < 60 && g_eprov != NULL && e_ < g_uprov_cap) {
+          char rn2_[40] = "-"; e_rop_name((uint16_t)g_eprov[e_].rop, rn2_, sizeof(rn2_));
+          fprintf(stderr, "unkprov:   node %d <- EXT added at %s pc %d (%s) from node %d\n", e_, g_eprov[e_].fn >= 0 && g_eprov[e_].fn < g_bnfuncs ? fn_name(g_eprov[e_].fn) : "?", g_eprov[e_].pc, rn2_, g_eprov[e_].src);
+          e_ = g_eprov[e_].src;
+        } }
+      while (n >= 0 && hop++ < 14 && n < g_uprov_cap) {
+        char rn_[40] = "-";
+        e_rop_name((uint16_t)g_uprov[n].rop, rn_, sizeof(rn_));
+        fprintf(stderr, "unkprov:   node %d <- added at %s pc %d (%s) from node %d\n", n, g_uprov[g_uprov[n].src >= 0 ? n : n].fn >= 0 && g_uprov[n].fn < g_bnfuncs ? fn_name(g_uprov[n].fn) : "?", g_uprov[n].pc, rn_, g_uprov[n].src);
+        { int fi_ = g_uprov[n].fn, q_;
+          if (fi_ >= 0 && fi_ < g_bnfuncs && g_bfn[fi_].ok)
+            for (q_ = 0; q_ < g_bfn[fi_].q.ninsns; q_++)
+              if (g_bfn[fi_].q.insns[q_].pc == g_uprov[n].pc) { char an_[64]; if (bn_atom(&g_bfn[fi_].q.insns[q_], NULL, an_, sizeof(an_), 0)) fprintf(stderr, "unkprov:       (atom .%s)\n", an_); break; } }
+        n = g_uprov[n].src;
+      }
+    }
+  }
+  if (R->collect && R->pts && in->nuse >= 1 && getenv("QJS_AOT_BUNDLE_RECVDBG") != NULL) {
+    char want_[96]; int wpc_ = -1; char *col_;
+    snprintf(want_, sizeof(want_), "%s", getenv("QJS_AOT_BUNDLE_RECVDBG"));
+    col_ = strrchr(want_, ':');
+    if (col_) { *col_ = 0; wpc_ = atoi(col_ + 1); }
+    if (in->pc == wpc_ && strstr(fn_name(I->fn), want_) != NULL) {
+      char sl_[400] = "-", cl_[128] = "-";
+      int rn_ = vnode(I, in->use[0]);
+      set_str_fwd(R, &R->nd[rn_].pts, sl_, sizeof(sl_), 12);
+      cls_str_fwd(R->nd[rn_].cls, cl_, sizeof(cl_));
+      fprintf(stderr, "recvdbg: %s pc %d rop %d receiver node %d cls=%s sites=[%s]\n", fn_name(I->fn), in->pc, (int)in->rop, rn_, cl_, sl_);
+    }
+  }
   switch (in->rop) {
     case ROP_load_undefined: nd_cls(dst, K_UNDEF); break;
     case ROP_load_null: nd_cls(dst, K_NULL); break;
@@ -1427,12 +1597,16 @@ static void do_insn(const BInst *I, int ii, int blk, int inloop) {
     case ROP_move: case ROP_move_s: case ROP_move_xfer:
       if (in->nuse >= 1) nd_flow(dst, vnode(I, in->use[0]));
       break;
-    case ROP_get_local:
-      nd_flow(dst, locnode(I, in->narg > 1 ? (int)in->arg[1].val : -1));
+    case ROP_get_local: {
+      int ls_ = in->narg > 1 ? (int)in->arg[1].val : -1, fv_ = local_fwd(I, in, ls_);
+      nd_flow(dst, fv_ >= 0 ? vnode(I, (Q2ValueId)fv_) : locnode(I, ls_));
       break;
-    case ROP_get_local_s0: case ROP_get_local_s1: case ROP_get_local_s2: case ROP_get_local_s3:
-      nd_flow(dst, locnode(I, in->rop - ROP_get_local_s0));
+    }
+    case ROP_get_local_s0: case ROP_get_local_s1: case ROP_get_local_s2: case ROP_get_local_s3: {
+      int ls_ = in->rop - ROP_get_local_s0, fv_ = local_fwd(I, in, ls_);
+      nd_flow(dst, fv_ >= 0 ? vnode(I, (Q2ValueId)fv_) : locnode(I, ls_));
       break;
+    }
     case ROP_put_local: case ROP_put_local_xfer: case ROP_put_local_probe:
       if (in->nuse >= 1) nd_flow(locnode(I, in->narg > 0 ? (int)in->arg[0].val : -1), vnode(I, in->use[0]));
       break;
@@ -1492,6 +1666,22 @@ static void do_insn(const BInst *I, int ii, int blk, int inloop) {
     case ROP_put_global: case ROP_define_global: case ROP_define_global_func:
       if (bn_atom(in, NULL, nm, sizeof(nm), 0) && in->nuse >= 1) {
         nd_flow(gnode(bn_name(nm)), vnode(I, in->use[0]));
+        if (R->collect && R->pts && getenv("QJS_AOT_BUNDLE_GWDBG") != NULL && strcmp(nm, getenv("QJS_AOT_BUNDLE_GWDBG")) == 0) {
+          char sl_[300] = "-", cl_[128] = "-";
+          set_str_fwd(R, &R->nd[vnode(I, in->use[0])].pts, sl_, sizeof(sl_), 6);
+          cls_str_fwd(R->nd[vnode(I, in->use[0])].cls, cl_, sizeof(cl_));
+          { const Q2Func *q_ = &g_bfn[I->fn].q; int vv_ = (int)in->use[0]; char dn_[40] = "-"; int dp_ = -1;
+            if (vv_ >= 0 && vv_ < q_->nvalues && q_->values[vv_].insn >= 0) { e_rop_name(q_->insns[q_->values[vv_].insn].rop, dn_, sizeof(dn_)); dp_ = q_->insns[q_->values[vv_].insn].pc; }
+            fprintf(stderr, "gwdbg: %s written in %s pc %d rop %d: value defined by %s@%d cls=%s sites=[%s]\n", nm, fn_name(I->fn), in->pc, (int)in->rop, dn_, dp_, cl_, sl_);
+            { int hop; for (hop = 0; hop < 6 && vv_ >= 0 && vv_ < q_->nvalues && q_->values[vv_].insn >= 0; hop++) {
+                const Q2Insn *d_ = &q_->insns[q_->values[vv_].insn]; char rn_[40]; char s2_[200] = "-";
+                e_rop_name(d_->rop, rn_, sizeof(rn_)); set_str_fwd(R, &R->nd[vnode(I, (Q2ValueId)vv_)].pts, s2_, sizeof(s2_), 4);
+                fprintf(stderr, "gwdbg:   v%d <- %s@%d narg=%d nuse=%d sites=[%s]\n", vv_, rn_, d_->pc, d_->narg, d_->nuse, s2_);
+                if (d_->rop == ROP_make_closure) { int a2_, ci2_ = -1; for (a2_ = 0; a2_ < d_->narg; a2_++) if (d_->arg[a2_].kind == 'c') { ci2_ = (int)d_->arg[a2_].val; break; }
+                  fprintf(stderr, "gwdbg:   make_closure cpool=%d cpool_count=%d cpool_fn=%p fn_of_closure=%d\n", ci2_, F->g->cpool_count, (void *)F->g->cpool_fn, fn_of_closure(F->g, ci2_)); }
+                { int ss_; BS_FOR(ss_, &R->nd[vnode(I, (Q2ValueId)vv_)].pts) fprintf(stderr, "gwdbg:   pts site %d kind %d(%s) label '%s' ext=%d\n", ss_, R->st[ss_].kind, sk_names[R->st[ss_].kind], R->st[ss_].label, site_is_ext(ss_)); }
+                if (d_->nuse >= 1 && (d_->rop == ROP_move || d_->rop == ROP_move_s || d_->rop == ROP_move_xfer)) vv_ = (int)d_->use[0]; else break; } } }
+        }
         mark_flags(vnode(I, in->use[0]), SF_GLOBAL);
         if (R->collect) WF->wglobal = 1;
       }
@@ -1736,13 +1926,46 @@ static void do_insn(const BInst *I, int ii, int blk, int inloop) {
     case ROP_return_undefined: nd_cls(I->retn, K_UNDEF); break;
     case ROP_throw: case ROP_throw_error:
       if (R->collect) WF->thrw = 1;
+      if (getenv("QJS_AOT_BUNDLE_DIAG_NOTHROWESC") == NULL)   /* DIAGNOSTIC ONLY (unsound): a thrown value does not escape */
       escape_node(in->nuse >= 1 ? vnode(I, in->use[0]) : -1);
       break;
     case ROP_check_ctor_return: case ROP_init_ctor:
       if (dst >= 0 && in->nuse >= 1) nd_flow(dst, vnode(I, in->use[0]));
       else if (dst >= 0) nd_flow(dst, I->thisn);
       break;
-    case ROP_special_object: nd_cls(dst, K_UNK); nd_site(dst, 0); if (R->collect) R->special_args++; break;
+    case ROP_special_object: {
+      /* `arguments` of a function that has no declared parameters (nothing to alias) or an unmapped arguments object is an array of the function's actual arguments: one abstract
+         array whose elements are the union of the argument nodes. Every other special object stays unknown. QJS_AOT_BUNDLE_NOARGS=1 turns this off. */
+      int kind_ = in->narg > 1 ? (int)in->arg[1].val : -1;
+      static int noargs = -1;
+      if (R->collect && R->pts && getenv("QJS_AOT_BUNDLE_ARGDBG") != NULL) fprintf(stderr, "argdbg: %s pc %d special_object kind=%d narg=%d arg_count=%d\n", fn_name(I->fn), in->pc, kind_, in->narg, F->g->arg_count);
+      if (noargs < 0) noargs = getenv("QJS_AOT_BUNDLE_NOARGS") != NULL;
+      if (!noargs && kind_ == 8) {   /* OP_SPECIAL_OBJECT_ARG_COUNT: the number of actual arguments (`arguments.length`) */
+        nd_cls(dst, K_INT);
+        break;
+      }
+      if (!noargs && (kind_ == 0 || (kind_ == 1 && F->g->arg_count == 0))) {
+        int ns = st_new(SK_ARR, -1, I->fn, in->pc, I->ctx, ""), q_;
+        if (R->st[ns].label[0] == 0) snprintf(R->st[ns].label, sizeof(R->st[ns].label), "arguments@%s:%d", fn_name(I->fn), in->pc);
+        nd_site(dst, ns);
+        for (q_ = 0; q_ < 17; q_++) nd_flow(fnode(ns, bn_name("[]"), 1), I->parn[q_]);
+        nd_cls(fnode(ns, bn_name("[]"), 1), K_UNDEF);
+        if (R->collect) WF->alloc++;
+        break;
+      }
+      nd_cls(dst, K_UNK); nd_site(dst, 0); if (R->collect) R->special_args++;
+      break;
+    }
+    case ROP_get_arg_el: {
+      /* `arguments[i]` read without materialising the object: any actual argument, or undefined past the end */
+      int q_;
+      static int noargs2 = -1;
+      if (noargs2 < 0) noargs2 = getenv("QJS_AOT_BUNDLE_NOARGS") != NULL;
+      if (noargs2) { nd_cls(dst, K_UNK); nd_site(dst, 0); break; }
+      for (q_ = 0; q_ < 17; q_++) nd_flow(dst, I->parn[q_]);
+      nd_cls(dst, K_UNDEF);
+      break;
+    }
     case ROP_lt: case ROP_lte: case ROP_gt: case ROP_gte: case ROP_eq: case ROP_neq: case ROP_strict_eq: case ROP_strict_neq:
     case ROP_instanceof: case ROP_in:
       nd_cls(dst, K_BOOL);
@@ -1970,7 +2193,9 @@ static void compute_cells(void) {
     for (k = 0; k < g_bfn[i].q.ninsns; k++) {
       const Q2Insn *in = &g_bfn[i].q.insns[k];
       int ch;
-      if (in->rop == ROP_eval || in->rop == ROP_apply_eval || in->rop == ROP_with_get_ref_undef || in->rop == ROP_special_object) g_bfn[i].evalish = 1;
+      if (in->rop == ROP_eval || in->rop == ROP_apply_eval || in->rop == ROP_with_get_ref_undef ||
+          (in->rop == ROP_special_object && !(getenv("QJS_AOT_BUNDLE_NOARGS") == NULL && in->narg > 1 &&
+                                              ((int)in->arg[1].val == 0 || (int)in->arg[1].val == 8 || ((int)in->arg[1].val == 1 && g_bfn[i].g->arg_count == 0))))) g_bfn[i].evalish = 1;
       if (in->rop != ROP_make_closure) continue;
       for (a = 0; a < in->narg && in->arg[a].kind != 'c'; a++) {}
       if (a >= in->narg || (ch = fn_of_closure(g_bfn[i].g, (int)in->arg[a].val)) < 0) continue;
@@ -2702,7 +2927,13 @@ static int bundle_prepare(void) {
            in->rop == ROP_define_class_computed) && bn_atom(in, NULL, nm, sizeof(nm), 0))
         g_gdef[bn_name(nm)] = 1;
     }
+    if (getenv("QJS_AOT_BUNDLE_GDEFDBG") != NULL) {
+      int nput = 0, ndef = 0;
+      for (k = 0; k < g_bfn[i].q.ninsns; k++) { if (g_bfn[i].q.insns[k].rop == ROP_put_global) nput++; if (g_bfn[i].q.insns[k].rop == ROP_define_global || g_bfn[i].q.insns[k].rop == ROP_define_global_func) ndef++; }
+      if (nput + ndef > 20) fprintf(stderr, "gdefdbg: fn %d %s ok insns=%d put_global=%d define_global=%d\n", i, fn_name(i), g_bfn[i].q.ninsns, nput, ndef);
+    }
   }
+  if (getenv("QJS_AOT_BUNDLE_GDEFDBG") != NULL) fprintf(stderr, "gdefdbg: one_way_unify1_nboyer gdef=%d sc_Pair gdef=%d\n", g_gdef[bn_name("one_way_unify1_nboyer")], g_gdef[bn_name("sc_Pair")]);
   run_one(&A, 0);
   /* layer 2: points-to; an assignment to F.prototype is assumed to precede F's first construct, and the run is repeated with that known */
   for (pass = 0; pass < 5; pass++) {

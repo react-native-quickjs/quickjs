@@ -739,6 +739,15 @@ const Q2RopInfo *q2_rop_info(uint16_t rop) {
       info.reads = Q2_E_HEAP;
       info.writes = Q2_E_HEAP | Q2_E_CONTROL;
       return &info;
+    case ROP_get_arg_el: /* "rur": d, the variable slot of the arguments object, the index */
+      info.op = Q2_OP_FALLBACK;
+      info.ndef = 1;
+      info.def[0] = 0;
+      info.nuse = 1;
+      info.use[0] = 2;
+      info.reads = Q2_E_HEAP;
+      info.writes = Q2_E_HEAP | Q2_E_CONTROL;
+      return &info;
     case ROP_load_const: /* "rbc": d, kind, cpool */
       info.op = Q2_OP_FALLBACK;
       info.ndef = 1;
@@ -1316,7 +1325,7 @@ static int def_from_record_insn(const Q2Insn *in) {
     case Q2_OP_FALLBACK:
       return in->ndef > 0;
     case Q2_OP_UNARY:
-      return in->rop == ROP_neg;
+      return in->rop == ROP_neg || in->rop == ROP_not;
     default:
       return 0;
   }
@@ -2931,6 +2940,11 @@ int q2_build_ea(
         int32_t dpc;
         if (v->insn < 0) continue;
         dpc = f->insns[v->insn].ppc;
+        /* A chain's first destination has its own record, filed one byte after the instruction's pc (CPCM in a copied body); the record AT the
+           pc is the second link's. */
+        if ((f->insns[v->insn].rop == ROP_get_field_chain || f->insns[v->insn].rop == ROP_get_field_chain_own) && f->insns[v->insn].ndef == 2 &&
+            f->insns[v->insn].def[0] == (Q2ValueId)i && getenv("QJS_AOT_CHAIN_OLD") == NULL)
+          dpc += f->insns[v->insn].own != 0 ? CPCM : 1;
         lo = 0;
         hi = f->nprof - 1;
         while (lo <= hi) {

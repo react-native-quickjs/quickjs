@@ -1,0 +1,39 @@
+Subject: A compiled entry that runs nothing hands the call to the interpreter; the profitability gate stops using the unit for the function
+
+What this does
+  - `qjs_aot_call_interp(ctx, co, this_obj, argv, argc)` makes the call as the interpreter would without a unit: `JS_CallInternal` with `JS_CALL_FLAG_AOT_DEOPT`, which keeps it off the native entry, the record entry and `js_regvm_execute`'s compiled entry.
+  - `qjs_aot_gated_call` drops the function's binding first (`js_aot_unbind`), then makes the call.
+
+Why we need it
+  A frameless native entry that is gated off, or refuses a call before running anything, used to continue in the unit's generic body on a frame the exit builds. With the generic body replaced by a continuation in the interpreter (QJS_AOT_NOGENERIC), that manufactured frame still differs from a real call (vcase r-pd-readonly produced a different result after the gate fired). The call itself is handed back instead; nothing of it has run.
+
+Soundness
+  The callee has not started, so the interpreter's call is the first and only execution. `this_obj` is the receiver the caller chose (a constructor call has made its object already); the value is the function's own return, as the compiled entry would return it. The gate unbinds the function exactly as `qjs_aot_func_disabled` documents for a function whose guards keep failing.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -66277,0 +66278,18 @@
++}
++
++/* A compiled function's entry (or its frameless exit) hands the whole call back: nothing of it has run, and no frame of the
++   unit was built. The interpreter makes the call as it would without a unit: the flag keeps JS_CallInternal off the compiled
++   entries (the native entry, the record entry, js_regvm_execute's entry), so this cannot come back here. `this_obj` is the
++   `this` the caller chose (a constructor call has already made its object), and the value is the function's own return. */
++QJS_AOT_STUB JSValue qjs_aot_call_interp(JSContext *ctx, JSObject *co, JSValue this_obj, JSValue *argv, int argc)
++{
++    return JS_CallInternal(ctx, JS_MKPTR(JS_TAG_OBJECT, co), this_obj, JS_UNDEFINED, argc, (JSValueConst *)argv,
++                           JS_CALL_FLAG_AOT_DEOPT);
++}
++
++/* The profitability gate fired for this function: stop using the unit for it (its calls take the interpreter's paths from
++   now on), and make this call there. */
++QJS_AOT_STUB JSValue qjs_aot_gated_call(JSContext *ctx, JSObject *co, JSValue this_obj, JSValue *argv, int argc)
++{
++    js_aot_unbind(co->u.func.function_bytecode);
++    return qjs_aot_call_interp(ctx, co, this_obj, argv, argc);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -311,0 +312,4 @@
++/* An entry that runs nothing hands the call to the interpreter (no frame of the unit is built); the gated form also stops
++   using the unit for the function. `this_obj` is the receiver the caller chose; the value is the function's own return. */
++QJS_AOT_STUB JSValue qjs_aot_call_interp(JSContext *ctx, JSObject *co, JSValue this_obj, JSValue *argv, int argc);
++QJS_AOT_STUB JSValue qjs_aot_gated_call(JSContext *ctx, JSObject *co, JSValue this_obj, JSValue *argv, int argc);

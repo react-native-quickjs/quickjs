@@ -1,0 +1,23 @@
+Subject: The register bytecode reader accepts the baseline tier's REG_IC_NONE property-site operand
+
+What this does
+  - Both register-program decoders (the wire decoder and the plain-operand check) required every property-site (`s`) operand to be below the function's `regvm_pic_count`. The baseline tier (functions with too many property sites for a 16-bit site index, or compiled without a site table) writes REG_IC_NONE (0xffff) for every site and has `regvm_pic_count == 0`; its handlers already treat REG_IC_NONE as "no site" and run the generic path. The reader now accepts exactly that pair, REG_IC_NONE in a function whose site table is empty, and still rejects any other out-of-range site.
+
+Why we need it
+  F51: tools/benchmark/octane/corpus/mandreel.js compiled by qjsc in the register build produced a 10 MB .bc that qjs-bench refused with "SyntaxError: register PIC site out of range" (the same file runs from source; the other eight Octane files round-trip). The check is older than the checkpoint (it is in 3f69465, from the register VM landing); it was never exercised because no round-tripped file contained a baseline-tier function.
+
+Soundness
+  A function with a site table (`regvm_pic_count > 0`) still rejects 0xffff, so a handler that indexes the table by site never sees REG_IC_NONE; a function without a table has no table for a handler to index and its handlers take the REG_IC_NONE path (`site == REG_IC_NONE` / `regvm_pic == NULL`).
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -85254 +85254,5 @@
+-                    if (sv < 0 || (uint32_t)sv >= b->regvm_pic_count) {
++                    /* The baseline tier names REG_IC_NONE for every property
++                       site and has no site table (pic_count 0); it is the only
++                       writer of that value. */
++                    if (!(sv == (int32_t)REG_IC_NONE && b->regvm_pic_count == 0) &&
++                        (sv < 0 || (uint32_t)sv >= b->regvm_pic_count)) {
+@@ -85792 +85796,2 @@
+-                if (v < 0 || (uint32_t)v >= b->regvm_pic_count) {
++                if (!(v == (int32_t)REG_IC_NONE && b->regvm_pic_count == 0) &&
++                    (v < 0 || (uint32_t)v >= b->regvm_pic_count)) {

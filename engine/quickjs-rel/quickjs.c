@@ -146,6 +146,17 @@ typedef struct JSRegRCC JSRegRCC;
 
 #if QJS_DRC
 static void js_drc_reconcile(JSRuntime *rt);
+#ifdef QJS_DRC_STRESS_ALLOC
+/* A reconcile at every QJS_DRC_STRESS_EVERY-th allocation (default every one): the validation mode of the conservative stack roots. */
+static uint32_t js_drc_stress_every = 1;
+static uint32_t js_drc_stress_ctr;
+__attribute__((constructor)) static void js_drc_stress_init(void)
+{
+    if (getenv("QJS_DRC_STRESS_EVERY")) js_drc_stress_every = (uint32_t)atoi(getenv("QJS_DRC_STRESS_EVERY"));
+    if (js_drc_stress_every == 0) js_drc_stress_every = 1;
+}
+#define JS_DRC_STRESS_POINT(rt_) do { if (!(rt_)->drc_in_reconcile && (rt_)->gc_phase == JS_GC_PHASE_NONE && ++js_drc_stress_ctr >= js_drc_stress_every) { js_drc_stress_ctr = 0; js_drc_reconcile(rt_); } } while (0)
+#endif
 #if QJS_DRC
 static void js_closcyc_resolve(JSRuntime *rt);
 #endif
@@ -519,8 +530,16 @@ typedef struct JSArenaState {
     /* Empty arenas kept rather than returned to the system allocator, each on
        its class's free_arena_list; see js_arena_free. */
     uint32_t n_empty;
+    /* A LIFO cache of blocks freed by the flat plain-object release, per size class, in front of the arenas: a push or a pop is a
+       few instructions where the arena's own free and pop update its bookkeeping (first free block, used count, the free arena list).
+       A cached block stays "used" in its arena (its block index in the header is kept) and is already out of the malloc accounting;
+       js_arena_trim gives the blocks back, and arenas are freed whole at teardown. */
+    void *cache[JS_ARENA_BLOCK_SIZE_COUNT];
+    uint32_t cache_n[JS_ARENA_BLOCK_SIZE_COUNT];
     _Alignas(JS_ARENA_ALIGN) uint8_t zero_size_block[sizeof(JSMallocBlockHeader)];
 } JSArenaState;
+#define JS_BLK_CACHE_MAX js_blk_cache_max
+static uint32_t js_blk_cache_max = 16384;
 
 /* Forward: the light-frame header prefix (defined near the register handlers). */
 struct JSRegRun;
@@ -648,6 +667,18 @@ struct JSRuntime {
     uint32_t zct_cap;
     uint32_t zct_nobj;
     uint32_t zct_limit;
+    /* Plain objects parked by js_drc_zero stay on gc_obj_list and are named here instead (in_zct set, count zero or
+       resurrected); a reconcile scans this array rather than moving every parked object between lists. */
+    JSGCObjectHeader **zpark;
+    uint32_t zpark_len;
+    uint32_t zpark_cap;
+    /* The one object whose last counted reference compiled code has just handed to a register (q2_set_reg_p), kept alive with that
+       reference instead of being parked: the next such hand-over releases it. An object a loop stores into the next one it makes is
+       thus never parked and resurrected. js_drc_reconcile_locked releases it first. */
+    JSObject *drc_pend[4];
+    uint32_t drc_pend_i;
+    void ***instof_ics;       /* the inline-instanceof caches that hold a shape reference (qjs_aot_instof_fill), released at teardown */
+    uint32_t instof_n, instof_cap;
     /* malloc_size at which allocation pressure forces a reconcile, so a few
        very large parked values cannot ratchet the heap up. */
     size_t drc_malloc_mark;
@@ -886,6 +917,10 @@ struct JSRuntime {
        watched object name an unwatched atom and skip the list) */
     JSAtom aot_gwatch[JS_AOT_GWATCH_MAX];
     uint64_t aot_gwatch_bloom[4];
+    /* per watched atom: 1 when a fact group (not only an int32 fold) depends on it. An atom watched only by folds is dropped from the list by the first
+       write it reports: the epoch moved, every folded literal is stale, and the next entry of a body re-confirms its folds against the live value (which
+       watches the atom again if it still matches). Otherwise a global written in a loop paid the epoch bump and the list on every store. */
+    uint8_t aot_gwatch_fact[JS_AOT_GWATCH_MAX];
 };
 
 #if QJS_REGVM_RECORD
@@ -1744,6 +1779,7 @@ typedef struct JSAotProfFunc {
     uint32_t *br_taken;    /* taken count by branch pc; size pc_n */
     uint32_t *br_total;    /* executions by branch pc; size pc_n */
     uint32_t *pc_samples;  /* sampler hits by pc; size pc_n */
+    uint32_t *pc_exec;     /* executions by instruction pc (saturating); size pc_n */
     uint64_t sample_us;    /* total sampled self time, microseconds */
     JSAotProfSite *sites;  /* size nsites */
     JSAotProfCall *calls;
@@ -1836,6 +1872,10 @@ typedef struct JSFunctionBytecode {
     uint8_t *byte_code_buf; /* (self pointer) */
     JSShape *ctor_fn_shape;
     JSShape *ctor_inst_shape[4];
+    /* The finished instance of a constructor that only stores arguments into fields (qjs_aot_new_fused). */
+    JSShape *ctor_final_shape;
+    uint8_t ctor_fused_ok;  /* ctor_final_shape is set and the constructor is neither derived nor a layout constructor: compiled code may allocate the instance inline */
+    uint8_t ctor_final_tries;
     uint16_t ctor_proto_slot;
     uint8_t ctor_inst_next;
     int byte_code_len;
@@ -1962,6 +2002,10 @@ typedef struct JSFunctionBytecode {
     /* The unit's native entry for this function (JSAotNFn), or NULL. */
     void *aot_nfn;
     uint32_t aot_index;
+    /* The unit entry of this function's code, set for every live bytecode whose digest the unit holds -- a gated one (aot_fn dropped), a twin
+       of the bound bytecode (aot_fn never set) and the bound one alike. A compiled caller that pins a method cell to a callee compares this: the
+       code is the same, and it calls the entry only when `aot_fn` says this bytecode runs it. */
+    void *aot_ident;
     /* The per-site polymorphic property cache a specialised body fills: four
        entries of (shape, offset, kind) per site, allocated on demand and freed
        with the bytecode. The entries hold counted shape references, so a shape
@@ -2075,6 +2119,14 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #define AOT_PROF_TAKEN(f_, ip_) \
         do { if (unlikely(AOT_PROF_ON((f_)->b))) \
                  js_aot_prof_taken((f_)->b, (ip_)); } while (0)
+/* The same for an instruction's FIRST destination when it has two (`get_field_chain`): the P record of the instruction's pc belongs to the
+   second, so the first is filed one byte on, a pc no instruction starts at. */
+#define AOT_PROF_REG_T1(f_, d_, v_) \
+        do { if (unlikely(AOT_PROF_ON((f_)->b))) { \
+                 JSAotProfFunc *pf1_ = (f_)->b->aot_prof; \
+                 if (pf1_) { pf1_->last_pc++; \
+                     js_aot_prof_reg((f_)->b, (int)((d_) / (int)sizeof(JSValue)), (v_)); \
+                     pf1_->last_pc--; } } } while (0)
 #else
 /* Only register code expands these, so a stack-only build never needs them. */
 #if QJS_REGVM
@@ -2088,6 +2140,7 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #define AOT_PROF_TICK(f_, ip_)      ((void)0)
 #define AOT_PROF_EDGE(f_, ip_, off_) ((void)0)
 #define AOT_PROF_REG_T(f_, d_, v_)  ((void)0)
+#define AOT_PROF_REG_T1(f_, d_, v_) ((void)0)
 #define AOT_PROF_TAKEN(f_, ip_)     ((void)0)
 #define AOT_PROF_ELEM(b_, v_, h_)   ((void)0)
 #define AOT_PROF_PACKED(b_, o_)     ((void)0)
@@ -3148,10 +3201,18 @@ static JSValue js_bool(bool v)
     return JS_MKVAL(JS_TAG_BOOL, (v != 0));
 }
 
+#ifdef SPL_COUNT
+unsigned long g_spl_k[16];
+__attribute__((destructor)) static void spl_cnt_dump(void){ static const char *nm[16]={"unit q2_dup","unit q2_dup_nl","unit q2_free_obj dec","unit other dec","engine js_dup","engine REG_ADOPT dec","engine JS_FreeValueRT dec","engine child dec in free","unit other dup",0,0,0,0,0,0,0}; for(int i=0;i<16;i++) if(g_spl_k[i]) fprintf(stderr,"SPLK %s=%lu\n", nm[i], g_spl_k[i]); }
+#define SPL_K(k) (g_spl_k[k]++)
+#else
+#define SPL_K(k) ((void)0)
+#endif
 static JSValue js_dup(JSValueConst v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         void *p = JS_VALUE_GET_PTR(v);
+        SPL_K(4);
         JS_REF_COUNT(p)++;
     }
     return unsafe_unconst(v);
@@ -3262,8 +3323,14 @@ static __attribute__((noinline)) void js_trigger_gc_slow(JSRuntime *rt, size_t s
 }
 
 /* The threshold test stays inline at every allocation site; the collection itself is out of line. */
+#ifdef QJS_DRC_STRESS_ALLOC
+static void js_drc_reconcile(JSRuntime *rt);
+#endif
 static inline __attribute__((always_inline)) void js_trigger_gc(JSRuntime *rt, size_t size)
 {
+#ifdef QJS_DRC_STRESS_ALLOC
+    JS_DRC_STRESS_POINT(rt);
+#endif
 #ifdef FORCE_GC_AT_MALLOC
     js_trigger_gc_slow(rt, size);
 #else
@@ -3303,15 +3370,28 @@ static inline JSMallocBlockHeader *arena_zero_block(JSRuntime *rt)
     return (JSMallocBlockHeader *)rt->arena_state.zero_size_block;
 }
 
+/* The arena size class of a plain object that reserves `cap` inline property slots (0xff: not an arena size), filled by js_arena_init. The
+   flat plain-object allocator reads it instead of re-deriving the class from the byte size on every allocation. */
+#define JS_PLAIN_OBJ_CAPS 17
+static uint8_t js_plain_obj_bsi[JS_PLAIN_OBJ_CAPS];
+
 static void js_arena_init(JSRuntime *rt)
 {
     JSArenaState *s = &rt->arena_state;
     int i;
+    for (i = 0; i < JS_PLAIN_OBJ_CAPS; i++) {
+        size_t total = (((offsetof(JSObject, u) + (size_t)i * sizeof(JSProperty)) + JS_ARENA_ALIGN - 1) &
+                        ~(size_t)(JS_ARENA_ALIGN - 1)) + sizeof(JSMallocBlockHeader);
+        int idx = arena_get_size_index(total);
+        js_plain_obj_bsi[i] = idx < JS_ARENA_BLOCK_SIZE_COUNT ? (uint8_t)idx : 0xff;
+    }
     arena_zero_block(rt)->u.block_idx = JS_ARENA_FREE_NIL;
     s->n_empty = 0;
     for (i = 0; i < JS_ARENA_BLOCK_SIZE_COUNT; i++) {
         init_list_head(&s->arena_list[i]);
         init_list_head(&s->free_arena_list[i]);
+        s->cache[i] = NULL;
+        s->cache_n[i] = 0;
     }
 }
 
@@ -3329,8 +3409,7 @@ static no_inline JSArena *arena_new(JSRuntime *rt, int block_size_idx)
 
     block_size = arena_block_sizes[block_size_idx];
     n_blocks = (JS_ARENA_SIZE - sizeof(JSArena)) / block_size;
-    ar = rt->mf.js_malloc(rt->malloc_state.opaque,
-                          sizeof(JSArena) + (size_t)n_blocks * block_size);
+    ar = rt->mf.js_malloc(rt->malloc_state.opaque, sizeof(JSArena) + (size_t)n_blocks * block_size);
     if (!ar)
         return NULL;
     ar->block_size_idx = block_size_idx;
@@ -3478,12 +3557,41 @@ static void js_arena_free(JSRuntime *rt, void *ptr)
 }
 
 /* Return every kept empty arena to the system allocator. */
+/* Give the cached blocks back to their arenas (their accounting was released when they were cached). */
+static void js_blk_cache_flush(JSRuntime *rt)
+{
+    JSArenaState *s = &rt->arena_state;
+    int i;
+
+    for (i = 0; i < JS_ARENA_BLOCK_SIZE_COUNT; i++) {
+        unsigned int block_size = arena_block_sizes[i];
+
+        while (s->cache[i]) {
+            void *ptr = s->cache[i];
+            JSMallocBlockHeader *b = container_of(ptr, JSMallocBlockHeader, user_data);
+            unsigned int block_idx = b->u.block_idx;
+            JSArena *ar = (JSArena *)((uint8_t *)b - (size_t)block_size * block_idx - sizeof(JSArena));
+
+            s->cache[i] = *(void **)ptr;
+            b->u.free_next = ar->first_free_block;
+            ar->first_free_block = block_idx;
+            if (ar->n_used_blocks == ar->n_blocks)
+                list_add(&ar->free_link, &s->free_arena_list[i]);
+            ar->n_used_blocks--;
+            if (ar->n_used_blocks == 0)
+                js_arena_empty(rt, ar);
+        }
+        s->cache_n[i] = 0;
+    }
+}
+
 static void js_arena_trim(JSRuntime *rt)
 {
     JSArenaState *s = &rt->arena_state;
     struct list_head *el, *el1;
     int i;
 
+    js_blk_cache_flush(rt);
     if (s->n_empty == 0)
         return;
     for (i = 0; i < JS_ARENA_BLOCK_SIZE_COUNT; i++) {
@@ -3601,6 +3709,8 @@ static void js_arena_free_all(JSRuntime *rt)
         }
         init_list_head(&s->arena_list[i]);
         init_list_head(&s->free_arena_list[i]);
+        s->cache[i] = NULL;
+        s->cache_n[i] = 0;
     }
 }
 
@@ -4038,6 +4148,7 @@ static int js_nb64_addresses_fit(const JSMallocFunctions *mf, void *opaque)
 }
 #endif
 
+static void *js_def_malloc(void *opaque, size_t size);
 JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 {
     JSRuntime *rt;
@@ -4082,6 +4193,11 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     rt->zct_cap = 0;
     rt->zct_nobj = 0;
     rt->zct_limit = 4096;
+    rt->zpark = NULL;
+    rt->zpark_len = 0;
+    rt->zpark_cap = 0;
+    memset(rt->drc_pend, 0, sizeof(rt->drc_pend));
+    rt->drc_pend_i = 0;
 #ifdef QJS_DRC_STRESS
     rt->zct_limit = 0;
 #endif
@@ -4443,8 +4559,99 @@ int js_regvm_count_dump(void);
 #endif
 
 
+static int js_drc_repark_skip = 1;
+static int js_drc_zarray = 1;
+static int js_blk_cache_on = 1;
+static unsigned long js_dbg_tpl_calls, js_dbg_note[8];
+void qjs_aot_dbg_note(int k) { js_dbg_note[k & 7]++; }
+__attribute__((destructor)) static void js_dbg_tpl_dump(void) { if (getenv("QJS_DEBUG_TPL")) fprintf(stderr, "engine template allocations: %lu; inline declines bsi=%lu empty=%lu limit=%lu shape/cap/proto=%lu hit=%lu; engine new_fused calls=%lu ok=%lu\n", js_dbg_tpl_calls, js_dbg_note[0], js_dbg_note[1], js_dbg_note[2], js_dbg_note[3], js_dbg_note[4], js_dbg_note[5], js_dbg_note[6]); }
+static uint32_t js_drc_minlim = 4096;
+static size_t js_drc_slack_min = (size_t)4 << 20;
+static int js_neverfree; /* throw-away measurement knob: a reconcile frees no parked plain object */
+static int js_free_stack_on = 1;
+__attribute__((constructor)) static void js_drc_repark_init(void)
+{
+    if (getenv("QJS_DRC_NOREPARK")) js_drc_repark_skip = js_drc_zarray = 0;
+    if (getenv("QJS_DRC_NOZARRAY")) js_drc_zarray = 0;
+    if (getenv("QJS_NOBLKCACHE")) js_blk_cache_on = 0;
+    if (getenv("QJS_BLKCACHE_MAX")) js_blk_cache_max = (uint32_t)atoi(getenv("QJS_BLKCACHE_MAX"));
+    if (getenv("QJS_NOFREESTACK")) js_free_stack_on = 0;
+    if (getenv("QJS_NEVERFREE")) js_neverfree = 1;
+    if (getenv("QJS_DRC_MINLIM")) js_drc_minlim = (uint32_t)atoi(getenv("QJS_DRC_MINLIM"));
+    if (getenv("QJS_DRC_SLACK_MB")) js_drc_slack_min = (size_t)atoi(getenv("QJS_DRC_SLACK_MB")) << 20;
+}
+#ifdef QJS_DRC_STATS
+static uint64_t drc_st_alloc, drc_st_freeobj, drc_st_repark, drc_st_park_obj, drc_st_park_other, drc_st_resurrect, drc_st_freed, drc_st_reconciles;
+#define DRC_ST(x) (x)++
+/* QJS_DRC_STATS: where objects get parked from, as the three nearest return addresses of the parking call. */
+#define DRC_SITE_N 4096
+static struct { uintptr_t ra[3]; uint64_t n; } drc_site[DRC_SITE_N];
+static __attribute__((noinline)) void drc_st_site(void)
+{
+    void **fp = __builtin_frame_address(0);
+    uintptr_t ra[3] = {0, 0, 0};
+    uint32_t h, i;
+    for (i = 0; i < 3 && fp; i++) {
+        ra[i] = (uintptr_t)fp[1];
+        fp = (void **)fp[0];
+    }
+    h = (uint32_t)((ra[0] * 31 + ra[1]) * 31 + ra[2]) * 2654435761u >> 20;
+    for (i = 0; i < DRC_SITE_N; i++) {
+        uint32_t k = (h + i) % DRC_SITE_N;
+        if (drc_site[k].n == 0) { memcpy(drc_site[k].ra, ra, sizeof(ra)); drc_site[k].n = 1; return; }
+        if (!memcmp(drc_site[k].ra, ra, sizeof(ra))) { drc_site[k].n++; return; }
+    }
+}
+static struct { uintptr_t ra; uint64_t park, res, fre; } drc_fate[1024];
+static uintptr_t *drc_zra; static uint32_t drc_zra_cap;
+static __attribute__((noinline)) uint32_t drc_fate_slot(uintptr_t ra)
+{
+    uint32_t h = (uint32_t)(ra * 2654435761u >> 22), i;
+    for (i = 0; i < 1024; i++) {
+        uint32_t k = (h + i) & 1023;
+        if (drc_fate[k].ra == ra || drc_fate[k].ra == 0) { drc_fate[k].ra = ra; return k; }
+    }
+    return 0;
+}
+static __attribute__((noinline)) uintptr_t drc_st_ra2(void)
+{
+    void **fp = __builtin_frame_address(0);
+    fp = (void **)fp[0]; fp = (void **)fp[0];
+    return (uintptr_t)fp[1];
+}
+static void drc_st_site_dump(void)
+{
+    {
+        uint32_t i;
+        for (i = 0; i < 1024; i++)
+            if (drc_fate[i].ra && drc_fate[i].park > 100000)
+                fprintf(stderr, "fate 0x%lx park %llu resurrected %llu freed %llu\n", (unsigned long)drc_fate[i].ra,
+                        (unsigned long long)drc_fate[i].park, (unsigned long long)drc_fate[i].res, (unsigned long long)drc_fate[i].fre);
+    }
+    uint32_t i, j, best;
+    fprintf(stderr, "park-site-anchor 0x%lx\n", (unsigned long)(uintptr_t)&drc_st_site_dump);
+    for (j = 0; j < 40; j++) {
+        best = 0;
+        for (i = 1; i < DRC_SITE_N; i++) if (drc_site[i].n > drc_site[best].n) best = i;
+        if (!drc_site[best].n) break;
+        fprintf(stderr, "park-site %llu 0x%lx 0x%lx 0x%lx\n", (unsigned long long)drc_site[best].n,
+                (unsigned long)drc_site[best].ra[0], (unsigned long)drc_site[best].ra[1], (unsigned long)drc_site[best].ra[2]);
+        drc_site[best].n = 0;
+    }
+}
+#else
+#define DRC_ST(x) ((void)0)
+#endif
+
 void JS_FreeRuntime(JSRuntime *rt)
 {
+#ifdef QJS_DRC_STATS
+    fprintf(stderr, "drc-stats: plain objects allocated %llu freed %llu; parked objects %llu (other values %llu; re-parks skipped %llu), reconciles %llu, at reconcile: resurrected %llu freed %llu\n",
+            (unsigned long long)drc_st_alloc, (unsigned long long)drc_st_freeobj, (unsigned long long)drc_st_park_obj, (unsigned long long)drc_st_park_other, (unsigned long long)drc_st_repark,
+            (unsigned long long)drc_st_reconciles, (unsigned long long)drc_st_resurrect,
+            (unsigned long long)drc_st_freed);
+    drc_st_site_dump();
+#endif
 #ifdef QJS_REGVM_COUNT
     if (getenv("QJS_REGVM_COUNTS"))
         js_regvm_count_dump();
@@ -4499,6 +4706,24 @@ void JS_FreeRuntime(JSRuntime *rt)
     /* The unit's own caches hold counted references: its site callees and the
        contracted layout shapes. Release them first, so nothing it holds outlives
        this runtime. A build with no unit has no such function. */
+    {
+        uint32_t k;
+
+        for (k = 0; k < rt->instof_n; k++) {
+            void **ic = rt->instof_ics[k];
+
+            if (ic[0]) {
+                js_free_shape(rt, (JSShape *)ic[0]);
+                ic[0] = NULL;
+            }
+            ic[1] = NULL;
+        }
+        rt->instof_n = 0;
+        if (rt->instof_ics)
+            rt->mf.js_free(rt->malloc_state.opaque, rt->instof_ics);
+        rt->instof_ics = NULL;
+        rt->instof_cap = 0;
+    }
     if (&qjs_aot_release != NULL)
         qjs_aot_release(rt);
     /* Release the per-site callee references before the final collection. A
@@ -4527,6 +4752,7 @@ void JS_FreeRuntime(JSRuntime *rt)
        whose last edge is counted but untraced. */
     js_gc_promote_all_code(rt);
 
+    /* Nothing is live on the machine stack any more: a stale word in a frame slot must not pin an object (and its cycle) through the collection below. */
     JS_RunGC(rt);
 
 #if QJS_DRC
@@ -4580,10 +4806,14 @@ void JS_FreeRuntime(JSRuntime *rt)
 #endif
 
 #if QJS_DRC
-    /* No live register frames here: drain anything still parked. */
+    /* No live register frames here: drain anything still parked. The machine stack holds no compiled frame either: a stale word on it must not keep an object. */
     js_drc_reconcile(rt);
     if (rt->zct)
         rt->mf.js_free(rt->malloc_state.opaque, rt->zct); /* raw realloc pair */
+    if (rt->zpark)
+        rt->mf.js_free(rt->malloc_state.opaque, rt->zpark);
+    rt->zpark = NULL;
+    rt->zpark_len = rt->zpark_cap = 0;
     rt->zct = NULL;
     rt->zct_len = 0;
     rt->zct_cap = 0;
@@ -4591,6 +4821,17 @@ void JS_FreeRuntime(JSRuntime *rt)
        freed at once rather than parked. */
     rt->drc_in_reconcile = 1;
 #endif
+    if (getenv("QJS_DEBUG_LEAK") && !list_empty(&rt->gc_obj_list)) {
+        struct list_head *el_;
+        int n_ = 0;
+        list_for_each(el_, &rt->gc_obj_list) {
+            JSGCObjectHeader *g_ = list_entry(el_, JSGCObjectHeader, link);
+            if (n_++ < 5)
+                fprintf(stderr, "leak: gc type %d rc %d in_zct %d class %d pend0=%p pend1=%p zpark_len=%u\n", (int)JS_GC_TYPE(g_), (int)JS_REF_COUNT(g_), (int)JS_GC_IN_ZCT(g_),
+                        JS_GC_TYPE(g_) == JS_GC_OBJ_TYPE_JS_OBJECT ? ((JSObject *)g_)->class_id : -1, (void *)rt->drc_pend[0], (void *)rt->drc_pend[1], rt->zpark_len);
+        }
+        fprintf(stderr, "leak: %d objects left\n", n_);
+    }
     assert(list_empty(&rt->gc_notrace_list));
     assert(list_empty(&rt->gc_obj_list));
 
@@ -4760,6 +5001,7 @@ void JS_FreeRuntime(JSRuntime *rt)
         js_free_rt(rt, fs);
     }
 
+    js_blk_cache_flush(rt); /* cached blocks are still counted as allocated */
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     if (check_dump_flag(rt, JS_DUMP_LEAKS)) {
         JSMallocState *s = &rt->malloc_state;
@@ -6059,8 +6301,9 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         /* Note: the atom 0 is not used */
         start = rt->atom_size;
         if (start == 0) {
-            /* JS_ATOM_NULL entry */
-            p = js_mallocz_rt(rt, sizeof(JSAtomStruct));
+            /* JS_ATOM_NULL entry. JS_AtomToString hands it out as the (empty) string it is, and JS_ToCStringLen
+               returns a string's bytes in place: they need the terminator that follows every string body. */
+            p = js_mallocz_rt(rt, sizeof(JSAtomStruct) + 1);
             if (!p) {
                 js_free_rt(rt, new_array);
                 goto fail;
@@ -8576,7 +8819,8 @@ static int fnbc_is_acyclic(JSFunctionBytecode *b)
        byte_code_buf was set. */
     return (b->cpool_count == 0 || (b->is_lazy && !b->lazy_failed)) &&
            b->objlit_tab == NULL && b->ic_table == NULL &&
-           b->ctor_fn_shape == NULL && b->ctor_inst_shape[0] == NULL
+           b->ctor_fn_shape == NULL && b->ctor_inst_shape[0] == NULL &&
+           b->ctor_final_shape == NULL
 #if QJS_REGVM
            /* The register PIC holds counted shape references; an untraced
               bytecode must still mark them. */
@@ -9565,18 +9809,96 @@ static JSValue JS_NewObjectFromShapeCapExtra(JSContext *ctx, JSShape *sh,
    function's. Takes over the caller's reference to `sh`. */
 static_assert(offsetof(JSObject, class_id) == sizeof(JSGCObjectHeader) + 2,
               "js_new_plain_object clears the object flags as the two bytes before class_id");
+/* A block for a plain object with `cap` inline slots from the block cache, accounted as an arena block is; NULL when the cache has none of its class
+   (or the memory limit is near), and the caller takes its ordinary route. */
+static inline __attribute__((always_inline)) void *js_plain_block_cached(JSRuntime *rt, uint32_t cap)
+{
+#ifdef QJS_DRC_STRESS_ALLOC
+    JS_DRC_STRESS_POINT(rt);
+#endif
+    JSMallocState *ms_ = &rt->malloc_state;
+    unsigned int bsi_ = js_plain_obj_bsi[cap];
+    void *p;
+
+    if (bsi_ == 0xff || (p = rt->arena_state.cache[bsi_]) == NULL)
+        return NULL;
+    {
+        size_t sz_ = offsetof(JSObject, u) + cap * sizeof(JSProperty);
+        size_t used_ = ms_->malloc_size;
+
+        if (unlikely(used_ + sz_ > ms_->malloc_limit - 1))
+            return NULL;
+        {
+            JSMallocBlockHeader *cb_ = container_of(p, JSMallocBlockHeader, user_data);
+            void *nx_ = *(void **)p;
+
+            ms_->malloc_count++;
+            ms_->malloc_size = used_ + (arena_block_sizes[bsi_] - sizeof(JSMallocBlockHeader) + MALLOC_OVERHEAD);
+            rt->arena_state.cache[bsi_] = nx_;
+            rt->arena_state.cache_n[bsi_]--;
+            if (nx_)
+                __builtin_prefetch((uint8_t *)nx_ - sizeof(JSMallocBlockHeader), 1, 3);
+            cb_->gc_notrace = 0;
+            cb_->in_zct = 0;
+        }
+    }
+    return p;
+}
+
 static inline __attribute__((always_inline)) JSValue js_new_plain_object(JSContext *ctx, JSShape *sh, uint32_t req_cap)
 {
     JSRuntime *rt = ctx->rt;
     JSObject *p;
     uint32_t cap = sh->prop_size <= JS_OBJ_INLINE_PROPS ? sh->prop_size : 0;
 
+#ifdef QJS_DRC_STRESS_ALLOC
+    JS_DRC_STRESS_POINT(rt);
+#endif
+    DRC_ST(drc_st_alloc);
     if (req_cap > cap)
         cap = req_cap > JS_OBJ_LEARNED_INLINE_MAX ? JS_OBJ_LEARNED_INLINE_MAX : req_cap;
     if (unlikely(cap == 0))
         return JS_NewObjectFromShapeCapExtra(ctx, sh, JS_CLASS_OBJECT, NULL, req_cap, 0);
-    js_trigger_gc(rt, sizeof(JSObject));
-    p = js_malloc_rt(rt, offsetof(JSObject, u) + cap * sizeof(JSProperty));
+    /* The flat path: the collector trigger, the memory limit, the accounting and the arena pop in one place, with the slow work (a collection, the
+       limit, an arena refill, a large block) left to the general path below. The checks and the accounting are those of js_trigger_gc +
+       js_malloc_rt; they just run once, against the size class read from the table. */
+    {
+        JSMallocState *ms_ = &rt->malloc_state;
+        size_t sz_ = offsetof(JSObject, u) + cap * sizeof(JSProperty);
+        size_t used_ = ms_->malloc_size;
+        unsigned int bsi_ = js_plain_obj_bsi[cap];
+        p = NULL;
+        /* A block from the cache is accounted like one from the arena (the release took it out of the accounting, so cached
+           blocks do not count toward the collector trigger), but it skips the arena's own bookkeeping and the trigger test. */
+        if (bsi_ != 0xff && (p = rt->arena_state.cache[bsi_]) != NULL && likely(used_ + sz_ <= ms_->malloc_limit - 1)) {
+            JSMallocBlockHeader *cb_ = container_of(p, JSMallocBlockHeader, user_data);
+            void *nx_ = *(void **)p;
+
+            ms_->malloc_count++;
+            ms_->malloc_size = used_ + (arena_block_sizes[bsi_] - sizeof(JSMallocBlockHeader) + MALLOC_OVERHEAD);
+
+            rt->arena_state.cache[bsi_] = nx_;
+            rt->arena_state.cache_n[bsi_]--;
+            if (nx_)
+                __builtin_prefetch((uint8_t *)nx_ - sizeof(JSMallocBlockHeader), 1, 3);
+            cb_->gc_notrace = 0;
+            cb_->in_zct = 0;
+        } else if (p = NULL, likely(!JS_ARENA_LARGE_BLOCKS_ONLY && bsi_ != 0xff &&
+                   used_ + sizeof(JSObject) <= rt->malloc_gc_threshold &&
+                   used_ + sz_ <= ms_->malloc_limit - 1)) {
+            unsigned int bs_ = arena_block_sizes[bsi_];
+            p = js_arena_pop(rt, bsi_, bs_);
+            if (likely(p != NULL)) {
+                ms_->malloc_count++;
+                ms_->malloc_size = used_ + (bs_ - sizeof(JSMallocBlockHeader) + MALLOC_OVERHEAD);
+                js_drc_malloc_pressure(rt);
+            }
+        }
+    }
+    if (unlikely(!p)) {
+        js_trigger_gc(rt, sizeof(JSObject));
+        p = js_malloc_rt(rt, offsetof(JSObject, u) + cap * sizeof(JSProperty));
+    }
     if (unlikely(!p)) {
         JS_ThrowOutOfMemory(ctx);
         js_free_shape(rt, sh);
@@ -9595,7 +9917,9 @@ static inline __attribute__((always_inline)) JSValue js_new_plain_object(JSConte
     JS_GC_MARK(&p->header) = 0;
     JS_GC_TYPE(&p->header) = JS_GC_OBJ_TYPE_JS_OBJECT;
     JS_GC_NOTRACE(&p->header) = 0;
+#ifndef QJS_EXP_NOLIST
     list_add_tail(&p->header.link, &rt->gc_obj_list);
+#endif
     return JS_MKPTR(JS_TAG_OBJECT, p);
 }
 
@@ -9778,8 +10102,8 @@ static JSValue js_new_object_from_template(JSContext *ctx, JSObjLitTemplate *tpl
     if (likely(tpl->shape != NULL)) {
         if (unlikely(tpl->shape->proto != proto))
             return JS_NewObject(ctx);
-        obj = JS_NewObjectFromShape(ctx, js_dup_shape(tpl->shape),
-                                    JS_CLASS_OBJECT, NULL);
+        js_dbg_tpl_calls++;
+        obj = js_new_plain_object(ctx, js_dup_shape(tpl->shape), 0);
         if (unlikely(JS_IsException(obj)))
             return obj;
         p = JS_VALUE_GET_OBJ(obj);
@@ -10030,11 +10354,11 @@ static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
             p->arr_kind = kind;
             for (i = 0; i < count; i++) {
                 if (kind == JS_ARR_KIND_INT32) {
-                    assert(js_arr_packed_num_int(src[i], &i32));
+                    { bool ok_ = js_arr_packed_num_int(src[i], &i32); assert(ok_); (void)ok_; }
                     ((int32_t *)p->u.array.u.values_raw)[i] = i32;
                 } else {
                     double d;
-                    assert(js_arr_packed_num_double(src[i], &d));
+                    { bool ok_ = js_arr_packed_num_double(src[i], &d); assert(ok_); (void)ok_; }
                     ((double *)p->u.array.u.values_raw)[i] = d;
                 }
             }
@@ -10810,7 +11134,7 @@ static void free_object(JSRuntime *rt, JSObject *p)
     for(i = 0; i < sh->prop_count; i++) {
         if (likely(!(pr->flags & JS_PROP_TMASK))) {
             JSValue v = p->prop[i].u.value;
-            if (JS_VALUE_HAS_REF_COUNT(v) &&
+            if (JS_VALUE_HAS_REF_COUNT(v) && (SPL_K(7), 1) &&
                 --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)
                 js_free_value_rt(rt, v);
         } else {
@@ -10852,40 +11176,133 @@ static void free_object(JSRuntime *rt, JSObject *p)
     }
 }
 
+/* js_free_rt for an arena block, inline: the accounting and the free-list push of its arena branch, with the large-block case left to the call. */
+static inline __attribute__((always_inline)) void js_free_block_flat(JSRuntime *rt, void *ptr)
+{
+    JSMallocBlockHeader *b = container_of(ptr, JSMallocBlockHeader, user_data);
+    unsigned int block_idx = b->u.block_idx;
+
+    if (likely(!JS_ARENA_LARGE_BLOCKS_ONLY && block_idx != JS_ARENA_FREE_NIL)) {
+        JSMallocState *s = &rt->malloc_state;
+        unsigned int block_size_idx = b->block_size_idx;
+        unsigned int block_size = arena_block_sizes[block_size_idx];
+        size_t sz = block_size - sizeof(JSMallocBlockHeader) + MALLOC_OVERHEAD;
+        JSArena *ar;
+        if (unlikely(sz > s->malloc_size))
+            goto general;
+        s->malloc_count--;
+        s->malloc_size -= sz;
+        if (likely(js_blk_cache_on) && likely(rt->arena_state.cache_n[block_size_idx] < JS_BLK_CACHE_MAX)) {
+            *(void **)ptr = rt->arena_state.cache[block_size_idx];
+            rt->arena_state.cache[block_size_idx] = ptr;
+            rt->arena_state.cache_n[block_size_idx]++;
+            return;
+        }
+        ar = (JSArena *)((uint8_t *)b - (size_t)block_size * block_idx - sizeof(JSArena));
+        b->u.free_next = ar->first_free_block;
+        ar->first_free_block = block_idx;
+        if (unlikely(ar->n_used_blocks == ar->n_blocks))
+            list_add(&ar->free_link, &rt->arena_state.free_arena_list[block_size_idx]);
+        ar->n_used_blocks--;
+        if (unlikely(ar->n_used_blocks == 0))
+            js_arena_empty(rt, ar);
+        return;
+    }
+general:
+    js_free_rt(rt, ptr);
+}
+
 /* free_object for the commonest garbage: a plain object (JS_CLASS_OBJECT, which
    has no finalizer and no exotic behaviour) without weak references, freed from
    free_zero_refcount, where gc_phase is DECREF. Nothing outside this call sees
    the object once it returns, so the free_mark and fail-safe stores, the
    finalizer lookup and the REMOVE_CYCLES test of free_object are skipped; every
    other step runs in the same order. */
-static inline __attribute__((always_inline)) void
-free_plain_object(JSRuntime *rt, JSObject *p)
-{
-    int i;
-    JSShape *sh;
-    JSShapeProperty *pr;
+/* The malloc accounting of blocks released by one reconcile pass, applied once at its end (nothing allocates while it runs). */
+typedef struct JSFreeAcc {
+    size_t count;
+    size_t size;
+} JSFreeAcc;
 
-    assert(p->class_id == JS_CLASS_OBJECT && !p->first_weak_ref);
-    assert(rt->class_array[JS_CLASS_OBJECT].finalizer == NULL);
-    assert(rt->gc_phase == JS_GC_PHASE_DECREF);
-    sh = p->shape;
-    pr = get_shape_prop(sh);
-    for(i = 0; i < sh->prop_count; i++) {
-        if (likely(!(pr->flags & JS_PROP_TMASK))) {
-            JSValue v = p->prop[i].u.value;
-            if (JS_VALUE_HAS_REF_COUNT(v) &&
-                --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)
-                js_free_value_rt(rt, v);
-        } else {
-            free_property(rt, &p->prop[i], pr->flags);
+/* js_free_block_flat for the block cache, with the accounting left to the caller's accumulator. */
+static inline __attribute__((always_inline)) void js_free_block_acc(JSRuntime *rt, void *ptr, JSFreeAcc *acc)
+{
+    JSMallocBlockHeader *b = container_of(ptr, JSMallocBlockHeader, user_data);
+    unsigned int block_idx = b->u.block_idx;
+
+    if (likely(js_blk_cache_on) && likely(block_idx != JS_ARENA_FREE_NIL)) {
+        unsigned int bsi = b->block_size_idx;
+
+        if (likely(rt->arena_state.cache_n[bsi] < JS_BLK_CACHE_MAX)) {
+            acc->count++;
+            acc->size += arena_block_sizes[bsi] - sizeof(JSMallocBlockHeader) + MALLOC_OVERHEAD;
+            *(void **)ptr = rt->arena_state.cache[bsi];
+            rt->arena_state.cache[bsi] = ptr;
+            rt->arena_state.cache_n[bsi]++;
+            return;
         }
-        pr++;
     }
-    if (p->prop_inline_cap == 0)
-        js_free_rt(rt, p->prop);
-    js_free_shape(rt, sh);
-    remove_gc_object(&p->header);
-    js_free_rt(rt, p);
+    js_free_block_flat(rt, ptr);
+}
+
+static inline __attribute__((always_inline)) void
+free_plain_object(JSRuntime *rt, JSObject *p, JSFreeAcc *acc)
+{
+    /* An object this release drops to a count of zero while it frees a field is freed here, from a small stack of
+       pending objects, instead of going to the zero list and back: a list or a tree of plain objects is released
+       without a list unlink, a link and an unlink per node. A node that is not a plain object without weak references,
+       or one that finds the stack full, takes the ordinary route. QJS_NOFREESTACK=1 turns it off. */
+    JSObject *stk[32];
+    int sp = 0;
+
+    for (;;) {
+        int i;
+        JSShape *sh;
+        JSShapeProperty *pr;
+
+        DRC_ST(drc_st_freeobj);
+        assert(p->class_id == JS_CLASS_OBJECT && !p->first_weak_ref);
+        assert(rt->class_array[JS_CLASS_OBJECT].finalizer == NULL);
+        assert(rt->gc_phase == JS_GC_PHASE_DECREF);
+        sh = p->shape;
+        pr = get_shape_prop(sh);
+        for(i = 0; i < sh->prop_count; i++) {
+            if (likely(!(pr->flags & JS_PROP_TMASK))) {
+                JSValue v = p->prop[i].u.value;
+                if (JS_VALUE_HAS_REF_COUNT(v) && (SPL_K(7), 1) &&
+                    --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0) {
+                    if (likely(js_free_stack_on) && JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && sp < 32) {
+                        JSObject *c = JS_VALUE_GET_OBJ(v);
+
+                        if (likely(c->class_id == JS_CLASS_OBJECT) && likely(c->first_weak_ref == NULL) &&
+                            !JS_GC_IN_ZCT(c)) {
+                            stk[sp++] = c;
+                            pr++;
+                            continue;
+                        }
+                    }
+                    js_free_value_rt(rt, v);
+                }
+            } else {
+                free_property(rt, &p->prop[i], pr->flags);
+            }
+            pr++;
+        }
+        if (p->prop_inline_cap == 0)
+            js_free_rt(rt, p->prop);
+        if (unlikely(--JS_REF_COUNT(sh) <= 0))
+            js_free_shape0(rt, sh);
+#ifndef QJS_EXP_NOLIST
+        remove_gc_object(&p->header);
+#endif
+        if (acc)
+            js_free_block_acc(rt, p, acc);
+        else
+            js_free_block_flat(rt, p);
+        if (sp == 0)
+            break;
+        p = stk[--sp];
+    }
 }
 
 /* free_object for a fast Array (JS_CLASS_ARRAY) without weak references, freed from free_zero_refcount (gc_phase DECREF): the property loop of free_plain_object, then
@@ -10905,7 +11322,7 @@ free_array_object(JSRuntime *rt, JSObject *p)
     for(i = 0; i < sh->prop_count; i++) {
         if (likely(!(pr->flags & JS_PROP_TMASK))) {
             JSValue v = p->prop[i].u.value;
-            if (JS_VALUE_HAS_REF_COUNT(v) &&
+            if (JS_VALUE_HAS_REF_COUNT(v) && (SPL_K(7), 1) &&
                 --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)
                 js_free_value_rt(rt, v);
         } else {
@@ -10964,7 +11381,7 @@ static void free_zero_refcount(JSRuntime *rt)
         if (likely(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT &&
                    ((JSObject *)p)->class_id == JS_CLASS_OBJECT &&
                    ((JSObject *)p)->first_weak_ref == NULL))
-            free_plain_object(rt, (JSObject *)p);
+            free_plain_object(rt, (JSObject *)p, NULL);
         else if (likely(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT &&
                         ((JSObject *)p)->class_id == JS_CLASS_ARRAY &&
                         ((JSObject *)p)->first_weak_ref == NULL))
@@ -11061,6 +11478,20 @@ static bool js_drc_value_is_large(JSValue v)
     }
 }
 
+/* Grow the parked-object array. Like js_drc_push this must not trigger a GC; 0 on failure, and the caller then parks
+   the object on the zero list. */
+static __attribute__((noinline)) int js_drc_zpark_grow(JSRuntime *rt)
+{
+    uint32_t ncap = rt->zpark_cap ? rt->zpark_cap * 2 : 1024;
+    JSGCObjectHeader **nz = rt->mf.js_realloc(rt->malloc_state.opaque, rt->zpark,
+                                              (size_t)ncap * sizeof(*nz));
+    if (!nz)
+        return 0;
+    rt->zpark = nz;
+    rt->zpark_cap = ncap;
+    return 1;
+}
+
 /* Park 'v' after its ref_count has reached zero. */
 static void js_drc_zero(JSRuntime *rt, JSValue v)
 {
@@ -11072,14 +11503,42 @@ static void js_drc_zero(JSRuntime *rt, JSValue v)
     }
     if (likely(tag == JS_TAG_OBJECT)) {
         JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
+        /* Already parked (its count went 0 -> 1 -> 0 while it sat on the zero list): nothing to do, and it must not count
+           twice toward the reconcile trigger. QJS_DRC_NOREPARK=1 restores the move to the head. */
+        if (JS_GC_IN_ZCT(p) && likely(js_drc_repark_skip)) {
+            DRC_ST(drc_st_repark);
+            return;
+        }
         if (likely(((JSObject *)p)->class_id == JS_CLASS_OBJECT)) {
             /* A plain object is not a value js_drc_value_is_large() can call
                large, so parking it takes neither the tag switch below nor the
                large-value walk. */
+#ifdef QJS_DRC_STATS
+            drc_st_site();
+            if (rt->zpark_len >= drc_zra_cap) { drc_zra_cap = rt->zpark_cap ? rt->zpark_cap * 2 : 1024; drc_zra = rt->mf.js_realloc(rt->malloc_state.opaque, drc_zra, drc_zra_cap * sizeof(uintptr_t)); }
+            if (rt->zpark_len < rt->zpark_cap) { uintptr_t ra2 = drc_st_ra2(); drc_zra[rt->zpark_len] = ra2; drc_fate[drc_fate_slot(ra2)].park++; }
+#endif
+            if (likely(js_drc_zarray) && likely(rt->zpark_len < rt->zpark_cap)) {
+                /* Stays on its list: one sequential store instead of unlinking it from its neighbours and
+                   linking it at the head of the zero list. */
+                rt->zpark[rt->zpark_len++] = p;
+                JS_GC_IN_ZCT(p) = 1;
+                rt->zct_nobj++;
+                DRC_ST(drc_st_park_obj);
+                return;
+            }
+            if (js_drc_zarray && js_drc_zpark_grow(rt)) {
+                rt->zpark[rt->zpark_len++] = p;
+                JS_GC_IN_ZCT(p) = 1;
+                rt->zct_nobj++;
+                DRC_ST(drc_st_park_obj);
+                return;
+            }
             list_del(&p->link);
             list_add(&p->link, &rt->gc_zero_ref_count_list);
             JS_GC_IN_ZCT(p) = 1;
             rt->zct_nobj++;
+            DRC_ST(drc_st_park_obj);
             return;
         }
     }
@@ -11100,6 +11559,7 @@ static void js_drc_zero(JSRuntime *rt, JSValue v)
                (see js_drc_validate_range). */
             JS_GC_IN_ZCT(p) = 1;
             rt->zct_nobj++;
+            DRC_ST(drc_st_park_obj);
         }
         break;
     default:
@@ -11126,8 +11586,10 @@ static void js_drc_pin_range(void *opaque, JSValue *regs, uint32_t nregs)
     }
 }
 
+static void js_drc_pend_flush(JSRuntime *rt);
 static void js_drc_pin(JSRuntime *rt)
 {
+    js_drc_pend_flush(rt);
     regvm_for_each_root_range(rt, js_drc_pin_range, NULL);
 }
 
@@ -11153,6 +11615,38 @@ static void js_drc_unpin(JSRuntime *rt)
 
 /* Frees every parked value that no live register refers to. The caller must
    have pinned the register windows first. */
+/* The held objects' references go back: a count that reaches zero parks the object like any other. This runs BEFORE the stack scan builds its table of parked
+   objects (js_drc_pin), so an object only the ring held, and a compiled frame still names, is parked in time to be pinned. */
+static void js_drc_pend_flush(JSRuntime *rt)
+{
+    {
+        int pi;
+
+        for (pi = 0; pi < 4; pi++) {
+            JSObject *pp = rt->drc_pend[pi];
+
+            if (!pp)
+                continue;
+            rt->drc_pend[pi] = NULL;
+            if (--JS_REF_COUNT(pp) <= 0) {
+                JS_REF_COUNT(pp) = 0;
+                if (!JS_GC_IN_ZCT(pp)) {
+                    if (pp->class_id != JS_CLASS_OBJECT || !js_drc_zarray ||
+                        (rt->zpark_len >= rt->zpark_cap && !js_drc_zpark_grow(rt))) {
+                        list_del(&pp->header.link);
+                        list_add(&pp->header.link, &rt->gc_zero_ref_count_list);
+                    } else {
+                        rt->zpark[rt->zpark_len++] = &pp->header;
+                    }
+                    JS_GC_IN_ZCT(pp) = 1;
+                    rt->zct_nobj++;
+                }
+            }
+        }
+    }
+
+}
+
 static void js_drc_reconcile_locked(JSRuntime *rt)
 {
     struct list_head *el, *el1;
@@ -11160,6 +11654,8 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
     uint32_t i;
 
     rt->drc_in_reconcile = 1;
+
+    js_drc_pend_flush(rt);
 
     /* Non-GC counted values (strings, ropes, BigInt, symbols). Clear the in_zct
        bits first so a value resurrected and then freed by a cascade leaves no
@@ -11173,10 +11669,54 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
     }
     rt->zct_len = 0;
 
+    /* Parked plain objects named in the array: one that a register (or a store) took a reference on again is simply
+       unmarked, it never left its list; the rest are freed. Dropping the survivors first keeps a cascade from freeing
+       an object the array still names: a count reaching zero while freeing is final, and a survivor has an owner. */
+    if (rt->zpark_len) {
+        uint32_t n = rt->zpark_len, w = 0;
+        JSFreeAcc facc;
+        for (i = 0; i < n; i++) {
+            p = rt->zpark[i];
+            if (JS_REF_COUNT(p) > 0) {
+                DRC_ST(drc_st_resurrect);
+#ifdef QJS_DRC_STATS
+                drc_fate[drc_fate_slot(drc_zra[i])].res++;
+#endif
+                JS_GC_IN_ZCT(p) = 0;
+            } else {
+#ifdef QJS_DRC_STATS
+                drc_fate[drc_fate_slot(drc_zra[i])].fre++;
+#endif
+                rt->zpark[w++] = p;
+            }
+        }
+        rt->zpark_len = w;
+        if (js_neverfree) {
+            for (i = 0; i < w; i++) JS_GC_IN_ZCT(rt->zpark[i]) = 0;
+            w = 0;
+        }
+        facc.count = facc.size = 0;
+        rt->gc_phase = JS_GC_PHASE_DECREF;
+        for (i = 0; i < w; i++) {
+            p = rt->zpark[i];
+            assert(JS_REF_COUNT(p) == 0 && JS_GC_IN_ZCT(p));
+            DRC_ST(drc_st_freed);
+            if (likely(((JSObject *)p)->first_weak_ref == NULL))
+                free_plain_object(rt, (JSObject *)p, &facc);
+            else
+                free_gc_object(rt, p);
+        }
+        rt->malloc_state.malloc_count -= facc.count;
+        rt->malloc_state.malloc_size -= facc.size;
+        rt->zpark_len = 0;
+        rt->gc_phase = JS_GC_PHASE_NONE;
+    }
+
     /* Objects: keep the ones a register refers to, free the rest. */
     list_for_each_safe(el, el1, &rt->gc_zero_ref_count_list) {
         p = list_entry(el, JSGCObjectHeader, link);
         if (JS_REF_COUNT(p) > 0) {
+            DRC_ST(drc_st_resurrect);
             list_del(&p->link);
             JS_GC_IN_ZCT(p) = 0;   /* resurrected: no longer parked */
             if (JS_GC_NOTRACE(p))
@@ -11186,6 +11726,10 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
         }
     }
     rt->zct_nobj = 0;
+    DRC_ST(drc_st_reconciles);
+#ifdef QJS_DRC_STATS
+    list_for_each(el, &rt->gc_zero_ref_count_list) drc_st_freed++;
+#endif
     if (!list_empty(&rt->gc_zero_ref_count_list))
         free_zero_refcount(rt);
     /* Break the recorded closure -> cell self-cycles last: registers are still
@@ -11206,8 +11750,8 @@ static void js_drc_reconcile(JSRuntime *rt)
     js_drc_unpin(rt);
 
     rt->zct_limit = (rt->zct_len + rt->zct_nobj) * 2;
-    if (rt->zct_limit < 4096)
-        rt->zct_limit = 4096;
+    if (rt->zct_limit < js_drc_minlim)
+        rt->zct_limit = js_drc_minlim;
 #ifdef QJS_DRC_STRESS
     rt->zct_limit = 0;
 #endif
@@ -11221,8 +11765,8 @@ static void js_drc_rearm_malloc_mark(JSRuntime *rt)
 {
     size_t m = rt->malloc_state.malloc_size;
     size_t slack = m >> 2;
-    if (slack < ((size_t)4 << 20))
-        slack = (size_t)4 << 20;
+    if (slack < js_drc_slack_min)
+        slack = js_drc_slack_min;
     rt->drc_malloc_mark = m + slack;
 }
 
@@ -11238,6 +11782,7 @@ static inline void js_drc_safepoint(JSRuntime *rt)
 #define REG_ADOPT(rt, v)                                                     \
     do {                                                                     \
         if (JS_VALUE_HAS_REF_COUNT(v)) {                                     \
+            SPL_K(5);                                                        \
             if (--JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)                    \
                 js_drc_zero(rt, v);                                          \
         }                                                                    \
@@ -11415,6 +11960,7 @@ void JS_FreeValueRT(JSRuntime *rt, JSValue v)
 #endif
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         void *p = JS_VALUE_GET_PTR(v);
+        SPL_K(6);
         if (--JS_REF_COUNT(p) <= 0) {
             js_free_value_rt(rt, v);
         }
@@ -11556,6 +12102,8 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
             }
             if (b->ctor_fn_shape)
                 mark_func(rt, &b->ctor_fn_shape->header);
+            if (b->ctor_final_shape)
+                mark_func(rt, &b->ctor_final_shape->header);
             for (i = 0; i < 4; i++) {
                 if (b->ctor_inst_shape[i])
                     mark_func(rt, &b->ctor_inst_shape[i]->header);
@@ -11874,8 +12422,8 @@ void JS_RunGC(JSRuntime *rt)
 #if QJS_DRC
     js_drc_unpin(rt);
     rt->zct_limit = (rt->zct_len + rt->zct_nobj) * 2;
-    if (rt->zct_limit < 4096)
-        rt->zct_limit = 4096;
+    if (rt->zct_limit < js_drc_minlim)
+        rt->zct_limit = js_drc_minlim;
 #ifdef QJS_DRC_STRESS
     rt->zct_limit = 0;
 #endif
@@ -11997,6 +12545,7 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
     int i;
     JSMemoryUsage_helper mem = { 0 }, *hp = &mem;
 
+    js_blk_cache_flush(rt);
     memset(s, 0, sizeof(*s));
     s->malloc_count = rt->malloc_state.malloc_count;
     s->malloc_size = rt->malloc_state.malloc_size;
@@ -16938,6 +17487,48 @@ static void aot_note_object(JSObject *p, uint32_t from)
     for (i = from; i < n && i < AOT_NOTE_SLOTS; i++)
         aot_note_slot(p->shape, i, p->prop[i].u.value);
 }
+
+/* The stores each global binding saw: how many, and the last value's type (and number, when it is one). A global stored
+   after its first assignment is not a constant, whatever one read of it saw. The atom is held until the dump. */
+#define AOT_GW_MAX 4096
+typedef struct AotGW {
+    JSAtom atom;
+    uint32_t writes;
+    uint16_t types;
+    double val;
+} AotGW;
+static AotGW aot_gw[AOT_GW_MAX];
+static int aot_ngw;
+
+static void aot_note_gwrite(JSRuntime *rt, JSAtom atom, JSValue v)
+{
+    static int last = -1;
+    int i;
+    AotGW *g;
+    if (last >= 0 && aot_gw[last].atom == atom) {
+        i = last;
+    } else {
+        for (i = 0; i < aot_ngw; i++)
+            if (aot_gw[i].atom == atom)
+                break;
+        if (i == aot_ngw) {
+            if (aot_ngw == AOT_GW_MAX)
+                return;
+            aot_gw[aot_ngw].atom = JS_DupAtomRT(rt, atom);
+            aot_gw[aot_ngw].writes = 0;
+            aot_gw[aot_ngw].types = 0;
+            aot_gw[aot_ngw].val = 0;
+            aot_ngw++;
+        }
+        last = i;
+    }
+    g = &aot_gw[i];
+    if (g->writes != UINT32_MAX)
+        g->writes++;
+    g->types = aot_tag_class(v);
+    g->val = g->types == AOT_TYPE_FLOAT ? JS_VALUE_GET_FLOAT64(v)
+             : g->types == AOT_TYPE_INT ? (double)JS_VALUE_GET_INT(v) : 0;
+}
 #endif
 
 /* Whether `v` keeps the promise `claim` makes about a slot. */
@@ -17006,12 +17597,42 @@ static inline bool js_aot_gwatched(JSRuntime *rt, JSAtom atom)
     return false;
 }
 
+static void js_gv_cell_invalidate(JSRuntime *rt);
+
+/* The index of `atom` on the watch list, or -1. */
+static inline int js_aot_gwatch_find(JSRuntime *rt, JSAtom atom)
+{
+    uint32_t i;
+    if (likely(rt->aot_gwatch_n == 0) || !(rt->aot_gwatch_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
+        return -1;
+    for (i = 0; i < rt->aot_gwatch_n; i++)
+        if (rt->aot_gwatch[i] == atom)
+            return (int)i;
+    return -1;
+}
+
+/* Drop entry `gi` (swap with the last). The bloom filter keeps the bit: it only ever over-reports. The cells filled while the atom was watched never took the
+   direct store, so they are dropped and refill. */
+static void js_aot_gwatch_drop(JSRuntime *rt, int gi)
+{
+    uint32_t last = --rt->aot_gwatch_n;
+    JSAtom a = rt->aot_gwatch[gi];
+    rt->aot_gwatch[gi] = rt->aot_gwatch[last];
+    rt->aot_gwatch_fact[gi] = rt->aot_gwatch_fact[last];
+    JS_FreeAtomRT(rt, a);
+    js_gv_cell_invalidate(rt);
+}
+
 /* A value is about to be written to the global property `atom`: a compiled body that holds
    it as a literal must leave at its next epoch test. */
 static inline void js_aot_gwrite(JSRuntime *rt, JSAtom atom)
 {
-    if (unlikely(rt->aot_gwatch_n != 0) && js_aot_gwatched(rt, atom))
+    int gi;
+    if (unlikely(rt->aot_gwatch_n != 0) && (gi = js_aot_gwatch_find(rt, atom)) >= 0) {
         AOT_EPOCH_BUMP(rt, 5);
+        if (!rt->aot_gwatch_fact[gi])
+            js_aot_gwatch_drop(rt, gi);
+    }
 }
 
 static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JSValueConst val);
@@ -17020,15 +17641,21 @@ static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JS
    fact that expects the property's value breaks. Only atoms on the watch list pay for the scan. */
 static __attribute__((noinline)) void js_aot_gwrite_slow(JSRuntime *rt, JSObject *p, JSAtom atom, JSValueConst v)
 {
-    if (!js_aot_gwatched(rt, atom))
+    int gi = js_aot_gwatch_find(rt, atom);
+    if (gi < 0)
         return;
     AOT_EPOCH_BUMP(rt, 5);
     if (rt->aot_facts != NULL)
         js_aot_obj_event(rt, p, JS_AOT_EV_STORE, atom, v);
+    if (!rt->aot_gwatch_fact[gi])
+        js_aot_gwatch_drop(rt, gi);
 }
 
 static inline void js_aot_gwrite_val(JSRuntime *rt, JSObject *p, JSAtom atom, JSValueConst v)
 {
+#if QJS_AOT_PROFILE
+    aot_note_gwrite(rt, atom, v);
+#endif
     /* the filter bit first: most stores name an unwatched atom and pay a load and a test */
     if (unlikely(rt->aot_gwatch_n != 0) && unlikely(rt->aot_gwatch_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
         js_aot_gwrite_slow(rt, p, atom, v);
@@ -17076,7 +17703,15 @@ typedef struct JSAotFacts {
     uint32_t sweep_pending; /* a group broke since the last sweep: it may still hold values (the sweep is a walk of every group) */
     struct JSAotLayoutDep *ld;      /* the facts_valid bits that depend on a layout */
     int nld, ldcap;
+    /* The atoms any group lists as an expected property value (a bit per atom hash, never cleared): a STORE of an atom no group lists cannot break one, so
+       the event scan is skipped for it. Without this every direct store to a watched global walked every group of the runtime. */
+    uint64_t listed_bloom[4];
 } JSAotFacts;
+
+static inline void js_aot_facts_note_listed(JSAotFacts *F, JSAtom atom)
+{
+    F->listed_bloom[(atom >> 6) & 3] |= (uint64_t)1 << (atom & 63);
+}
 
 #ifdef QJS_KIT_TEST_KNOBS
 /* The vkit's negative controls: QJS_AOT_FACTS_OFF=add,store,edit,proto,construct,eval,all switches a mechanism off so its case can be
@@ -17197,6 +17832,10 @@ static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JS
     JSAotFacts *F = rt->aot_facts;
     int i;
     if (F == NULL || (js_aot_facts_off_mask() & (1u << ev)))
+        return;
+    /* a store breaks a group only through an atom the group lists (the STORE case below needs k >= 0) */
+    if (ev == JS_AOT_EV_STORE && atom != JS_ATOM_NULL &&
+        !(F->listed_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
         return;
     for (i = 0; i < F->n; i++) {
         JSAotFact *g = F->g[i];
@@ -17337,6 +17976,7 @@ JSAotFact *qjs_aot_fact_new(JSContext *ctx, JSValueConst obj, JSValueConst proto
         g->props[g->nprops].atom = JS_DupAtom(ctx, atoms[i]);
         g->props[g->nprops].val = js_dup(pr->u.value);
         g->nprops++;
+        js_aot_facts_note_listed(F, atoms[i]);
     }
     if (F->n == F->cap) {
         int ncap = F->cap ? F->cap * 2 : 16;
@@ -17386,6 +18026,8 @@ int qjs_aot_fact_expect(JSContext *ctx, JSAotFact *g, JSAtom atom, JSValueConst 
         g->props[g->nprops].atom = JS_DupAtom(ctx, atom);
         g->props[g->nprops].val = js_dup(val);
         g->nprops++;
+        if (g->rt->aot_facts != NULL)
+            js_aot_facts_note_listed(g->rt->aot_facts, atom);
     }
     return 0;
 }
@@ -25485,6 +26127,8 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
 /* A compiled coroutine left a guard: the register interpreter continues the parked frame at the
    pc in sf->cur_pc (not as a resumption of a yield), without entering compiled code again. */
 #define JS_CALL_FLAG_AOT_DEOPT   (1 << 3)
+/* with AOT_DEOPT on a coroutine resume: the instruction the frame continues at is the one it is resuming (a yield or await), not a fresh one */
+#define JS_CALL_FLAG_AOT_KEEP_MARKER (1 << 4)
 
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
@@ -31693,12 +32337,8 @@ static uint8_t *REGVM_CC regvm_t_make_closure(REGVM_ARGS)
 }
 
 /* "ra": function in a register, name atom. */
-static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_set_name_slow(REGVM_ARGS)
+static int regvm_set_name_value(JSContext *ctx, JSValue v, JSAtom atom)
 {
-    int r = T_REG(1);
-    JSAtom atom = T_U32(3);
-    JSValue v = FR(r);
-
     /* `set_name` only replaces a closure's empty compile-time name. A closure's
        `name` is an own non-writable, non-enumerable, configurable data property
        (`js_function_set_properties`), so when it is present and normal the
@@ -31714,19 +32354,29 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_set_name_slow(REGVM_A
                 JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_STRING) {
                 if (JS_VALUE_GET_STRING(pr->u.value)->len != 0) {
                     /* already named: JS_DefineObjectName is a no-op */
-                    T_NEXT(T_SZ_RA);
+                    return 0;
                 } else {
                     JSValue s = JS_AtomToString(ctx, atom);
 
                     if (JS_IsException(s))
-                        T_FAIL();
+                        return -1;
                     set_value(ctx, &pr->u.value, s);
-                    T_NEXT(T_SZ_RA);
+                    return 0;
                 }
             }
         }
     }
     if (JS_DefineObjectName(ctx, v, atom, JS_PROP_CONFIGURABLE) < 0)
+        return -1;
+    return 0;
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_set_name_slow(REGVM_ARGS)
+{
+    int r = T_REG(1);
+    JSAtom atom = T_U32(3);
+
+    if (regvm_set_name_value(ctx, FR(r), atom) < 0)
         T_FAIL();
     T_NEXT(T_SZ_RA);
 }
@@ -32688,6 +33338,7 @@ regvm_t_get_field_chain_slow(REGVM_ARGS)
         __attribute__((musttail)) return regvm_t_get_field_chain_free1(REGVM_PASS);
     }
 #endif
+    AOT_PROF_REG_T1(f, d1, FR(d1));
     /* The second link's site may hold this shape even when the first's did not:
        try its inline hit before `chain_second_slow`, and on a hit requicken
        from both sites' kinds. */
@@ -32731,6 +33382,7 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain(REGVM_ARGS)
         __attribute__((musttail)) return regvm_t_get_field_chain_free1(REGVM_PASS);
     }
 #endif
+    AOT_PROF_REG_T1(f, d1, FR(d1));
     if (unlikely(!regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(d1),
                                      site2, &v2)))
         __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
@@ -32774,6 +33426,7 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS)
         __attribute__((musttail)) return regvm_t_get_field_chain_free1(REGVM_PASS);
     }
 #endif
+    AOT_PROF_REG_T1(f, d1, FR(d1));
     {
         JSValue r = FR(d1);
         if (likely(JS_VALUE_GET_TAG(r) == JS_TAG_OBJECT)) {
@@ -33896,7 +34549,8 @@ static uint8_t *REGVM_CC regvm_t_object_fill(REGVM_ARGS)
                    (int)tpl->prop_count == n)) {
             for (i2 = 0; i2 < n; i2++) {
 #if QJS_DRC
-                set_value(ctx, &po->prop[i2].u.value, js_dup(vals[i2]));
+                /* the slot still holds the template's undefined: nothing to free */
+                po->prop[i2].u.value = js_dup(vals[i2]);
                 vals[i2] = JS_UNDEFINED;
 #else
                 set_value(ctx, &po->prop[i2].u.value, vals[i2]);
@@ -34595,13 +35249,15 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
 {
     JSRegRun *c;
 
+    /* A C-entered activation is released by the C frame that entered it, on
+       both the return and the throw path. The frame compiled code builds for its
+       callee has a caller, so the flag is tested first: such a frame is on the C
+       stack, not in the arena. */
+    if (unlikely(f->flags & REGVM_FLAG_C_ENTRY)) {
+        f->ret = JS_EXCEPTION;
+        return REGVM_C_RET;
+    }
     if (f->caller == NULL) {
-        /* A C-entered activation is released by the C frame that entered it, on
-           both the return and the throw path. */
-        if (unlikely(f->flags & REGVM_FLAG_C_ENTRY)) {
-            f->ret = JS_EXCEPTION;
-            return REGVM_C_RET;
-        }
         f->ret = JS_EXCEPTION;
         return NULL;
     }
@@ -35343,7 +35999,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                while the frame is running */
             sf->cur_pc = NULL;
             /* a deopt continues at an instruction, it does not resume a yield */
-            if (unlikely(flags & JS_CALL_FLAG_AOT_DEOPT))
+            if (unlikely((flags & (JS_CALL_FLAG_AOT_DEOPT | JS_CALL_FLAG_AOT_KEEP_MARKER)) == JS_CALL_FLAG_AOT_DEOPT))
                 regvm_resume_marker = NULL;
             regvm_nctl = JS_VALUE_GET_INT(regs[regvm_frame_regs(b)]);
         }
@@ -36884,7 +37540,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
 #if QJS_DRC
                             /* The register only borrows: the property takes its
                                own reference. */
-                            set_value(ctx, &po->prop[i2].u.value, js_dup(vals[i2]));
+                            po->prop[i2].u.value = js_dup(vals[i2]);
                             vals[i2] = JS_UNDEFINED;
 #else
                             set_value(ctx, &po->prop[i2].u.value, vals[i2]);
@@ -44625,6 +45281,33 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
     return realm;
 }
 
+/* Enter an unhashed shape that belongs to one object (a function's, made property by property) into the shape hash table, so the
+   places that key on a hashed shape (the constructor's learned `prototype` slot and finished shape) can serve it. The hash is the
+   one add_shape_property would have built: the proto's initial hash folded over each property's atom and flags. A shape with deleted
+   entries, or one more than one object holds, is left alone. */
+static bool js_shape_try_hash(JSContext *ctx, JSShape *sh)
+{
+    JSRuntime *rt = ctx->rt;
+    JSShapeProperty *pr;
+    uint32_t h;
+    int i;
+
+    if (sh->is_hashed)
+        return true;
+    if (JS_REF_COUNT(sh) != 1 || sh->deleted_prop_count != 0 || sh->prop_count > sh->prop_size)
+        return false;
+    pr = get_shape_prop(sh);
+    h = shape_initial_hash(sh->proto);
+    for (i = 0; i < sh->prop_count; i++)
+        h = shape_hash(shape_hash(h, pr[i].atom), pr[i].flags);
+    if (2 * (rt->shape_hash_count + 1) > rt->shape_hash_size)
+        resize_shape_hash(rt, rt->shape_hash_bits + 1);
+    sh->hash = h;
+    sh->is_hashed = true;
+    js_shape_hash_link(rt, sh);
+    return true;
+}
+
 static __attribute__((noinline)) JSValue js_create_from_ctor_cap_slow(JSContext *ctx, JSValueConst ctor,
                                                                     int class_id, uint32_t req_cap)
 {
@@ -44709,7 +45392,7 @@ static __attribute__((noinline)) JSValue js_create_from_ctor_cap_slow(JSContext 
             int k;
 
             js_fnbc_gc_force_trace(rt, fb);
-            if (cp->shape->is_hashed && slot <= UINT16_MAX &&
+            if ((cp->shape->is_hashed || js_shape_try_hash(ctx, cp->shape)) && slot <= UINT16_MAX &&
                 fb->ctor_fn_shape != cp->shape) {
                 if (fb->ctor_fn_shape)
                     js_free_shape(rt, fb->ctor_fn_shape);
@@ -45133,7 +45816,8 @@ static JSValue js_aot_run_coroutine(JSContext *ctx, JSAsyncFunctionState *s,
         return js_regvm_execute(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val, JS_UNDEFINED,
                                 s->argc, vc(sf->arg_buf), sf, b, sf->arg_buf, sf->arg_buf,
                                 sf->var_buf, regs, sp, pc,
-                                JS_CALL_FLAG_GENERATOR | JS_CALL_FLAG_AOT_DEOPT, 0);
+                                JS_CALL_FLAG_GENERATOR | JS_CALL_FLAG_AOT_DEOPT |
+                                    (run.deopt_pc == entry_pc ? JS_CALL_FLAG_AOT_KEEP_MARKER : 0), 0);
     }
     sf->cur_pc = run.sf->cur_pc;
     sf->cur_sp = run.sf->cur_sp;
@@ -45174,7 +45858,7 @@ static JSValue js_regvm_resume_coroutine(JSContext *ctx, JSAsyncFunctionState *s
     rt->current_stack_frame = sf;
     throw_pending = s->throw_flag != 0;
 #if QJS_AOT && QJS_REGVM && QJS_DRC
-    if (b->aot_fn != NULL && !throw_pending && b->regvm_compiled) {
+    if (b->aot_fn != NULL && !throw_pending && b->regvm_compiled && pc != NULL) {   /* pc is NULL for the first run of the coroutine: that is no resume */
         JSAotRun *ar = rt->aot_run;
 
         if (likely(ar == NULL || ar->disabled == NULL ||
@@ -46221,9 +46905,28 @@ typedef enum JSParseExportEnum {
     JS_PARSE_EXPORT_DEFAULT,
 } JSParseExportEnum;
 
+typedef struct LiftCallRec { int pos, argc, ord; } LiftCallRec;
+typedef struct LiftPlanFn {
+    int ord;          /* function ordinal in parse order */
+    JSAtom name;      /* the variable it was assigned to */
+    JSAtom hidden;    /* variable holding the lifted function */
+    int nformals;
+    int nextra;
+    JSAtom *extra;    /* captured variables passed as trailing arguments */
+} LiftPlanFn;
+typedef struct LiftPlan {
+    int nfn;
+    LiftPlanFn *fn;
+    int ncall;
+    int *call_fn;     /* call ordinal -> fn index or -1 */
+} LiftPlan;
+
 typedef struct JSFunctionDef {
     JSContext *ctx;
     struct JSFunctionDef *parent;
+    int lift_ord, lift_id;          /* lambda lift: parse ordinal, analysis id */
+    LiftCallRec *lift_calls;
+    int lift_ncalls, lift_callcap;
     int parent_cpool_idx; /* index in the constant pool of the parent
                              or -1 if none */
     int parent_scope_level; /* scope level in parent at point of definition */
@@ -46443,6 +47146,10 @@ typedef struct JSParseState {
     JSONShapeCache *json_shapes;
     int json_shapes_len;
     int json_shapes_cap;
+
+    int lift_mode;       /* 0 off, 1 recording, 2 applying lift_plan */
+    int lift_fn_seq, lift_call_seq;
+    LiftPlan *lift_plan;
 
     /* current function code */
     JSFunctionDef *cur_func;
@@ -49051,6 +49758,762 @@ static int add_arg(JSContext *ctx, JSFunctionDef *fd, JSAtom name)
     vd->func_pool_idx = -1;
     return fd->arg_count - 1;
 }
+
+/* ---------------------------------------------------------------------- */
+/* Lambda lift of local, call-only function expressions (QJS_LIFT).
+
+   A function expression assigned once to a local variable L, and only ever
+   called through L, becomes a function created once next to its creator's
+   parent; the variables it captured are passed as extra trailing arguments.
+   The first parse records the pass-1 bytecode, the analysis decides which
+   functions qualify, and the source is parsed again with the plan applied
+   (js_parse_function_decl2 hoists and appends parameters, the call emission
+   in js_parse_postfix_expr pads the arguments and passes the captured values). */
+
+typedef struct LiftFd LiftFd;
+typedef struct LiftBind { LiftFd *o; int idx; } LiftBind; /* idx -2: pseudo */
+typedef struct LiftWrite { int idx; LiftFd *f; int ins; } LiftWrite;
+typedef struct LiftCall { LiftFd *x; int ins; int ord; int argc; } LiftCall;
+struct LiftFd {
+    JSFunctionDef *fd;
+    LiftFd *parent;
+    int id, n, nlab;
+    int *pos;
+    int *lab2ins;
+    LiftBind *bind;
+    int *callee;           /* instruction -> lift_calls index + 1 */
+    int *cand_of;          /* var index -> candidate index + 1 */
+    LiftWrite *wr;
+    int nwr, wrcap;
+    int *kids; int nkids;  /* LiftFd ids */
+    uint8_t complex, bad, pseudo, subbad, lifted;
+    int head;              /* id of the lifted function containing this code, or -1 */
+};
+
+typedef struct LiftCand {
+    LiftFd *p, *f;
+    int fc, store, lidx;
+    JSAtom name;
+    int alive;
+    LiftCall *calls; int ncalls, callcap;
+    LiftBind *ex; int nex, excap;
+    int plan_idx;
+    uint8_t *reach; /* reachable instructions after the creation, in p */
+} LiftCand;
+
+typedef struct LiftAll {
+    JSContext *ctx;
+    LiftFd **fds; int nfds, fdcap;
+    LiftCand *c; int nc, ccap;
+    LiftCand **cand_of_fd; /* by fd id */
+    int oom;
+} LiftAll;
+
+#define LIFT_ARG(idx) ((idx) & ARGUMENT_VAR_OFFSET)
+
+static void *lift_grow(LiftAll *A, void *p, int *cap, int need, size_t sz)
+{
+    if (need <= *cap)
+        return p;
+    int nc = *cap ? *cap * 2 : 8;
+    while (nc < need) nc *= 2;
+    void *q = js_realloc(A->ctx, p, (size_t)nc * sz);
+    if (!q) { A->oom = 1; return p; }
+    *cap = nc;
+    return q;
+}
+
+static inline int lift_op(LiftFd *x, int i) { return x->fd->byte_code.buf[x->pos[i]]; }
+static inline uint32_t lift_atom_at(LiftFd *x, int i) { return get_u32(x->fd->byte_code.buf + x->pos[i] + 1); }
+static inline bool lift_is_scope_op(int op)
+{
+    return op == OP_scope_get_var || op == OP_scope_get_var_undef ||
+           op == OP_scope_put_var || op == OP_scope_put_var_init ||
+           op == OP_scope_make_ref || op == OP_scope_get_ref ||
+           op == OP_scope_delete_var;
+}
+static inline bool lift_is_write_op(int op)
+{
+    return op == OP_scope_put_var || op == OP_scope_put_var_init ||
+           op == OP_scope_make_ref || op == OP_scope_delete_var;
+}
+static inline int lift_scope_at(LiftFd *x, int i)
+{
+    int op = lift_op(x, i);
+    return get_u16(x->fd->byte_code.buf + x->pos[i] + (op == OP_scope_make_ref ? 9 : 5));
+}
+
+static LiftFd *lift_build(LiftAll *A, JSFunctionDef *fd, LiftFd *parent)
+{
+    LiftFd *x = js_mallocz(A->ctx, sizeof(*x));
+    struct list_head *el;
+    int pos, n = 0, cap = 0, i;
+    if (!x) { A->oom = 1; return NULL; }
+    x->fd = fd; x->parent = parent; x->id = A->nfds;
+    A->fds = lift_grow(A, A->fds, &A->fdcap, A->nfds + 1, sizeof(A->fds[0]));
+    if (A->oom) { js_free(A->ctx, x); return NULL; }
+    A->fds[A->nfds++] = x;
+    fd->lift_id = x->id;
+    /* decode */
+    for (pos = 0; pos < fd->byte_code.size; ) {
+        int op = fd->byte_code.buf[pos];
+        if (n >= cap) {
+            int ncap = cap ? cap * 2 : 64;
+            int *np = js_realloc(A->ctx, x->pos, ncap * sizeof(int));
+            if (!np) { A->oom = 1; return x; }
+            x->pos = np; cap = ncap;
+        }
+        x->pos[n++] = pos;
+        pos += opcode_info[op].size;
+    }
+    x->n = n;
+    x->nlab = fd->label_count;
+    x->lab2ins = js_malloc(A->ctx, (x->nlab + 1) * sizeof(int));
+    x->bind = js_mallocz(A->ctx, (n + 1) * sizeof(LiftBind));
+    x->callee = js_mallocz(A->ctx, (n + 1) * sizeof(int));
+    x->cand_of = js_mallocz(A->ctx, (fd->var_count + 1) * sizeof(int));
+    if (!x->lab2ins || !x->bind || !x->callee || !x->cand_of) { A->oom = 1; return x; }
+    for (i = 0; i <= x->nlab; i++) x->lab2ins[i] = -1;
+    for (i = 0; i < n; i++) {
+        int op = lift_op(x, i);
+        if (op == OP_label) {
+            uint32_t l = get_u32(fd->byte_code.buf + x->pos[i] + 1);
+            if ((int)l < x->nlab) x->lab2ins[l] = i;
+        } else if (op == OP_catch || op == OP_gosub || op == OP_ret ||
+                   op == OP_dispose_scope) {
+            x->complex = 1;
+        }
+    }
+    /* callee records */
+    for (i = 0; i < fd->lift_ncalls; i++) {
+        int lo = 0, hi = n - 1, p = fd->lift_calls[i].pos;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (x->pos[mid] == p) { x->callee[mid] = i + 1; break; }
+            if (x->pos[mid] < p) lo = mid + 1; else hi = mid - 1;
+        }
+    }
+    if (fd->has_eval_call || fd->func_kind != JS_FUNC_NORMAL ||
+        fd->has_parameter_expressions || fd->var_object_idx >= 0 ||
+        fd->arg_var_object_idx >= 0 ||
+        (fd->is_eval && fd->eval_type == JS_EVAL_TYPE_DIRECT))
+        x->bad = 1;
+    for (i = 0; i < fd->var_count; i++)
+        if (fd->vars[i].var_name == JS_ATOM__with_)
+            x->bad = 1;
+    list_for_each(el, &fd->child_list) {
+        JSFunctionDef *c = list_entry(el, JSFunctionDef, link);
+        LiftFd *cx = lift_build(A, c, x);
+        if (A->oom) return x;
+        x->kids = js_realloc(A->ctx, x->kids, (x->nkids + 1) * sizeof(int));
+        if (!x->kids) { A->oom = 1; return x; }
+        x->kids[x->nkids++] = cx->id;
+    }
+    return x;
+}
+
+static bool lift_resolve(LiftAll *A, LiftFd *x, JSAtom name, int scope, LiftBind *out)
+{
+    JSFunctionDef *fd = x->fd;
+    int level = scope;
+    for (;;) {
+        int idx = -1, v;
+        if (level < 0)
+            return false;
+        for (idx = fd->scopes[level].first; idx >= 0; idx = fd->vars[idx].scope_next) {
+            if (fd->vars[idx].var_name == name) {
+                out->o = A->fds[fd->lift_id]; out->idx = idx;
+                return true;
+            }
+        }
+        if (idx != ARG_SCOPE_END) {
+            v = find_var(A->ctx, fd, name);
+            if (v >= 0) {
+                out->o = A->fds[fd->lift_id]; out->idx = v;
+                return true;
+            }
+        }
+        if (fd->is_func_expr && fd->func_name == name) {
+            out->o = A->fds[fd->lift_id]; out->idx = -2;
+            return true;
+        }
+        if (!fd->parent)
+            break;
+        level = fd->parent_scope_level;
+        fd = fd->parent;
+    }
+    out->o = NULL; out->idx = 0;
+    return false;
+}
+
+static void lift_add_write(LiftAll *A, LiftFd *o, int idx, LiftFd *f, int ins)
+{
+    o->wr = lift_grow(A, o->wr, &o->wrcap, o->nwr + 1, sizeof(o->wr[0]));
+    if (A->oom) return;
+    o->wr[o->nwr].idx = idx; o->wr[o->nwr].f = f; o->wr[o->nwr].ins = ins;
+    o->nwr++;
+}
+
+/* successors of instruction i; returns the count */
+static int lift_succ(LiftFd *x, int i, int out[2])
+{
+    int op = lift_op(x, i), k = 0;
+    switch (op) {
+    case OP_goto: {
+        uint32_t l = get_u32(x->fd->byte_code.buf + x->pos[i] + 1);
+        out[0] = ((int)l < x->nlab) ? x->lab2ins[l] : -1;
+        return out[0] >= 0 ? 1 : 0;
+    }
+    case OP_if_true: case OP_if_false: {
+        uint32_t l = get_u32(x->fd->byte_code.buf + x->pos[i] + 1);
+        if (i + 1 < x->n) out[k++] = i + 1;
+        if ((int)l < x->nlab && x->lab2ins[l] >= 0) out[k++] = x->lab2ins[l];
+        return k;
+    }
+    case OP_return: case OP_return_undef: case OP_return_async:
+    case OP_throw: case OP_throw_error: case OP_ret:
+        return 0;
+    default:
+        if (i + 1 < x->n) { out[0] = i + 1; return 1; }
+        return 0;
+    }
+}
+
+static uint8_t *lift_reach(LiftAll *A, LiftFd *x, int from)
+{
+    uint8_t *seen = js_mallocz(A->ctx, x->n + 1);
+    int *stack = js_malloc(A->ctx, (x->n + 1) * sizeof(int));
+    int sp = 0, s[2], k, j;
+    if (!seen || !stack) { js_free(A->ctx, seen); js_free(A->ctx, stack); A->oom = 1; return NULL; }
+    k = lift_succ(x, from, s);
+    for (j = 0; j < k; j++) if (!seen[s[j]]) { seen[s[j]] = 1; stack[sp++] = s[j]; }
+    while (sp) {
+        int i = stack[--sp];
+        k = lift_succ(x, i, s);
+        for (j = 0; j < k; j++) if (!seen[s[j]]) { seen[s[j]] = 1; stack[sp++] = s[j]; }
+    }
+    js_free(A->ctx, stack);
+    return seen;
+}
+
+/* in[i] = 1 if every path from the entry to i passes through `store` first */
+static uint8_t *lift_dom(LiftAll *A, LiftFd *x, int store)
+{
+    uint8_t *in = js_malloc(A->ctx, x->n + 1);
+    int changed = 1, i, j, k, s[2];
+    if (!in) { A->oom = 1; return NULL; }
+    memset(in, 1, x->n + 1);
+    if (x->n) in[0] = 0;
+    while (changed) {
+        changed = 0;
+        for (i = 0; i < x->n; i++) {
+            int o = in[i] || i == store;
+            k = lift_succ(x, i, s);
+            for (j = 0; j < k; j++)
+                if (in[s[j]] && !o) { in[s[j]] = 0; changed = 1; }
+        }
+    }
+    return in;
+}
+
+static bool lift_is_ancestor(LiftFd *a, LiftFd *x) /* a is a strict ancestor of x */
+{
+    for (x = x->parent; x; x = x->parent)
+        if (x == a) return true;
+    return false;
+}
+
+static bool lift_same(LiftBind a, LiftBind b) { return a.o == b.o && a.idx == b.idx; }
+
+static void lift_add_extra(LiftAll *A, LiftCand *c, LiftBind b, int *changed)
+{
+    int i;
+    for (i = 0; i < c->nex; i++)
+        if (lift_same(c->ex[i], b)) return;
+    c->ex = lift_grow(A, c->ex, &c->excap, c->nex + 1, sizeof(c->ex[0]));
+    if (A->oom) return;
+    c->ex[c->nex++] = b;
+    *changed = 1;
+}
+
+static JSAtom lift_bind_name(LiftBind b)
+{
+    JSFunctionDef *fd = b.o->fd;
+    if (b.idx == -2) return fd->func_name;
+    if (LIFT_ARG(b.idx)) return fd->args[b.idx - ARGUMENT_VAR_OFFSET].var_name;
+    return fd->vars[b.idx].var_name;
+}
+
+static void lift_free_all(LiftAll *A)
+{
+    int i;
+    JSContext *ctx = A->ctx;
+    for (i = 0; i < A->nfds; i++) {
+        LiftFd *x = A->fds[i];
+        js_free(ctx, x->pos); js_free(ctx, x->lab2ins); js_free(ctx, x->bind);
+        js_free(ctx, x->callee); js_free(ctx, x->cand_of); js_free(ctx, x->wr);
+        js_free(ctx, x->kids); js_free(ctx, x);
+    }
+    js_free(ctx, A->fds);
+    for (i = 0; i < A->nc; i++) {
+        js_free(ctx, A->c[i].calls); js_free(ctx, A->c[i].ex); js_free(ctx, A->c[i].reach);
+        JS_FreeAtom(ctx, A->c[i].name);
+    }
+    js_free(ctx, A->c);
+    js_free(ctx, A->cand_of_fd);
+}
+
+static void lift_plan_free(JSContext *ctx, LiftPlan *p)
+{
+    int i;
+    if (!p) return;
+    for (i = 0; i < p->nfn; i++) {
+        int k;
+        JS_FreeAtom(ctx, p->fn[i].name);
+        JS_FreeAtom(ctx, p->fn[i].hidden);
+        for (k = 0; k < p->fn[i].nextra; k++) JS_FreeAtom(ctx, p->fn[i].extra[k]);
+        js_free(ctx, p->fn[i].extra);
+    }
+    js_free(ctx, p->fn);
+    js_free(ctx, p->call_fn);
+    js_free(ctx, p);
+}
+
+static bool lift_stats_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QJS_LIFT_STATS"); v = e && *e && *e != '0'; }
+    return v;
+}
+
+static bool lift_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("QJS_LIFT"); v = e && *e && *e != '0'; }
+    return v;
+}
+
+/* nearest alive-lifted function head for each fd */
+static void lift_set_heads(LiftAll *A)
+{
+    int i;
+    for (i = 0; i < A->nfds; i++) {
+        LiftFd *x = A->fds[i];
+        x->lifted = A->cand_of_fd[i] && A->cand_of_fd[i]->alive;
+        x->head = x->lifted ? x->id : (x->parent ? x->parent->head : -1);
+    }
+}
+
+static bool lift_chain_ok(LiftFd *from, LiftFd *top) /* from..top inclusive have no bad flag */
+{
+    LiftFd *x;
+    for (x = from; x; x = x->parent) {
+        if (x->bad) return false;
+        if (x == top) return true;
+    }
+    return false;
+}
+
+/* returns the child of `o` on the ancestor path of x */
+static LiftFd *lift_child_toward(LiftFd *o, LiftFd *x)
+{
+    while (x && x->parent != o) x = x->parent;
+    return x;
+}
+
+static LiftPlan *lift_analyze(JSContext *ctx, JSFunctionDef *root, int ncalls_total)
+{
+    LiftAll AA, *A = &AA;
+    LiftPlan *plan = NULL;
+    int i, j, k;
+    memset(A, 0, sizeof(*A));
+    A->ctx = ctx;
+    if (lift_build(A, root, NULL), A->oom) goto out;
+
+    /* resolve every scope operation; note pseudo uses, writes, private/class uses */
+    for (i = 0; i < A->nfds; i++) {
+        LiftFd *x = A->fds[i];
+        for (j = 0; j < x->n; j++) {
+            int op = lift_op(x, j);
+            if (lift_is_scope_op(op)) {
+                JSAtom nm = lift_atom_at(x, j);
+                LiftBind b;
+                if (nm == JS_ATOM_arguments || nm == JS_ATOM_this || nm == JS_ATOM_new_target ||
+                    nm == JS_ATOM_home_object || nm == JS_ATOM_this_active_func || nm == JS_ATOM_eval) {
+                    x->pseudo = 1;
+                    if (nm == JS_ATOM_arguments || nm == JS_ATOM_eval) x->bad = 1;
+                    continue;
+                }
+                if (lift_resolve(A, x, nm, lift_scope_at(x, j), &b)) {
+                    x->bind[j] = b;
+                    if (lift_is_write_op(op) && b.idx != -2)
+                        lift_add_write(A, b.o, b.idx, x, j);
+                }
+            } else if (op == OP_scope_get_private_field || op == OP_scope_get_private_field2 ||
+                       op == OP_scope_put_private_field || op == OP_scope_in_private_field ||
+                       op == OP_define_class || op == OP_define_class_computed) {
+                x->pseudo = 1;
+            }
+        }
+        if (A->oom) goto out;
+    }
+    for (i = A->nfds - 1; i >= 0; i--) {
+        LiftFd *x = A->fds[i];
+        if (x->bad) x->subbad = 1;
+        if (x->pseudo) x->subbad = 1;
+        for (k = 0; k < x->nkids; k++)
+            if (A->fds[x->kids[k]]->subbad) x->subbad = 1;
+    }
+
+    /* candidates */
+    A->cand_of_fd = js_mallocz(ctx, (A->nfds + 1) * sizeof(LiftCand *));
+    if (!A->cand_of_fd) goto out;
+    for (i = 0; i < A->nfds; i++) {
+        LiftFd *p = A->fds[i];
+        for (j = 0; j + 1 < p->n; j++) {
+            int op = lift_op(p, j), t, store = -1, cpi;
+            JSFunctionDef *cf = NULL;
+            struct list_head *el;
+            LiftFd *fx;
+            LiftCand *c;
+            if (op != OP_fclosure) continue;
+            cpi = get_u32(p->fd->byte_code.buf + p->pos[j] + 1);
+            list_for_each(el, &p->fd->child_list) {
+                JSFunctionDef *cc = list_entry(el, JSFunctionDef, link);
+                if (cc->parent_cpool_idx == cpi) { cf = cc; break; }
+            }
+            if (!cf) continue;
+            t = j + 1;
+            if (t < p->n && lift_op(p, t) == OP_set_name) t++;
+            if (t < p->n && lift_op(p, t) == OP_dup) {
+                if (t + 2 < p->n && lift_op(p, t + 1) == OP_scope_put_var && lift_op(p, t + 2) == OP_drop)
+                    store = t + 1;
+            } else if (t < p->n && (lift_op(p, t) == OP_scope_put_var || lift_op(p, t) == OP_scope_put_var_init)) {
+                store = t;
+            }
+            if (store < 0) continue;
+            fx = A->fds[cf->lift_id];
+            if (cf->func_type != JS_PARSE_FUNC_EXPR || cf->func_name != JS_ATOM_NULL ||
+                cf->func_kind != JS_FUNC_NORMAL || !cf->has_simple_parameter_list ||
+                cf->has_parameter_expressions || fx->subbad || cf->lift_ord < 0)
+                continue;
+            if (p->bind[store].o != p || p->bind[store].idx < 0 || LIFT_ARG(p->bind[store].idx))
+                continue;
+            if (p->cand_of[p->bind[store].idx]) {
+                A->c[p->cand_of[p->bind[store].idx] - 1].alive = 0; /* assigned twice */
+                continue;
+            }
+            for (k = 0; k < cf->arg_count; k++)
+                if (cf->args[k].var_name == JS_ATOM_NULL) break;
+            if (k < cf->arg_count) continue;
+            A->c = lift_grow(A, A->c, &A->ccap, A->nc + 1, sizeof(A->c[0]));
+            if (A->oom) goto out;
+            c = &A->c[A->nc];
+            memset(c, 0, sizeof(*c));
+            c->p = p; c->f = fx; c->fc = j; c->store = store;
+            c->lidx = p->bind[store].idx;
+            c->name = JS_DupAtom(ctx, p->fd->vars[c->lidx].var_name);
+            c->alive = 1;
+            p->cand_of[c->lidx] = ++A->nc;
+            A->cand_of_fd[fx->id] = c;
+        }
+    }
+    /* the c pointers into A->c may have moved while growing: rebuild */
+    for (i = 0; i < A->nc; i++) A->cand_of_fd[A->c[i].f->id] = &A->c[i];
+
+    /* C1: every reference to L is the store or a callee */
+    for (i = 0; i < A->nfds; i++) {
+        LiftFd *x = A->fds[i];
+        for (j = 0; j < x->n; j++) {
+            LiftBind b = x->bind[j];
+            LiftCand *c;
+            int op;
+            if (!b.o || b.idx < 0 || LIFT_ARG(b.idx) || !b.o->cand_of[b.idx]) continue;
+            c = &A->c[b.o->cand_of[b.idx] - 1];
+            op = lift_op(x, j);
+            if (x == c->p && j == c->store) continue;
+            if (op == OP_scope_get_var && x->callee[j]) {
+                LiftCall *cl;
+                c->calls = lift_grow(A, c->calls, &c->callcap, c->ncalls + 1, sizeof(c->calls[0]));
+                if (A->oom) goto out;
+                cl = &c->calls[c->ncalls++];
+                cl->x = x; cl->ins = j;
+                cl->ord = x->fd->lift_calls[x->callee[j] - 1].ord;
+                cl->argc = x->fd->lift_calls[x->callee[j] - 1].argc;
+                continue;
+            }
+            c->alive = 0;
+        }
+    }
+
+    /* fixpoint */
+    for (;;) {
+        int changed = 0;
+        lift_set_heads(A);
+        for (i = 0; i < A->nc; i++) A->c[i].nex = 0;
+        for (i = 0; i < A->nc; i++) {
+            LiftCand *c = &A->c[i];
+            LiftFd *p0, *a, *x;
+            LiftCand *c0;
+            uint8_t *da = NULL;
+            if (!c->alive) continue;
+            /* root of the lifted tree and the hoist target */
+            c0 = c;
+            while (A->cand_of_fd[c0->p->id] && A->cand_of_fd[c0->p->id]->alive)
+                c0 = A->cand_of_fd[c0->p->id];
+            p0 = c0->p; a = p0->parent;
+            if (!a || a->fd->eval_type == JS_EVAL_TYPE_DIRECT ||
+                (p0->fd->func_type != JS_PARSE_FUNC_EXPR && p0->fd->func_type != JS_PARSE_FUNC_ARROW) ||
+                !lift_chain_ok(c->p, a) || c->p->complex || c->ncalls == 0) {
+                c->alive = 0; changed = 1; continue;
+            }
+            /* calls: arity and dominance of the store */
+            da = lift_dom(A, c->p, c->store);
+            if (!da) goto out;
+            for (k = 0; k < c->ncalls && c->alive; k++) {
+                LiftCall *cl = &c->calls[k];
+                if (cl->argc > c->f->fd->arg_count) { c->alive = 0; break; }
+                if (cl->x == c->p) {
+                    if (!da[cl->ins]) c->alive = 0;
+                } else {
+                    LiftFd *ch = lift_child_toward(c->p, cl->x);
+                    if (ch && ch != c->f) {
+                        /* the closure containing the call must be created after the store */
+                        int fcx = -1, q, cpi2 = ch->fd->parent_cpool_idx;
+                        for (q = 0; q < c->p->n; q++)
+                            if (lift_op(c->p, q) == OP_fclosure &&
+                                (int)get_u32(c->p->fd->byte_code.buf + c->p->pos[q] + 1) == cpi2) { fcx = q; break; }
+                        if (fcx < 0 || !da[fcx]) c->alive = 0;
+                    }
+                }
+            }
+            js_free(ctx, da);
+            if (!c->alive) changed = 1;
+        }
+        if (changed) continue;
+
+        /* extras: free variables owned by the chain between the function and its root's parent */
+        for (i = 0; i < A->nc; i++) {
+            LiftCand *c = &A->c[i];
+            LiftCand *c0;
+            LiftFd *p0;
+            int ch2 = 0;
+            if (!c->alive) continue;
+            c0 = c;
+            while (A->cand_of_fd[c0->p->id] && A->cand_of_fd[c0->p->id]->alive)
+                c0 = A->cand_of_fd[c0->p->id];
+            p0 = c0->p;
+            for (j = 0; j < A->nfds; j++) {
+                LiftFd *x = A->fds[j];
+                if (x->head != c->f->id) continue;
+                for (k = 0; k < x->n; k++) {
+                    LiftBind b = x->bind[k];
+                    LiftFd *o;
+                    if (!b.o) continue;
+                    /* rewritten callee references and creation stores do not capture */
+                    if (b.idx >= 0 && !LIFT_ARG(b.idx) && b.o->cand_of[b.idx]) {
+                        LiftCand *g = &A->c[b.o->cand_of[b.idx] - 1];
+                        if (g->alive) continue;
+                    }
+                    o = b.o;
+                    if (o == c->f || !lift_is_ancestor(o, c->f)) continue;
+                    {   /* owner must be c->f's parent .. p0 */
+                        LiftFd *y; bool in = false;
+                        for (y = c->f->parent; y; y = y->parent) { if (y == o) { in = true; break; } if (y == p0) break; }
+                        if (!in) continue;
+                    }
+                    lift_add_extra(A, c, b, &ch2);
+                }
+            }
+        }
+        {   /* close over the extras of the functions called */
+            int again = 1;
+            while (again) {
+                again = 0;
+                for (i = 0; i < A->nc; i++) {
+                    LiftCand *g = &A->c[i];
+                    if (!g->alive) continue;
+                    for (k = 0; k < g->ncalls; k++) {
+                        LiftCall *cl = &g->calls[k];
+                        LiftCand *h;
+                        LiftCand *c0;
+                        LiftFd *p0;
+                        if (cl->x->head < 0) continue;
+                        h = A->cand_of_fd[cl->x->head];
+                        if (!h || !h->alive) continue;
+                        c0 = h;
+                        while (A->cand_of_fd[c0->p->id] && A->cand_of_fd[c0->p->id]->alive)
+                            c0 = A->cand_of_fd[c0->p->id];
+                        p0 = c0->p;
+                        for (j = 0; j < g->nex; j++) {
+                            LiftFd *o = g->ex[j].o, *y; bool in = false;
+                            if (o == h->f || !lift_is_ancestor(o, h->f)) continue;
+                            for (y = h->f->parent; y; y = y->parent) { if (y == o) { in = true; break; } if (y == p0) break; }
+                            if (in) lift_add_extra(A, h, g->ex[j], &again);
+                        }
+                    }
+                }
+            }
+        }
+        if (A->oom) goto out;
+        /* validity of the extras */
+        for (i = 0; i < A->nc; i++) {
+            LiftCand *c = &A->c[i];
+            if (!c->alive) continue;
+            for (j = 0; j < c->nex && c->alive; j++) {
+                LiftBind b = c->ex[j];
+                LiftFd *ch;
+                LiftCand *cc;
+                int w;
+                if (b.idx == -2 || b.o->bad || b.o->complex) { c->alive = 0; break; }
+                if (!LIFT_ARG(b.idx) && b.o->fd->vars[b.idx].var_kind == JS_VAR_FUNCTION_NAME) { c->alive = 0; break; }
+                ch = lift_child_toward(b.o, c->f);
+                cc = ch ? A->cand_of_fd[ch->id] : NULL;
+                if (!cc || !cc->alive) { c->alive = 0; break; }
+                if (!cc->reach) {
+                    cc->reach = lift_reach(A, b.o, cc->fc);
+                    if (!cc->reach) goto out;
+                }
+                for (w = 0; w < b.o->nwr; w++) {
+                    LiftWrite *wr = &b.o->wr[w];
+                    if (wr->idx != b.idx) continue;
+                    if (wr->f != b.o || cc->reach[wr->ins]) { c->alive = 0; break; }
+                }
+            }
+            if (c->alive) {   /* names: unique, not shadowing the formals */
+                for (j = 0; j < c->nex && c->alive; j++) {
+                    JSAtom nj = lift_bind_name(c->ex[j]);
+                    if (nj == JS_ATOM_NULL) { c->alive = 0; break; }
+                    for (k = 0; k < c->f->fd->arg_count; k++)
+                        if (c->f->fd->args[k].var_name == nj) c->alive = 0;
+                    for (k = 0; k < j; k++)
+                        if (lift_bind_name(c->ex[k]) == nj) c->alive = 0;
+                }
+            }
+            if (!c->alive) changed = 1;
+        }
+        if (changed) continue;
+        /* the call sites must see the same bindings under the same names */
+        for (i = 0; i < A->nc; i++) {
+            LiftCand *g = &A->c[i];
+            if (!g->alive) continue;
+            for (k = 0; k < g->ncalls && g->alive; k++) {
+                LiftCall *cl = &g->calls[k];
+                for (j = 0; j < g->nex; j++) {
+                    LiftBind r;
+                    if (!lift_resolve(A, cl->x, lift_bind_name(g->ex[j]), lift_scope_at(cl->x, cl->ins), &r) ||
+                        !lift_same(r, g->ex[j])) { g->alive = 0; break; }
+                }
+            }
+            if (!g->alive) changed = 1;
+        }
+        if (!changed) break;
+    }
+
+    /* the plan */
+    {
+        int nfn = 0;
+        for (i = 0; i < A->nc; i++) if (A->c[i].alive) nfn++;
+        if (!nfn) goto out;
+        plan = js_mallocz(ctx, sizeof(*plan));
+        if (!plan) goto out;
+        plan->fn = js_mallocz(ctx, nfn * sizeof(plan->fn[0]));
+        plan->call_fn = js_malloc(ctx, (ncalls_total + 1) * sizeof(int));
+        if (!plan->fn || !plan->call_fn) { lift_plan_free(ctx, plan); plan = NULL; goto out; }
+        for (i = 0; i <= ncalls_total; i++) plan->call_fn[i] = -1;
+        plan->ncall = ncalls_total;
+        for (i = 0; i < A->nc; i++) {
+            LiftCand *c = &A->c[i];
+            LiftPlanFn *pf;
+            char buf[48];
+            if (!c->alive) continue;
+            pf = &plan->fn[plan->nfn];
+            c->plan_idx = plan->nfn++;
+            pf->ord = c->f->fd->lift_ord;
+            pf->name = JS_DupAtom(ctx, c->name);
+            snprintf(buf, sizeof(buf), "%%lift%d", pf->ord);
+            pf->hidden = JS_NewAtom(ctx, buf);
+            pf->nformals = c->f->fd->arg_count;
+            pf->nextra = c->nex;
+            pf->extra = js_malloc(ctx, (c->nex + 1) * sizeof(JSAtom));
+            if (!pf->extra) { lift_plan_free(ctx, plan); plan = NULL; goto out; }
+            for (j = 0; j < c->nex; j++) pf->extra[j] = JS_DupAtom(ctx, lift_bind_name(c->ex[j]));
+            for (j = 0; j < c->ncalls; j++)
+                if (c->calls[j].ord >= 0 && c->calls[j].ord < ncalls_total)
+                    plan->call_fn[c->calls[j].ord] = c->plan_idx;
+        }
+        if (lift_stats_on()) {
+            fprintf(stderr, "lift: %d functions\n", plan->nfn);
+            for (i = 0; i < plan->nfn; i++)
+                fprintf(stderr, "lift:   fn ord=%d formals=%d extras=%d\n", plan->fn[i].ord, plan->fn[i].nformals, plan->fn[i].nextra);
+        }
+    }
+out:
+    lift_free_all(A);
+    return plan;
+}
+
+/* ---- parse-time hooks ---- */
+
+static int lift_find_fn(LiftPlan *p, int ord)
+{
+    int i;
+    for (i = 0; i < p->nfn; i++) if (p->fn[i].ord == ord) return i;
+    return -1;
+}
+
+/* called when a call through a plain identifier is emitted; returns the
+   argument count to emit */
+static int lift_note_call(JSParseState *s, JSFunctionDef *fd, int cpos, int argc)
+{
+    int ord = s->lift_call_seq++;
+    JSContext *ctx = s->ctx;
+    if (s->lift_mode == 1) {
+        if (fd->lift_ncalls >= fd->lift_callcap) {
+            int nc = fd->lift_callcap ? fd->lift_callcap * 2 : 4;
+            LiftCallRec *np = js_realloc(ctx, fd->lift_calls, nc * sizeof(*np));
+            if (!np) return argc;
+            fd->lift_calls = np; fd->lift_callcap = nc;
+        }
+        fd->lift_calls[fd->lift_ncalls].pos = cpos;
+        fd->lift_calls[fd->lift_ncalls].argc = argc;
+        fd->lift_calls[fd->lift_ncalls].ord = ord;
+        fd->lift_ncalls++;
+    } else if (s->lift_mode == 2 && ord < s->lift_plan->ncall && s->lift_plan->call_fn[ord] >= 0) {
+        LiftPlanFn *pf = &s->lift_plan->fn[s->lift_plan->call_fn[ord]];
+        uint8_t *bc = fd->byte_code.buf + cpos;
+        int k;
+        JS_FreeAtom(ctx, get_u32(bc + 1));
+        put_u32(bc + 1, JS_DupAtom(ctx, pf->hidden));
+        for (; argc < pf->nformals; argc++)
+            emit_op(s, OP_undefined);
+        for (k = 0; k < pf->nextra; k++) {
+            emit_op(s, OP_scope_get_var);
+            emit_atom(s, pf->extra[k]);
+            emit_u16(s, fd->scope_level);
+        }
+        argc += pf->nextra;
+    }
+    return argc;
+}
+
+/* emits, in the hoist target `a` (s->cur_func), the creation of the lifted
+   function stored in its hidden variable */
+static int lift_emit_hoist(JSParseState *s, int cpool_idx, LiftPlanFn *pf)
+{
+    JSFunctionDef *a = s->cur_func;
+    if (find_var(s->ctx, a, pf->hidden) < 0 && add_var(s->ctx, a, pf->hidden) < 0)
+        return -1;
+    emit_op(s, OP_fclosure);
+    emit_u32(s, cpool_idx);
+    emit_op(s, OP_set_name);
+    emit_atom(s, pf->name);
+    emit_op(s, OP_scope_put_var);
+    emit_atom(s, pf->hidden);
+    emit_u16(s, a->scope_level);
+    return 0;
+}
+
 
 /* add a global variable definition */
 static JSGlobalVar *add_global_var(JSContext *ctx, JSFunctionDef *s,
@@ -51997,6 +53460,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
     for(;;) {
         JSFunctionDef *fd = s->cur_func;
         bool has_optional_chain = false;
+        int lift_cpos = -1;
 
         if (s->token.val == TOK_QUESTION_MARK_DOT) {
             /* optional chaining */
@@ -52103,6 +53567,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                             if (has_with_scope(fd, scope)) {
                                 opcode = OP_scope_get_ref;
                                 fd->byte_code.buf[fd->last_opcode_pos] = opcode;
+                            } else if (s->lift_mode && !has_optional_chain) {
+                                lift_cpos = fd->last_opcode_pos;
                             }
                         }
                         drop_count = 1;
@@ -52278,6 +53744,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                         emit_op(s, OP_call_constructor);
                         emit_u16(s, arg_count);
                     } else {
+                        if (lift_cpos >= 0 && opcode == OP_scope_get_var && call_type == FUNC_CALL_NORMAL)
+                            arg_count = lift_note_call(s, fd, lift_cpos, arg_count);
                         emit_op(s, OP_call);
                         emit_u16(s, arg_count);
                     }
@@ -57620,6 +59088,8 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
         return NULL;
 
     fd->ctx = ctx;
+    fd->lift_ord = -1;
+    fd->lift_id = -1;
     init_list_head(&fd->child_list);
 
     /* insert in parent list */
@@ -57756,6 +59226,7 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     fd->regvm_src_pc = NULL;
 #endif
     free_objlit_sites(ctx, fd);
+    js_free(ctx, fd->lift_calls);
     js_free(ctx, fd->jump_slots);
     js_free(ctx, fd->label_slots);
     js_free(ctx, fd->source_loc_slots);
@@ -64030,6 +65501,8 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_regrun_pic = (uint32_t)offsetof(JSRegRun, pic);
     out->off_regrun_var_buf = (uint32_t)offsetof(JSRegRun, var_buf);
     out->off_regrun_arg_buf = (uint32_t)offsetof(JSRegRun, arg_buf);
+    out->off_regrun_argc = (uint32_t)offsetof(JSRegRun, argc);
+    out->off_regrun_argv = (uint32_t)offsetof(JSRegRun, argv);
     out->off_regrun_func = (uint32_t)offsetof(JSRegRun, func);
     out->off_regrun_this_obj = (uint32_t)offsetof(JSRegRun, this_obj);
     out->off_regrun_flags = (uint32_t)offsetof(JSRegRun, flags);
@@ -64059,6 +65532,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_rt_layout_count = (uint32_t)offsetof(JSRuntime, aot_layout_count);
     out->off_rt_htmldda = (uint32_t)offsetof(JSRuntime, aot_htmldda);
     out->off_shape_layout_id = (uint32_t)offsetof(JSShape, layout_id);
+    out->class_proxy = JS_CLASS_PROXY;
     out->off_ctx_interrupt_counter =
         (uint32_t)offsetof(JSContext, interrupt_counter);
     out->off_ctx_rt = (uint32_t)offsetof(JSContext, rt);
@@ -64110,6 +65584,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_rt_onechar = (uint32_t)offsetof(JSRuntime, onechar);
     out->class_string = JS_CLASS_STRING;
     out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
+    out->off_fnbc_aot_ident = (uint32_t)offsetof(JSFunctionBytecode, aot_ident);
 #endif
     out->off_fnbc_regvm_pic = (uint32_t)offsetof(JSFunctionBytecode, regvm_pic);
     {
@@ -64215,6 +65690,111 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_rt_regvm_cur = (uint32_t)offsetof(JSRuntime, regvm_cur);
     out->off_rt_stack_limit = (uint32_t)offsetof(JSRuntime, stack_limit);
     out->off_rt_fl_top = (uint32_t)offsetof(JSRuntime, aot_fl_top);
+    out->off_rt_zpark = (uint32_t)offsetof(JSRuntime, zpark);
+    out->off_rt_zpark_len = (uint32_t)offsetof(JSRuntime, zpark_len);
+    out->off_rt_zpark_cap = (uint32_t)offsetof(JSRuntime, zpark_cap);
+    out->off_rt_zct_nobj = (uint32_t)offsetof(JSRuntime, zct_nobj);
+    out->off_rt_drc_pend = (uint32_t)offsetof(JSRuntime, drc_pend);
+    out->off_rt_drc_pend_i = (uint32_t)offsetof(JSRuntime, drc_pend_i);
+    out->off_rt_drc_in_reconcile = (uint32_t)offsetof(JSRuntime, drc_in_reconcile);
+    {
+        static JSRuntime r0; /* all zero: only the phase under test is set while it is searched for */
+        const uint8_t *q = (const uint8_t *)&r0;
+        size_t i;
+
+        r0.gc_phase = (JSGCPhaseEnum)255;
+        out->off_rt_gc_phase = 0;
+        for (i = 0; i < sizeof(r0); i++) {
+            if (q[i] != 0) {
+                out->off_rt_gc_phase = (uint32_t)i;
+                break;
+            }
+        }
+        r0.gc_phase = JS_GC_PHASE_NONE;
+    }
+    out->class_object = JS_CLASS_OBJECT;
+    out->off_rt_blkcache = (uint32_t)offsetof(JSRuntime, arena_state.cache);
+    out->off_rt_blkcache_n = (uint32_t)offsetof(JSRuntime, arena_state.cache_n);
+    out->off_rt_malloc_count = (uint32_t)offsetof(JSRuntime, malloc_state.malloc_count);
+    out->off_rt_malloc_size = (uint32_t)offsetof(JSRuntime, malloc_state.malloc_size);
+    out->off_rt_malloc_limit = (uint32_t)offsetof(JSRuntime, malloc_state.malloc_limit);
+    out->off_rt_gc_obj_list = (uint32_t)offsetof(JSRuntime, gc_obj_list);
+    out->off_fnbc_objlit_tab = (uint32_t)offsetof(JSFunctionBytecode, objlit_tab);
+    out->sizeof_objlit_tpl = (uint32_t)sizeof(JSObjLitTemplate);
+    out->off_tpl_shape = (uint32_t)offsetof(JSObjLitTemplate, shape);
+    out->off_tpl_prop_count = (uint32_t)offsetof(JSObjLitTemplate, prop_count);
+    out->off_object_u = (uint32_t)offsetof(JSObject, u);
+    out->js_obj_inline_props = JS_OBJ_INLINE_PROPS;
+    out->off_fnbc_ctor_final_shape = (uint32_t)offsetof(JSFunctionBytecode, ctor_final_shape);
+    out->off_fnbc_ctor_fn_shape = (uint32_t)offsetof(JSFunctionBytecode, ctor_fn_shape);
+    out->off_fnbc_ctor_proto_slot = (uint32_t)offsetof(JSFunctionBytecode, ctor_proto_slot);
+    out->off_fnbc_ctor_fused_ok = (uint32_t)offsetof(JSFunctionBytecode, ctor_fused_ok);
+    out->off_fnbc_inst_inline_cap = (uint32_t)offsetof(JSFunctionBytecode, inst_inline_cap);
+    {
+        JSObject o;
+        const uint8_t *q = (const uint8_t *)&o;
+        size_t i;
+
+        memset(&o, 0, sizeof(o));
+        o.is_constructor = 1;
+        out->object_ctor_mask = 0;
+        for (i = 0; i < 8; i++)
+            if (q[offsetof(JSObject, class_id) - 2 + i] != 0 && i < 2) {
+                out->object_ctor_mask = (uint32_t)q[offsetof(JSObject, class_id) - 2 + i] << (8 * i);
+                break;
+            }
+    }
+    {
+        JSMallocBlockHeader h;
+        const uint8_t *q = (const uint8_t *)&h;
+        int cap;
+
+        memset(&h, 0, sizeof(h));
+        h.gc_obj_type = JS_GC_OBJ_TYPE_JS_OBJECT;
+        out->plain_gcbyte = 0;
+        {
+            size_t i;
+            for (i = 0; i < offsetof(JSMallocBlockHeader, user_data); i++)
+                if (q[i] != 0) { out->plain_gcbyte = q[i]; break; }
+        }
+        for (cap = 0; cap < 5; cap++) {
+            JSObject o;
+            uint64_t w;
+            size_t total = (((offsetof(JSObject, u) + (size_t)cap * sizeof(JSProperty)) + JS_ARENA_ALIGN - 1) &
+                            ~(size_t)(JS_ARENA_ALIGN - 1)) + sizeof(JSMallocBlockHeader);
+            int idx = arena_get_size_index(total);
+
+            out->plain_bsi[cap] = idx < JS_ARENA_BLOCK_SIZE_COUNT ? (uint32_t)idx : 0xffu;
+            out->plain_acct[cap] = idx < JS_ARENA_BLOCK_SIZE_COUNT
+                ? (uint32_t)(arena_block_sizes[idx] - sizeof(JSMallocBlockHeader) + MALLOC_OVERHEAD) : 0;
+            memset(&o, 0, sizeof(o));
+            o.extensible = true;
+            o.prop_inline_cap = (unsigned)cap;
+            o.class_id = JS_CLASS_OBJECT;
+            o.values_inline = 0;
+            o.arr_kind = JS_ARR_KIND_GENERIC;
+            memcpy(&w, (const uint8_t *)&o + offsetof(JSObject, class_id) - 2, sizeof(w));
+            out->plain_hdr_lo[cap] = (uint32_t)w;
+            out->plain_hdr_hi[cap] = (uint32_t)(w >> 32);
+        }
+    }
+    {
+        JSMallocBlockHeader h;
+        const uint8_t *q = (const uint8_t *)&h;
+        size_t i;
+
+        memset(&h, 0, sizeof(h));
+        h.in_zct = 1;
+        out->off_zct_back = 0;
+        out->zct_mask = 0;
+        for (i = 0; i < offsetof(JSMallocBlockHeader, user_data); i++) {
+            if (q[i] != 0) {
+                out->off_zct_back = (uint32_t)(offsetof(JSMallocBlockHeader, user_data) - i);
+                out->zct_mask = q[i];
+                break;
+            }
+        }
+    }
     out->off_object_func_var_refs = (uint32_t)offsetof(JSObject, u.func.var_refs);
     out->light_prefix_slots = REGVM_LIGHT_PREFIX_SLOTS;
     out->regvm_flag_light = REGVM_FLAG_LIGHT;
@@ -64564,6 +66144,9 @@ static JSAotProfFunc *js_aot_prof_ensure(JSRuntime *rt, JSFunctionBytecode *b)
         pf->pc_samples = js_mallocz_rt(rt, sizeof(uint32_t) * (size_t)pf->pc_n);
         if (!pf->pc_samples)
             goto fail;
+        pf->pc_exec = js_mallocz_rt(rt, sizeof(uint32_t) * (size_t)pf->pc_n);
+        if (!pf->pc_exec)
+            goto fail;
     }
     if (pf->reg_n > 0) {
         pf->reg_types = js_mallocz_rt(rt, sizeof(uint16_t) * (size_t)pf->reg_n);
@@ -64587,6 +66170,7 @@ fail:
     js_free_rt(rt, pf->br_taken);
     js_free_rt(rt, pf->br_total);
     js_free_rt(rt, pf->pc_samples);
+    js_free_rt(rt, pf->pc_exec);
     js_free_rt(rt, pf->reg_types);
     js_free_rt(rt, pf->reg_pc);
     js_free_rt(rt, pf->sites);
@@ -64620,6 +66204,8 @@ static void js_aot_prof_op(JSFunctionBytecode *b, uint8_t *rpc, uint8_t **pprev)
     pf->last_pc = (int32_t)(rpc - b->regvm_code);
     if (pf->last_pc >= 0 && pf->last_pc < pf->cov_n)
         pf->cov[pf->last_pc >> 3] |= (uint8_t)(1u << (pf->last_pc & 7));
+    if (pf->pc_exec && pf->last_pc >= 0 && pf->last_pc < pf->pc_n && pf->pc_exec[pf->last_pc] != UINT32_MAX)
+        pf->pc_exec[pf->last_pc]++;
     if (unlikely((pf->ops & 0x3ff) == 0))
         js_aot_prof_sample(b->realm->rt, b, pf->last_pc);
     if (*pprev && rpc < *pprev) {
@@ -64648,6 +66234,8 @@ static void js_aot_prof_tick(JSFunctionBytecode *b, uint8_t *rpc)
     pc = pf->last_pc = (int32_t)(rpc - b->regvm_code);
     if (pc >= 0 && pc < pf->cov_n)
         pf->cov[pc >> 3] |= (uint8_t)(1u << (pc & 7));
+    if (pf->pc_exec && pc >= 0 && pc < pf->pc_n && pf->pc_exec[pc] != UINT32_MAX)
+        pf->pc_exec[pc]++;
     if (pc >= 0 && pc < pf->pc_n && regvm_is_cond_branch[*rpc])
         pf->br_total[pc]++;
     if (unlikely((pf->ops & 0x3ff) == 0))
@@ -65133,6 +66721,7 @@ static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b)
     js_free_rt(rt, pf->br_taken);
     js_free_rt(rt, pf->br_total);
     js_free_rt(rt, pf->pc_samples);
+    js_free_rt(rt, pf->pc_exec);
     js_free_rt(rt, pf->reg_types);
     js_free_rt(rt, pf->reg_pc);
     js_free_rt(rt, pf->sites);
@@ -65534,7 +67123,7 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
             fprintf(f, "P %s pc=%d types=%s props=%u pk=%u src=%s\n",
                     dgt, i, ts, e->alloc_props, e->packed_kinds, src);
         else if (e->has_num)
-            fprintf(f, "P %s pc=%d types=%s num=%g..%g frac=%u negzero=%u pk=%u src=%s\n",
+            fprintf(f, "P %s pc=%d types=%s num=%.17g..%.17g frac=%u negzero=%u pk=%u src=%s\n",
                     dgt, i, ts, e->num_min, e->num_max, e->frac, e->negzero, e->packed_kinds, src);
         else
             fprintf(f, "P %s pc=%d types=%s pk=%u src=%s\n", dgt, i, ts, e->packed_kinds, src);
@@ -65556,6 +67145,37 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
                         dgt, i, pf->pc_samples[i], src);
             }
         }
+    }
+    if (pf->pc_exec && b->regvm_code != NULL) {
+        /* N <digest> pc=<first>..<last> n=<executions>: the instructions from first to last (starts, in order) each ran n times. The frequency
+           the generator's hot/cold decisions use; a time sample says where the profiler happened to land, not how often a pc runs. */
+        int run_a = -1, run_b = -1;
+        uint32_t run_n = 0;
+
+        for (i = 0; i <= pf->pc_n; ) {
+            uint32_t c = i < pf->pc_n ? pf->pc_exec[i] : 0;
+
+            if (c != 0 && run_a >= 0 && c == run_n) {
+                run_b = i;
+            } else {
+                if (run_a >= 0)
+                    fprintf(f, "N %s pc=%d..%d n=%u\n", dgt, run_a, run_b, run_n);
+                run_a = c != 0 ? i : -1;
+                run_b = i;
+                run_n = c;
+            }
+            if (i >= pf->pc_n)
+                break;
+            {
+                int sz = regvm_fmt_size(regvm_rop_fmt[b->regvm_code[i]], 1, (uint16_t)b->regvm_code[i]);
+
+                if (sz < 0)
+                    break;
+                i += sz + 1;
+            }
+        }
+        if (run_a >= 0 && i < pf->pc_n)
+            fprintf(f, "N %s pc=%d..%d n=%u\n", dgt, run_a, run_b, run_n);
     }
     if (pf->cov && pf->cov_n > 0) {
         int nins = 0, ncov = 0, prev_un = -1;
@@ -65646,7 +67266,7 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
             aot_type_str(c->res_types, ts, sizeof(ts));
             fprintf(f, "K %s pc=%u types=%s", dgt, c->pc, ts);
             if (c->res_has_num)
-                fprintf(f, " num=%g..%g frac=%u negzero=%u", c->res_min,
+                fprintf(f, " num=%.17g..%.17g frac=%u negzero=%u", c->res_min,
                         c->res_max, c->res_frac, c->res_negzero);
             fprintf(f, " calls=%u results=%u\n", c->count, c->res_count);
         }
@@ -65884,7 +67504,7 @@ void js_aot_prof_dump(JSRuntime *rt)
         if (!f)
             f = stderr;
     }
-    fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u callres=1 sitekinds=1 vmode=%u\n",
+    fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u callres=1 sitekinds=1 gwrites=1 vmode=%u\n",
             QJS_AOT_ABI, REGVM_FORMAT_VERSION, QJS_DRC,
             QJS_REGVM_THREAD, QJS_REGVM_RECORD, QJS_NAN_BOXING64);
     {
@@ -65894,6 +67514,19 @@ void js_aot_prof_dump(JSRuntime *rt)
                               ? NULL
                               : list_entry(rt->context_list.next, JSContext, link);
         aot_dump_shapes(f, rt, ctx0);
+        if (ctx0 != NULL) {
+            /* G <name> writes=<n> types=<last value's type> val=<its number>: the stores each global saw (see aot_note_gwrite). */
+            int gi;
+            for (gi = 0; gi < aot_ngw; gi++) {
+                const char *gn = JS_AtomToCString(ctx0, aot_gw[gi].atom);
+                char ts[128];
+                aot_type_str(aot_gw[gi].types, ts, sizeof(ts));
+                if (gn != NULL) {
+                    fprintf(f, "G %s writes=%u types=%s val=%.17g\n", gn, aot_gw[gi].writes, ts, aot_gw[gi].val);
+                    JS_FreeCString(ctx0, gn);
+                }
+            }
+        }
         {
             int nseen = 0;
             list_for_each(el, &rt->gc_obj_list) {
@@ -66275,6 +67908,24 @@ static void js_aot_unbind(JSFunctionBytecode *b)
     regvm_set_frame_shape(b);
 }
 
+/* A compiled function's entry (or its frameless exit) hands the whole call back: nothing of it has run, and no frame of the
+   unit was built. The interpreter makes the call as it would without a unit: the flag keeps JS_CallInternal off the compiled
+   entries (the native entry, the record entry, js_regvm_execute's entry), so this cannot come back here. `this_obj` is the
+   `this` the caller chose (a constructor call has already made its object), and the value is the function's own return. */
+QJS_AOT_STUB JSValue qjs_aot_call_interp(JSContext *ctx, JSObject *co, JSValue this_obj, JSValue *argv, int argc)
+{
+    return JS_CallInternal(ctx, JS_MKPTR(JS_TAG_OBJECT, co), this_obj, JS_UNDEFINED, argc, (JSValueConst *)argv,
+                           JS_CALL_FLAG_AOT_DEOPT);
+}
+
+/* The profitability gate fired for this function: stop using the unit for it (its calls take the interpreter's paths from
+   now on), and make this call there. */
+QJS_AOT_STUB JSValue qjs_aot_gated_call(JSContext *ctx, JSObject *co, JSValue this_obj, JSValue *argv, int argc)
+{
+    js_aot_unbind(co->u.func.function_bytecode);
+    return qjs_aot_call_interp(ctx, co, this_obj, argv, argc);
+}
+
 /* Bind a function to its generated entry. The table is sorted by digest;
    `code_crc` catches a stale unit (QJS_AOT_VERIFY). Called once, when the
    bytecode is final. */
@@ -66431,6 +68082,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
     }
     b->aot_fn = NULL;
     b->aot_nfn = NULL;
+    b->aot_ident = NULL;
     b->aot_index = UINT32_MAX;
     b->aot_state = 2;           /* known-absent until a match is found */
     b->aot_layout_ctor = 0;
@@ -66461,6 +68113,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
                 b->realm->rt->aot_bound = js_mallocz_rt(b->realm->rt, qjs_aot_count);
             if (!js_aot_unit_claim(b->realm->rt))
                 return;         /* the unit is bound in another runtime: this one interprets */
+            b->aot_ident = (void *)qjs_aot_table[mid].fn;
             if (b->realm->rt->aot_bound == NULL || b->realm->rt->aot_bound[mid])
                 return;         /* another live bytecode holds this function */
             b->realm->rt->aot_bound[mid] = 1;
@@ -66872,8 +68525,11 @@ QJS_AOT_STUB JSValue qjs_aot_new_from_shape_cap(JSContext *ctx, void *shape, uin
     }
     cap = js_aot_inline_room(sh, cap);
     /* what JS_NewObjectFromShapeCapExtra does for a plain object, without its class switch: one block holding the body and the cap slots */
-    js_trigger_gc(rt, sizeof(JSObject));
-    p = js_malloc(ctx, offsetof(JSObject, u) + cap * sizeof(JSProperty));
+    p = cap < JS_PLAIN_OBJ_CAPS ? js_plain_block_cached(rt, cap) : NULL;
+    if (!p) {
+        js_trigger_gc(rt, sizeof(JSObject));
+        p = js_malloc(ctx, offsetof(JSObject, u) + cap * sizeof(JSProperty));
+    }
     if (unlikely(!p))
         return JS_EXCEPTION;   /* the generic path also drops the shape reference it was given; here none was taken yet */
     p->prop_inline_cap = cap;
@@ -68056,6 +69712,20 @@ int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out
     return qjs_aot_object_template_b(ctx, f->b, index, out);
 }
 
+/* A call from compiled code to a bytecode function the unit cannot enter natively (it builds an `arguments` object, reads closure
+   variables, ...): what the step engine's `call` does for it, without decoding the instruction or going through the step. `cap` is
+   the byte of the call in the caller's program (the backtrace position). JS_UNINITIALIZED, having done nothing, when the callee is
+   not such a function (a builtin, a bound function, a proxy, a non-function): the site then takes the step as before. The result
+   is owned, or an exception. QJS_AOT_NOGENCALL=1 (read at generation) leaves the site on the step. */
+JSValue qjs_aot_call_generic(JSContext *ctx, JSRegRun *f, JSValue callee, JSValue this_obj, JSValue *argv, int na, uint32_t cap)
+{
+    if (JS_VALUE_GET_TAG(callee) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(callee)->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return JS_UNINITIALIZED;
+    f->cap_ip = f->b->regvm_code + cap;
+    return JS_CallInternal(ctx, callee, this_obj, JS_UNDEFINED, na, vc(argv), 0);
+}
+
 int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out)
 {
     JSObject *p = JS_VALUE_GET_OBJ(f->sf->cur_func);
@@ -68111,13 +69781,19 @@ int qjs_aot_global_watch(JSContext *ctx, JSValue obj, int atom)
     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT ||
         (JS_VALUE_GET_OBJ(obj) != JS_VALUE_GET_OBJ(ctx->global_obj) && JS_VALUE_GET_OBJ(obj) != JS_VALUE_GET_OBJ(ctx->global_var_obj)))
         return 1;
-    if (!js_aot_gwatched(rt, (JSAtom)atom)) {
-        if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
-            return 0;
-        rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
-        rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
-        /* the cells filled so far may take the direct store */
-        js_gv_cell_invalidate(rt);
+    {
+        int gi = js_aot_gwatch_find(rt, (JSAtom)atom);
+        if (gi >= 0) {
+            rt->aot_gwatch_fact[gi] = 1;
+        } else {
+            if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
+                return 0;
+            rt->aot_gwatch_fact[rt->aot_gwatch_n] = 1;
+            rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
+            rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
+            /* the cells filled so far may take the direct store */
+            js_gv_cell_invalidate(rt);
+        }
     }
     return 1;
 }
@@ -68129,9 +69805,11 @@ int qjs_aot_global_fold(JSContext *ctx, int atom, int32_t v)
     JSProperty *pr;
     JSValue cur;
 
-    if (find_own_property(&pr, JS_VALUE_GET_OBJ(ctx->global_var_obj), (JSAtom)atom) != NULL)
-        return 0;
-    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(ctx->global_obj), (JSAtom)atom);
+    /* a top-level let/const lives in the lexical object and is found first, as a read finds it; every write to it reports through the same
+       watch (JS_SetGlobalVarS and the cell stores call js_aot_gwrite_val for both objects), and an uninitialised binding is not an int */
+    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(ctx->global_var_obj), (JSAtom)atom);
+    if (prs == NULL)
+        prs = find_own_property(&pr, JS_VALUE_GET_OBJ(ctx->global_obj), (JSAtom)atom);
     if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
         return 0;
     cur = pr->u.value;
@@ -68140,6 +69818,7 @@ int qjs_aot_global_fold(JSContext *ctx, int atom, int32_t v)
     if (!js_aot_gwatched(rt, (JSAtom)atom)) {
         if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
             return 0;
+        rt->aot_gwatch_fact[rt->aot_gwatch_n] = 0;   /* a fold only: the first reported write drops it */
         rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
         rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
         /* the cells filled so far may take the direct store */
@@ -68262,6 +69941,54 @@ int qjs_aot_ta_len_valid(JSContext *ctx)
 /* `a instanceof b` for a plain constructor: 1 or 0, or -1 when the engine's own operator has to
    decide (a right side that is not a function whose @@hasInstance is the builtin, a `prototype`
    that is not a plain object property, a proxy in the chain). It runs no JS and throws nothing. */
+/* A site's inline instanceof (q2_instanceof) trusts a function object whose shape is `ic[0]`: the shape of a plain bytecode
+   function, exactly length, name, prototype, whose prototype is Function.prototype. The cache holds a counted reference, so
+   the shape cannot change under it or be reused for another layout. Returns 1 when the shape was taken. */
+int qjs_aot_instof_fill(JSContext *ctx, JSValue b, void **ic)
+{
+    JSObject *p;
+    JSShape *sh;
+    JSShapeProperty *sp;
+
+    if (JS_VALUE_GET_TAG(b) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(b);
+    sh = p->shape;
+    sp = get_shape_prop(sh);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION || sh->proto != JS_VALUE_GET_OBJ(ctx->function_proto) ||
+        !sh->is_hashed || sh->prop_count != 3 || sp[2].atom != JS_ATOM_prototype ||
+        (sp[2].flags & JS_PROP_TMASK) != 0 || sp[0].atom != JS_ATOM_length || sp[1].atom != JS_ATOM_name)
+        return 0;
+    if (ic[0] != (void *)sh) {
+        if (ic[0])
+            js_free_shape(ctx->rt, (JSShape *)ic[0]);
+        else {
+            JSRuntime *rt = ctx->rt;
+
+            /* the first shape this cache holds: remember the cache, so the runtime gives the reference back when it goes */
+            if (rt->instof_n == rt->instof_cap) {
+                uint32_t nc = rt->instof_cap ? rt->instof_cap * 2 : 64;
+                void ***ni = rt->mf.js_realloc(rt->malloc_state.opaque, rt->instof_ics, (size_t)nc * sizeof(*ni));
+
+                if (!ni)
+                    return 0;
+                rt->instof_ics = ni;
+                rt->instof_cap = nc;
+            }
+            rt->instof_ics[rt->instof_n++] = ic;
+        }
+        ic[0] = js_dup_shape(sh);
+    }
+    return 1;
+}
+
+/* QJS_AOT_NOINSTLEAN=1 turns the slot read off (the A/B knob). */
+static int qjs_aot_instof_lean = 1;
+__attribute__((constructor)) static void qjs_aot_instof_init(void)
+{
+    if (getenv("QJS_AOT_NOINSTLEAN")) qjs_aot_instof_lean = 0;
+}
+
 int qjs_aot_instanceof(JSContext *ctx, JSValue a, JSValue b)
 {
     JSObject *p, *proto;
@@ -68272,13 +69999,33 @@ int qjs_aot_instanceof(JSContext *ctx, JSValue a, JSValue b)
         return -1;
     p = JS_VALUE_GET_OBJ(b);
     if ((p->class_id != JS_CLASS_BYTECODE_FUNCTION && p->class_id != JS_CLASS_C_FUNCTION) ||
-        p->shape->proto != JS_VALUE_GET_OBJ(ctx->function_proto) ||
-        find_own_property1(p, JS_ATOM_Symbol_hasInstance))
+        p->shape->proto != JS_VALUE_GET_OBJ(ctx->function_proto))
+        return -1;
+    {
+        /* A plain function is exactly length, name, prototype: no own @@hasInstance, and the
+           prototype is the third slot, so neither is a hash probe. Any other layout is searched. */
+        JSShape *sh = p->shape;
+        JSShapeProperty *sp = get_shape_prop(sh);
+        if (likely(qjs_aot_instof_lean) && p->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+            sh->prop_count == 3 && sp[2].atom == JS_ATOM_prototype &&
+            (sp[2].flags & JS_PROP_TMASK) == 0 &&
+            sp[0].atom == JS_ATOM_length && sp[1].atom == JS_ATOM_name) {
+            pr = &p->prop[2];
+            prs = &sp[2];
+            if (JS_VALUE_GET_TAG(a) != JS_TAG_OBJECT)
+                return 0;
+            goto have_proto;
+        }
+    }
+    if (find_own_property1(p, JS_ATOM_Symbol_hasInstance))
         return -1;
     if (JS_VALUE_GET_TAG(a) != JS_TAG_OBJECT)
         return 0;
     prs = find_own_property(&pr, p, JS_ATOM_prototype);
-    if (!prs || (prs->flags & JS_PROP_TMASK) != 0 || JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
+    if (!prs || (prs->flags & JS_PROP_TMASK) != 0)
+        return -1;
+have_proto:
+    if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
         return -1;
     proto = JS_VALUE_GET_OBJ(pr->u.value);
     p = JS_VALUE_GET_OBJ(a);
@@ -68421,6 +70168,134 @@ int qjs_aot_construct_this_cap(JSContext *ctx, JSObject *ctor, JSValue *out,
         return -1;
     *out = obj;
     return 1;
+}
+
+/* `new C(a, b)` of a constructor whose body only stores parameters into fields of `this` (the generator's field map `fm`:
+   the count, then per field the code offset of its atom and the argument it stores). Once one instance has taught the
+   bytecode the finished shape, the object is made with that shape and the fields filled: no `this` with an empty shape,
+   no body, no property-add transition. JS_UNINITIALIZED, having done nothing, when the shape is not known or the
+   constructor is not in the state it was learned in (function shape, prototype); the site then constructs as before and
+   offers the result to qjs_aot_fused_learn. QJS_AOT_NOFUSED=1 turns it off. */
+static int qjs_aot_fused_on = 1;
+__attribute__((constructor)) static void qjs_aot_fused_init(void)
+{
+    if (getenv("QJS_AOT_NOFUSED")) qjs_aot_fused_on = 0;
+}
+
+JSValue qjs_aot_new_fused(JSContext *ctx, JSObject *ctor, JSValue *argv, int na, const uint32_t *fm, uint32_t steal)
+{
+    JSFunctionBytecode *cb;
+    JSShape *sh;
+    JSValue pv, obj;
+    JSObject *p;
+    uint32_t nf = fm[0], i;
+
+    js_dbg_note[5]++;
+    if (unlikely(ctor->class_id != JS_CLASS_BYTECODE_FUNCTION))
+        return JS_UNINITIALIZED;
+    cb = ctor->u.func.function_bytecode;
+    sh = cb->ctor_final_shape;
+    if (likely(sh != NULL) && ctor->is_constructor && cb->ctor_fn_shape == ctor->shape &&
+        !cb->is_derived_class_constructor && !JS_AOT_LAYOUT_CTOR(cb)) {
+        pv = ctor->prop[cb->ctor_proto_slot].u.value;
+        if (JS_VALUE_GET_TAG(pv) == JS_TAG_OBJECT && sh->proto == JS_VALUE_GET_OBJ(pv)) {
+            obj = js_new_plain_object(ctx, js_dup_shape(sh), cb->inst_inline_cap);
+            if (unlikely(JS_IsException(obj)))
+                return obj;
+            js_dbg_note[6]++;
+            p = JS_VALUE_GET_OBJ(obj);
+            /* `steal` has a bit per argument whose reference the caller holds (a fresh result it did not adopt): that
+               reference becomes the field's, no dup and no park; an argument stored in two fields is stolen once. */
+            for (i = 0; i < nf; i++) {
+                uint32_t ai = fm[2 + 2 * i];
+                if (ai >= (uint32_t)na)
+                    p->prop[i].u.value = JS_UNDEFINED;
+                else if (ai < 32 && ((steal >> ai) & 1)) {
+                    p->prop[i].u.value = argv[ai];
+                    steal &= ~(1u << ai);
+                } else
+                    p->prop[i].u.value = js_dup(argv[ai]);
+            }
+            return obj;
+        }
+    }
+    return JS_UNINITIALIZED;
+}
+
+/* `new C(args)` of a base-class constructor from a body that has no frame, when the finished shape is not learned yet: `this` comes from the
+   same allocation the framed site uses (qjs_aot_construct_this_cap, which also notes the function's shape and where its prototype lives), the
+   constructor body runs as an ordinary call, an object it returns wins, and the instance teaches the shape. The result is owned, or an exception. */
+void qjs_aot_fused_learn(JSContext *ctx, JSObject *ctor, JSValue inst, const uint32_t *fm);
+JSValue qjs_aot_construct_learn(JSContext *ctx, JSObject *ctor, JSValue *argv, int na, const uint32_t *fm)
+{
+    JSValue self, ret, fv = JS_MKPTR(JS_TAG_OBJECT, ctor);
+    int rc = qjs_aot_construct_this_cap(ctx, ctor, &self, 0);
+
+    if (rc < 0)
+        return JS_EXCEPTION;
+    if (rc == 0)
+        return JS_CallConstructor(ctx, fv, na, vc(argv));
+    ret = JS_CallInternal(ctx, fv, self, JS_UNDEFINED, na, vc(argv), 0);
+    if (JS_IsException(ret)) {
+        JS_FreeValue(ctx, self);
+        return ret;
+    }
+    if (JS_VALUE_GET_TAG(ret) == JS_TAG_OBJECT) {
+        JS_FreeValue(ctx, self);
+        return ret;
+    }
+    JS_FreeValue(ctx, ret);
+    qjs_aot_fused_learn(ctx, ctor, self, fm);
+    return self;
+}
+
+void qjs_aot_fused_learn(JSContext *ctx, JSObject *ctor, JSValue inst, const uint32_t *fm)
+{
+    JSFunctionBytecode *cb;
+    JSShape *sh;
+    JSShapeProperty *sp;
+    JSObject *p;
+    JSRuntime *rt = ctx->rt;
+    uint32_t nf = fm[0], i;
+    const uint8_t *code;
+
+    if (!qjs_aot_fused_on || ctor->class_id != JS_CLASS_BYTECODE_FUNCTION ||
+        JS_VALUE_GET_TAG(inst) != JS_TAG_OBJECT)
+        return;
+    cb = ctor->u.func.function_bytecode;
+    if (cb->ctor_final_shape || cb->ctor_final_tries >= 4 || cb->regvm_code == NULL)
+        return;
+    if (cb->ctor_fn_shape == NULL && (ctor->shape->is_hashed || js_shape_try_hash(ctx, ctor->shape))) {
+        /* No construct has gone through js_create_from_ctor_cap's learning (the instances came from compiled code): note the function
+           object's shape and where its `prototype` lives, as that path does. */
+        JSProperty *ppr_;
+        JSShapeProperty *pps_ = find_own_property(&ppr_, ctor, JS_ATOM_prototype);
+
+        if (pps_ != NULL && (pps_->flags & JS_PROP_TMASK) == 0 && (uint32_t)(ppr_ - ctor->prop) <= UINT16_MAX) {
+            js_fnbc_gc_force_trace(ctx->rt, cb);
+            cb->ctor_fn_shape = js_dup_shape(ctor->shape);
+            cb->ctor_proto_slot = (uint16_t)(ppr_ - ctor->prop);
+        }
+    }
+    if (cb->ctor_fn_shape != ctor->shape) { if (getenv("QJS_DEBUG_FUSED")) fprintf(stderr, "learn: fn shape mismatch\n"); return; }
+    cb->ctor_final_tries++;
+    p = JS_VALUE_GET_OBJ(inst);
+    sh = p->shape;
+    if (p->class_id != JS_CLASS_OBJECT || !sh->is_hashed || sh->prop_count != (int)nf) { if (getenv("QJS_DEBUG_FUSED")) fprintf(stderr, "learn: inst shape hashed=%d count=%d nf=%d\n", (int)sh->is_hashed, sh->prop_count, (int)nf); return; }
+    if (JS_VALUE_GET_TAG(ctor->prop[cb->ctor_proto_slot].u.value) != JS_TAG_OBJECT ||
+        sh->proto != JS_VALUE_GET_OBJ(ctor->prop[cb->ctor_proto_slot].u.value))
+        return;
+    sp = get_shape_prop(sh);
+    code = cb->regvm_code;
+    for (i = 0; i < nf; i++) {
+        uint32_t atom;
+        memcpy(&atom, code + fm[1 + 2 * i], sizeof(atom));
+        if (sp[i].atom != atom || sp[i].flags != JS_PROP_C_W_E)
+            return;
+    }
+    js_fnbc_gc_force_trace(rt, cb);
+    cb->ctor_final_shape = js_dup_shape(sh);
+    cb->ctor_fused_ok = !cb->is_derived_class_constructor && !JS_AOT_LAYOUT_CTOR(cb);
 }
 
 int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
@@ -69309,6 +71184,87 @@ QJS_AOT_STUB int qjs_aot_array_const(JSContext *ctx, JSRegRun *f, uint32_t idx,
     return 0;
 }
 
+/* local_check and close_local without the step handler: the ops' own bodies, on the root's frame. */
+QJS_AOT_STUB int qjs_aot_local_check(JSContext *ctx, JSRegRun *f, int slot)
+{
+    if (unlikely(JS_IsUninitialized(f->var_buf[slot]))) {
+        JS_ThrowReferenceErrorUninitialized2(ctx, f->b, slot, false);
+        return -1;
+    }
+    return 0;
+}
+
+QJS_AOT_STUB void qjs_aot_close_local(JSContext *ctx, JSRegRun *f, int slot)
+{
+    close_lexical_var(ctx, f->b, f->sf, slot);
+}
+
+/* set_name without the step handler (compiled code): the op's own body. */
+QJS_AOT_STUB int qjs_aot_set_name(JSContext *ctx, JSValue v, JSAtom atom)
+{
+    return regvm_set_name_value(ctx, v, atom);
+}
+
+/* make_closure without the step handler: the same js_closure call the op makes, from the root's pool, var refs and frame. */
+QJS_AOT_STUB int qjs_aot_make_closure(JSContext *ctx, JSRegRun *f, uint32_t idx, JSValue *out)
+{
+    *out = js_closure(ctx, js_dup(f->b->cpool[idx]), f->var_refs, f->sf);
+    return JS_IsException(*out) ? -1 : 0;
+}
+
+/* The three forms below are for the code of an INLINED CALLEE (a copy): the copy has the callee's bytecode `b`
+   (bound from the closure its guard proved) and no frame of its own to give the helpers above, whose `f` is the
+   root's. Same operations, from `b`'s pool and without the in-place append (that needs the frame). */
+int qjs_aot_load_const_b(JSContext *ctx, JSFunctionBytecode *b, int kind, uint32_t idx,
+                         JSValue *out)
+{
+    *out = kind == REG_CONST_CPOOL ? js_dup(b->cpool[idx]) : JS_AtomToValue(ctx, idx);
+    return JS_IsException(*out) ? -1 : 0;
+}
+
+int qjs_aot_array_const_b(JSContext *ctx, JSFunctionBytecode *b, uint32_t idx, JSValue *out)
+{
+    *out = regvm_array_from_const(ctx, b->cpool[idx]);
+    return JS_IsException(*out) ? -1 : 0;
+}
+
+/* `a <sub> b` for a copy: only the cases that run no user code and cannot throw but for out of memory (numbers,
+   a short string with a string or an int). 1 with an owned *out, 0 when it is anything else (the copy then leaves
+   at the instruction, before any effect), -1 on out of memory. */
+int qjs_aot_binary_pure(JSContext *ctx, int sub, JSValue a, JSValue b, JSValue *out)
+{
+    int ta = JS_VALUE_GET_TAG(a), tb = JS_VALUE_GET_TAG(b);
+
+    if (regvm_num_fast(sub, a, b, out))
+        return 1;
+    /* numbers and the primitives that convert without running code */
+    if (sub != REG_BIN_INSTANCEOF && sub != REG_BIN_IN && sub != REG_BIN_PRIVATE_IN &&
+        ((uint32_t)ta <= JS_TAG_UNDEFINED || ta == JS_TAG_FLOAT64)) {
+        if ((uint32_t)tb <= JS_TAG_UNDEFINED || tb == JS_TAG_FLOAT64)
+            return js_regvm_binary(ctx, sub, a, b, out) ? -1 : 1;
+    }
+    if (sub == REG_BIN_ADD)
+        return js_concat_short(ctx, a, b, out);
+    return 0;
+}
+
+/* The same with the right operand from the callee's pool (`kind` REG_CONST_CPOOL) or an atom. */
+int qjs_aot_binary_cpool_pure(JSContext *ctx, JSFunctionBytecode *b, int sub, uint32_t idx,
+                              int kind, JSValue a, JSValue *out)
+{
+    JSValue cst;
+    int r;
+
+    if (kind == REG_CONST_CPOOL)
+        return qjs_aot_binary_pure(ctx, sub, a, b->cpool[idx], out);
+    cst = JS_AtomToValue(ctx, (JSAtom)idx);
+    if (JS_IsException(cst))
+        return -1;
+    r = qjs_aot_binary_pure(ctx, sub, a, cst, out);
+    JS_FreeValue(ctx, cst);
+    return r;
+}
+
 QJS_AOT_STUB void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v)
 {
     set_value(ctx, &vb[slot], js_dup(v));
@@ -69365,6 +71321,45 @@ QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
     *out = JS_GetGlobalVar(ctx, (JSAtom)atom, throwing);
     if (JS_IsException(*out))
         return -1;
+    return 1;
+}
+
+/* Fill the global-read cache cell of `site` for a plain data property of the global object, without running user code or throwing:
+   1 when the site now holds (the caller probes it again), 0 when the global is absent, an accessor, uninitialised or the function has no
+   cache array yet. A compiled loop whose hoisted global read found the cell empty (a process that has not run the site yet) fills it here
+   and goes on, where the miss would hand the rest of the activation to the interpreter. */
+QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int atom)
+{
+    JSValue v;
+    JSObject *p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    int k;
+
+    if (f->pic == NULL)
+        return 0;
+    if (!js_gv_cell_peek(ctx, (JSAtom)atom, &v)) {
+        for (k = 0; k < 2; k++) {
+            p = JS_VALUE_GET_OBJ(k == 0 ? ctx->global_var_obj : ctx->global_obj);
+            if (p->shape->prop_count == 0)
+                continue;
+            prs = find_own_property(&pr, p, (JSAtom)atom);
+            if (prs == NULL)
+                continue;
+            if ((prs->flags & JS_PROP_TMASK) != 0 || JS_IsUninitialized(pr->u.value))
+                return 0;
+            break;
+        }
+        if (k == 2)
+            return 0;
+        v = JS_GetGlobalVar(ctx, (JSAtom)atom, false);
+        if (JS_IsException(v)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            return 0;
+        }
+        JS_FreeValue(ctx, v);
+    }
+    regvm_global_site_fill(ctx, f->b, &f->pic, (JSAtom)atom, site);
     return 1;
 }
 
@@ -69720,6 +71715,13 @@ QJS_AOT_STUB JSValue qjs_aot_deopt(JSContext *ctx, JSRegRun *f, JSValue *fr,
 /* the bound callee (and its C prototype) per runtime.                       */
 /* ------------------------------------------------------------------------ */
 
+/* A function the unit has switched off (its exits crossed the profitability gate) is bound for ever otherwise: each call enters the compiled stub only to
+   deopt, which costs more than the interpreter's own call. Dropping the binding makes its later calls take the interpreter's path. */
+QJS_AOT_STUB void qjs_aot_unbind_fn(JSRegRun *f)
+{
+    js_aot_unbind(f->b);
+}
+
 /* A compiled loop's back edge polls the embedder's interrupt handler here, the
    way every interpreter back edge does, so a compiled `while (true) {}` can
    still be stopped. The counter is the context's own, so a compiled loop and
@@ -69804,9 +71806,49 @@ static void aot_site_store(JSRuntime *rt, JSAotSite *e, int kind, JSValue v,
 static JSValue regvm_aot_run_to_end(JSContext *ctx, JSRegRun *f, JSValue *fr,
                                     uint32_t pc)
 {
+    JSFunctionBytecode *b = f->b;
+    JSRegRun tmp;
+    uint8_t *ip;
+
     ctx->rt->regvm_cur = f;
-    regvm_t_dispatch(f->b->regvm_code + pc, fr, f, f->b->realm);
-    return f->ret;
+    if (likely(b->aot_light || b->regvm_light)) {
+        regvm_t_dispatch(b->regvm_code + pc, fr, f, b->realm);
+        return f->ret;
+    }
+    /* The code is not light-safe (closure variables, arguments, control records, an instruction only the monolith runs): the
+       monolith's handlers read the frame's JSStackFrame, which a light frame does not have. Step it, as the generated
+       generic body does for the instructions it does not lower: each step runs on the frame and needs no JSStackFrame. */
+    /* The steps read the record-only tail of the frame for the arguments (`rf->argv`) and `new.target`: a light frame ends after the
+       header prefix. Step on a copy of the prefix that has a tail (the registers, the variable area and the arguments stay where
+       they are). */
+    memset(&tmp, 0, sizeof(tmp));
+    memcpy(&tmp, f, REGVM_LIGHT_PREFIX_BYTES);
+    tmp.ctx = b->realm;
+    tmp.caller_ctx = ctx;
+    tmp.new_target = JS_UNDEFINED;
+    tmp.argv = f->arg_buf;
+    tmp.deopt_pc = QJS_AOT_NO_DEOPT;
+    ctx->rt->regvm_cur = &tmp;
+    ip = b->regvm_code + pc;
+    for (;;) {
+        uint8_t *nip;
+
+        tmp.cap_ip = ip;
+        nip = regvm_step(ip, fr, &tmp, b->realm);
+        if (nip == NULL) {
+            if (needs_backtrace(ctx->rt->current_exception))
+                build_backtrace(ctx, ctx->rt->current_exception, JS_UNDEFINED, NULL, 0, 0, 0);
+            ctx->rt->regvm_cur = f;
+            return JS_EXCEPTION;
+        }
+        if (nip == REGVM_COLD_RET) {
+            ctx->rt->regvm_cur = f;
+            if (unlikely(JS_IsException(tmp.ret)) && needs_backtrace(ctx->rt->current_exception))
+                build_backtrace(ctx, ctx->rt->current_exception, JS_UNDEFINED, NULL, 0, 0, 0);
+            return tmp.ret;
+        }
+        ip = nip;
+    }
 }
 
 static __attribute__((always_inline)) inline void regvm_light_free(
@@ -69859,8 +71901,22 @@ aot_call_light_impl(JSContext *ctx, JSRegRun *caller_f, int na,
        it implies are kept either way. */
     if (cb->aot_fn == NULL || !(cb->aot_light || cb->aot_nfn != NULL))
         return 0;
-    if (cb->func_kind != JS_FUNC_NORMAL || na < cb->arg_count)
+    if (cb->func_kind != JS_FUNC_NORMAL)
         return 0;
+    /* A call with fewer arguments than the callee declares: the compiled body reads the declared ones, so the window is
+       extended with undefined in a copy (the callee's `arguments` and `.length` still see `na`). Without this the call took
+       JS_CallInternal, js_regvm_execute and the compiled entry: 1.3x the cost of the interpreter's own call (aot_bench call.arity). */
+    JSValue padded[16];
+    if (unlikely(na < cb->arg_count)) {
+        int i;
+        if (cb->arg_count > 16)
+            return 0;
+        for (i = 0; i < na; i++)
+            padded[i] = argv[i];
+        for (; i < cb->arg_count; i++)
+            padded[i] = JS_UNDEFINED;
+        argv = padded;
+    }
     if (unlikely(js_poll_interrupts(ctx)))
         return -1;
     if (cb->aot_nfn != NULL) {
@@ -69940,6 +71996,10 @@ aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
     int slots = regvm_args_borrowable(cb, argc) ? 0
         : (argc > cb->arg_count ? argc : cb->arg_count);
 
+    /* an exit continues in the interpreter on this record, and the threaded interpreter cannot run every instruction of a
+       function that is not all-threaded: that function takes the full activation, whose monolith resumes at any pc */
+    if (unlikely(!cb->regvm_all_threaded))
+        return 0;
     /* the C stack the compiled body and its callees will use, as JS_CallInternal checks */
     if (js_check_stack_overflow(rt, sizeof(JSValue) * (size_t)(cb->var_count +
                                     regvm_frame_regs(cb) + REGVM_HS) + 1024)) {
@@ -69952,6 +72012,9 @@ aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
         return -1;
     }
     regvm_light_seal(rt, rt->regvm_cur);
+    /* a compiled caller recursing through here never reaches the interpreter's call safepoint: reconcile
+       the parked values (and the closure cycles waiting for a reconcile) before the record is taken */
+    js_drc_safepoint(rt);
     if (unlikely(regvm_record_alloc(rt, cb, slots, &lay) != 0))
         return 0;
     regvm_record_fill(rt, &lay, JS_MKPTR(JS_TAG_OBJECT, co), co, cb, NULL, 0, NULL,
@@ -69977,6 +72040,9 @@ aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
             JS_ThrowInternalError(cb->realm, "compiled function cannot be resumed");
             ret = JS_EXCEPTION;
         } else {
+            /* the record has no caller: a return from the interpreter leaves through regvm_t_return_common
+               (NULL), never through the trivial path, which moves the value into `caller`'s register */
+            rec->flags &= ~REGVM_FLAG_TRIVIAL_RET;
             regvm_t_dispatch(cb->regvm_code + pc, rec->fr, rec, cb->realm);
             ret = rec->ret;
         }
@@ -70261,6 +72327,58 @@ static inline bool aot_lean_args(const JSValue *argv, int na)
     return true;
 }
 
+/* A call from compiled code to a generic or generic_magic C function, with the stack frame the
+   function's backtrace line and a nested JS call need and nothing else: js_call_c_function's
+   alloca, per-prototype switch and constructor handling cost a compiled loop that makes only
+   plain calls more than the call itself (call.host: 2.3x). A short argument list is padded
+   with undefined up to the declared length in a small stack array; a declared length above
+   that, or a function the generic path must handle, takes js_call_c_function. */
+static JSValue aot_call_c_frame(JSContext *ctx, JSValueConst callee, JSObject *p,
+                                JSValueConst this_obj, int na, JSValueConst *argv)
+{
+    JSRuntime *rt = ctx->rt;
+    JSStackFrame sf_s, *sf = &sf_s;
+    JSValueConst padded[8];
+    JSValueConst *av = argv;
+    JSContext *rctx = p->u.cfunc.realm;
+    int len = p->u.cfunc.length, ac = na;
+    JSValue ret;
+
+    if (unlikely(na < len)) {
+        int k;
+
+        if (len > 8)
+            return js_call_c_function(ctx, callee, this_obj, na, argv, 0);
+        for (k = 0; k < na; k++)
+            padded[k] = argv[k];
+        for (; k < len; k++)
+            padded[k] = JS_UNDEFINED;
+        av = padded;
+        ac = len;
+    }
+    if (js_check_stack_overflow(rt, sizeof(JSValue) * len))
+        return JS_ThrowStackOverflow(ctx);
+    sf->prev_frame = rt->current_stack_frame;
+    regvm_light_seal(rt, rt->regvm_cur);
+    sf->rv_light = rt->regvm_cur;
+    sf->rv_rec = NULL;
+    rt->regvm_cur = NULL;
+    REGVM_SET_ROOT(sf, NULL, 0);
+    rt->current_stack_frame = sf;
+    sf->is_strict_mode = false;
+    sf->is_constructor = false;
+    sf->cur_func = unsafe_unconst(callee);
+    sf->arg_count = ac;
+    sf->arg_buf = (JSValue *)av;
+    if (p->u.cfunc.cproto == JS_CFUNC_generic)
+        ret = p->u.cfunc.c_function.generic(rctx, this_obj, na, av);
+    else
+        ret = p->u.cfunc.c_function.generic_magic(rctx, this_obj, na, av, p->u.cfunc.magic);
+    rt->regvm_cur = sf->rv_light;
+    rt->current_stack_frame = sf->prev_frame;
+    return ret;
+}
+
 /* The specialised C-call path for `callee(this, argv[0..na-1])`. `cproto` is
    the C prototype the profile saw (-1 = any). Returns 1 with *out, 0 to fall
    back, -1 on exception. The f_f / f_f_f paths call the bound pointer, so the
@@ -70345,10 +72463,40 @@ QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JS
                 return 1;
             }
         }
-        rv = js_call_c_function(ctx, callee, this_obj, na, argv, 0);
+        rv = aot_call_c_frame(ctx, callee, p, this_obj, na, argv);
         if (JS_IsException(rv))
             return -1;
         *out = rv;
+        return 1;
+    }
+    /* A math builtin of the one-double or two-double form is called through the pointer its own function object holds, so a site that sees
+       several of them (Math.abs then Math.sqrt) binds nothing and re-stores nothing per call: the identity is the object's. */
+    if (p->u.cfunc.cproto == JS_CFUNC_f_f && na == 1 && p->u.cfunc.realm == ctx
+#ifndef AOT_MUT_SKIP_CALLEE_GUARD
+        && (cproto < 0 || cproto == JS_CFUNC_f_f)
+#endif
+        ) {
+        double d1;
+
+        if (JS_ToFloat64(ctx, &d1, argv[0]))
+            return -1;
+        if (js_poll_interrupts(ctx))
+            return -1;
+        *out = js_number(p->u.cfunc.c_function.f_f(d1));
+        return 1;
+    }
+    if (p->u.cfunc.cproto == JS_CFUNC_f_f_f && na == 2 && p->u.cfunc.realm == ctx
+#ifndef AOT_MUT_SKIP_CALLEE_GUARD
+        && (cproto < 0 || cproto == JS_CFUNC_f_f_f)
+#endif
+        ) {
+        double d1, d2;
+
+        if (JS_ToFloat64(ctx, &d1, argv[0]) || JS_ToFloat64(ctx, &d2, argv[1]))
+            return -1;
+        if (js_poll_interrupts(ctx))
+            return -1;
+        *out = js_number(p->u.cfunc.c_function.f_f_f(d1, d2));
         return 1;
     }
     if (!aot_site_ensure(rt, (uint32_t)site))
@@ -70404,7 +72552,7 @@ QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JS
         } else
 #endif
         {
-            rv = js_call_c_function(ctx, callee, this_obj, na, argv, 0);
+            rv = aot_call_c_frame(ctx, callee, p, this_obj, na, argv);
         }
         if (JS_IsException(rv))
             return -1;
@@ -73799,7 +75947,7 @@ static void regvm_fuse_branches(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
 
             /* the compare's result must be this branch's only reader */
             if (d < 0 || d >= n_values || nref[d] != 2 ||
-                prev->ops[0] != d)
+                prev->n_ops < 2 || prev->ops[0] != d)
                 continue;
             sub = prev->ops[1];
             if (sub < 0 || sub > 0x3f)
@@ -81443,6 +83591,10 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
         js_free_shape(rt, b->ctor_fn_shape);
         b->ctor_fn_shape = NULL;
     }
+    if (b->ctor_final_shape) {
+        js_free_shape(rt, b->ctor_final_shape);
+        b->ctor_final_shape = NULL;
+    }
     for (i = 0; i < 4; i++) {
         if (b->ctor_inst_shape[i]) {
             js_free_shape(rt, b->ctor_inst_shape[i]);
@@ -81734,6 +83886,8 @@ static __exception int js_parse_function_decl2(JSParseState *s,
 {
     JSContext *ctx = s->ctx;
     JSFunctionDef *fd = s->cur_func;
+    JSFunctionDef *lift_q = fd;   /* the function the source places this one in */
+    int lift_fi = -1;
     bool is_expr;
     int func_idx, lexical_func_idx = -1;
     bool has_opt_arg;
@@ -81842,8 +83996,25 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         }
     }
 
-    fd = js_new_function_def(ctx, fd, false, is_expr, s->filename,
-                             function_line_num, function_col_num);
+    {
+        int ord = -1;
+        JSFunctionDef *lift_parent = fd;
+        if (s->lift_mode) {
+            ord = s->lift_fn_seq++;
+            if (s->lift_mode == 2 && func_type == JS_PARSE_FUNC_EXPR) {
+                lift_fi = lift_find_fn(s->lift_plan, ord);
+                if (lift_fi >= 0)
+                    lift_parent = lift_q->parent;
+            }
+        }
+        fd = js_new_function_def(ctx, lift_parent, false, is_expr, s->filename,
+                                 function_line_num, function_col_num);
+        if (fd) {
+            fd->lift_ord = ord;
+            if (lift_fi >= 0)
+                fd->is_strict_mode = lift_q->is_strict_mode;
+        }
+    }
     if (!fd) {
         JS_FreeAtom(ctx, func_name);
         return -1;
@@ -82063,6 +84234,14 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         }
     }
 
+    if (lift_fi >= 0) {
+        LiftPlanFn *pf = &s->lift_plan->fn[lift_fi];
+        int k;
+        for (k = 0; k < pf->nextra; k++)
+            if (add_arg(ctx, fd, pf->extra[k]) < 0)
+                goto fail;
+    }
+
     if (fd->has_parameter_expressions) {
         int idx;
 
@@ -82207,7 +84386,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         }
     }
 done:
-    s->cur_func = fd->parent;
+    s->cur_func = lift_q;
 
     /* Reparse identifiers after the function is terminated so that
        the token is parsed in the englobing function. It could be done
@@ -82221,8 +84400,21 @@ done:
         JSAtom func_name = fd->func_name;
 
         /* the real object will be set at the end of the compilation */
+        if (lift_fi >= 0)
+            s->cur_func = fd->parent;
         idx = cpool_add(s, JS_NULL);
         fd->parent_cpool_idx = idx;
+        if (lift_fi >= 0) {
+            /* the lifted function is created next to its creator's parent;
+               the expression itself evaluates to undefined */
+            if (lift_emit_hoist(s, idx, &s->lift_plan->fn[lift_fi])) {
+                s->cur_func = lift_q;
+                goto fail;
+            }
+            s->cur_func = lift_q;
+            emit_op(s, OP_undefined);
+            return 0;
+        }
 
         if (is_expr) {
             /* for constructors, no code needs to be generated here */
@@ -82318,7 +84510,7 @@ done:
     }
     return 0;
  fail:
-    s->cur_func = fd->parent;
+    s->cur_func = lift_q;
     js_free_function_def(ctx, fd);
     if (pfd)
         *pfd = NULL;
@@ -82516,6 +84708,9 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     JSFunctionDef *fd;
     JSModuleDef *m;
     bool is_strict_mode;
+    LiftPlan *lift_plan = NULL;
+    int lift_phase = 0;
+    bool lift_again = false;
 
     js_parse_init(ctx, s, input, input_len, filename, line);
     skip_shebang(&s->buf_ptr, s->buf_end);
@@ -82547,10 +84742,20 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
             is_strict_mode = true;
         }
     }
+    if (eval_type == JS_EVAL_TYPE_GLOBAL && !(flags & JS_EVAL_FLAG_ASYNC) && lift_enabled())
+        lift_phase = 1;
+ retry_parse:
+    if (lift_again) {
+        js_parse_init(ctx, s, input, input_len, filename, line);
+        skip_shebang(&s->buf_ptr, s->buf_end);
+        lift_again = false;
+    }
     fd = js_new_function_def(ctx, NULL, true, false, filename, line, 1);
     if (!fd)
         goto fail1;
     s->cur_func = fd;
+    s->lift_mode = lift_phase;
+    s->lift_plan = lift_plan;
     fd->eval_type = eval_type;
     fd->has_this_binding = (eval_type != JS_EVAL_TYPE_DIRECT);
     fd->backtrace_barrier = ((flags & JS_EVAL_FLAG_BACKTRACE_BARRIER) != 0);
@@ -82584,11 +84789,36 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
 
     err = js_parse_program(s);
     if (err) {
+        if (lift_phase == 2) {
+            /* the plan did not apply: compile without it */
+            free_token(s, &s->token);
+            js_free_function_def(ctx, fd);
+            lift_plan_free(ctx, lift_plan);
+            lift_plan = NULL;
+            lift_phase = 0;
+            lift_again = true;
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            goto retry_parse;
+        }
     fail:
         free_token(s, &s->token);
         js_free_function_def(ctx, fd);
+        lift_plan_free(ctx, lift_plan);
         goto fail1;
     }
+    if (lift_phase == 1) {
+        LiftPlan *plan = lift_analyze(ctx, fd, s->lift_call_seq);
+        if (plan) {
+            free_token(s, &s->token);
+            js_free_function_def(ctx, fd);
+            lift_plan = plan;
+            lift_phase = 2;
+            lift_again = true;
+            goto retry_parse;
+        }
+    }
+    lift_plan_free(ctx, lift_plan);
+    lift_plan = NULL;
 
     if (m != NULL)
         m->has_tla = fd->has_await;
@@ -83827,7 +86057,8 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
 #if QJS_REGVM
     /* The register program. A refused function is written as "not compiled",
        which the flag keeps distinct from an empty program. */
-    bc_put_u8(s, b->regvm_compiled ? 1 : 0);
+    /* Bit 0 is the flag; the other bits carry the compiler's variable area plus one (0: not recorded, the reader derives it). */
+    bc_put_u8(s, !b->regvm_compiled ? 0 : b->var_count <= 126 ? (uint8_t)(1 | ((b->regvm_var_count + 1) << 1)) : 1);
     if (b->regvm_compiled) {
         bc_put_u8(s, REGVM_FORMAT_VERSION);
         bc_put_leb128(s, b->regvm_reg_count);
@@ -84580,13 +86811,15 @@ static int bc_get_leb128_int(BCReaderState *s, int *pval)
     return bc_get_leb128(s, (uint32_t *)pval);
 }
 
-/* An entry count: a value that does not fit an int is not one any writer produced. */
-static int bc_get_leb128_count(BCReaderState *s, int *pval)
+/* An entry count: a value that does not fit an int is not one any writer produced, and neither is one the rest of the input cannot hold:
+   every entry takes at least `min_bytes` bytes, so a count above (bytes left / min_bytes) is rejected before the table for it is allocated
+   (a 19-byte blob declaring INT32_MAX entries used to make the loader touch gigabytes before it failed). */
+static int bc_get_leb128_count_n(BCReaderState *s, int *pval, size_t min_bytes)
 {
     uint32_t val;
     if (bc_get_leb128(s, &val))
         return -1;
-    if (val > INT32_MAX) {
+    if (val > INT32_MAX || (size_t)val > (size_t)(s->buf_end - s->ptr) / min_bytes) {
         JS_ThrowSyntaxError(s->ctx, "invalid count");
         return -1;
     }
@@ -84852,6 +87085,18 @@ static int bc_get_atom(BCReaderState *s, JSAtom *patom)
     }
 }
 
+/* An atom that names a module or one of its imports and exports: JS_ATOM_NULL names nothing, and the writer never emits it. */
+static int bc_get_name_atom(BCReaderState *s, JSAtom *patom)
+{
+    if (bc_get_atom(s, patom))
+        return -1;
+    if (unlikely(*patom == JS_ATOM_NULL)) {
+        JS_ThrowSyntaxError(s->ctx, "invalid module name atom");
+        return -1;
+    }
+    return 0;
+}
+
 #if QJS_REGVM
 /* ULEB128 from a wire buffer, bounded by `end`. A value longer than 32 bits is
    an error, and so is running off the end. */
@@ -84932,6 +87177,12 @@ static bool regvm_slot_operands_ok(const JSFunctionBytecode *b, int op,
     case ROP_put_local_s0: case ROP_put_local_s1:
     case ROP_put_local_s2: case ROP_put_local_s3:
         slot = op - ROP_put_local_s0; bound = b->var_count; break;
+    case ROP_put_local_xfer_s0: case ROP_put_local_xfer_s1:
+    case ROP_put_local_xfer_s2: case ROP_put_local_xfer_s3:
+        slot = op - ROP_put_local_xfer_s0; bound = b->var_count; break;
+    case ROP_get_local_field_0: case ROP_get_local_field_1:
+    case ROP_get_local_field_2: case ROP_get_local_field_3:
+        slot = op - ROP_get_local_field_0; bound = b->var_count; break;
     case ROP_get_arg:
         slot = ops[1]; bound = b->arg_count; break;
     case ROP_put_arg:
@@ -84997,6 +87248,98 @@ static bool regvm_slot_operands_ok(const JSFunctionBytecode *b, int op,
     return true;
 }
 
+/* The highest variable (var_buf) slot an instruction names, or -1. Mirrors the variable cases of regvm_slot_operands_ok: a slot the program
+   names is a slot the frame must fill and release. INT_MAX means "unknown": direct eval reads variables by name. */
+static int regvm_var_slot_hi(int op, const int32_t *ops)
+{
+    int hi = -1, t;
+    switch (op) {
+    case ROP_get_local: case ROP_get_arg_el: case ROP_get_local_field:
+    case ROP_local_rmw_imm: case ROP_local_rmw_branch:
+        hi = ops[1]; break;
+    case ROP_put_local: case ROP_local_check: case ROP_local_check_init:
+    case ROP_local_uninit: case ROP_close_local: case ROP_put_local_xfer:
+        hi = ops[0]; break;
+    case ROP_get_local_s0: case ROP_get_local_s1: case ROP_get_local_s2: case ROP_get_local_s3:
+        hi = op - ROP_get_local_s0; break;
+    case ROP_put_local_s0: case ROP_put_local_s1: case ROP_put_local_s2: case ROP_put_local_s3:
+        hi = op - ROP_put_local_s0; break;
+    case ROP_put_local_xfer_s0: case ROP_put_local_xfer_s1: case ROP_put_local_xfer_s2: case ROP_put_local_xfer_s3:
+        hi = op - ROP_put_local_xfer_s0; break;
+    case ROP_get_local_field_0: case ROP_get_local_field_1: case ROP_get_local_field_2: case ROP_get_local_field_3:
+        hi = op - ROP_get_local_field_0; break;
+    case ROP_make_local_ref:
+        hi = ops[4] == 0 ? ops[3] : -1; break;
+    case ROP_using_dispose: hi = ops[2] + 1; break;
+    case ROP_using_dispose_async: hi = ops[1] + 1; break;
+    case ROP_binary_loc_reg: hi = ops[2]; break;
+    case ROP_binary_reg_loc: hi = ops[3]; break;
+    case ROP_binary_loc_loc: hi = ops[2] > ops[3] ? ops[2] : ops[3]; break;
+    case ROP_branch_cmp_loc_reg: hi = ops[1]; break;
+    case ROP_branch_cmp_reg_loc: hi = ops[2]; break;
+    case ROP_branch_cmp_loc_loc: hi = ops[1] > ops[2] ? ops[1] : ops[2]; break;
+    case ROP_eval: case ROP_apply_eval:
+        return INT_MAX;
+    default:
+        break;
+    }
+    t = hi;
+    return t;
+}
+
+/* The variable slots a blob function's frame must fill and release (`regvm_var_count`): the compiler's promotion map is not serialized, but the
+   slots that are not promoted are exactly the ones the program names, the `arguments` variable, and the ones an inner closure captures (a
+   captured local is never promoted, and only the capturing child names it). `var_hi` is the highest slot the program names. A direct eval, or more than 255 slots,
+   keeps all of `var_count`. */
+static uint8_t regvm_blob_var_count(const JSFunctionBytecode *b, int var_hi, bool with_arguments)
+{
+    int vc = var_hi == INT_MAX ? b->var_count : var_hi + 1, i, k;
+    if (b->var_count > 255)
+        return 255;
+    /* The `arguments` variable is never promoted: the compiler counts its slot even when the program no longer names it (an elided
+       `arguments.length` / `arguments[i]`). Only the derivation without a recorded value needs it; it is not something the program reads. */
+    if (with_arguments && b->vardefs)
+        for (i = 0; i < b->var_count; i++)
+            if (b->vardefs[b->arg_count + i].var_name == JS_ATOM_arguments && i + 1 > vc)
+                vc = i + 1;
+    for (i = 0; i < b->cpool_count && vc < b->var_count; i++) {
+        const JSFunctionBytecode *c;
+        if (JS_VALUE_GET_TAG(b->cpool[i]) != JS_TAG_FUNCTION_BYTECODE)
+            continue;
+        c = JS_VALUE_GET_PTR(b->cpool[i]);
+        for (k = 0; k < c->closure_var_count; k++)
+            if (c->closure_var[k].closure_type == JS_CLOSURE_LOCAL && (int)c->closure_var[k].var_idx + 1 > vc)
+                vc = (int)c->closure_var[k].var_idx + 1;
+    }
+    if (vc > b->var_count)
+        vc = b->var_count;
+    return (uint8_t)(vc < 0 ? 0 : vc);
+}
+
+#if QJS_REGVM
+/* Test hook (tests/bytecode_test.cpp, F52): `regvm_var_count` of the `child`-th function in the constant pool of the function bytecode `fn`
+   (counting only function entries), or -1. Lets a test compare a function compiled from source with the same function read from a blob. */
+int JS_TestRegvmVarCountOfChild(JSContext *ctx, JSValueConst fn, int child);
+int JS_TestRegvmVarCountOfChild(JSContext *ctx, JSValueConst fn, int child)
+{
+    const JSFunctionBytecode *b;
+    int i, n = 0;
+    (void)ctx;
+    if (JS_VALUE_GET_TAG(fn) != JS_TAG_FUNCTION_BYTECODE)
+        return -1;
+    b = JS_VALUE_GET_PTR(fn);
+    for (i = 0; i < b->cpool_count; i++) {
+        if (JS_VALUE_GET_TAG(b->cpool[i]) != JS_TAG_FUNCTION_BYTECODE)
+            continue;
+        if (n++ == child) {
+            const JSFunctionBytecode *c = JS_VALUE_GET_PTR(b->cpool[i]);
+            return c->regvm_compiled ? (int)c->regvm_var_count : -1;
+        }
+    }
+    return -1;
+}
+#endif
+
 /* wire -> exec, in one pass: decode into b->regvm_code (exec_len bytes),
    interning atoms, range-checking operands, marking instruction starts,
    collecting branch targets, and computing args_captured / argv_safe. On
@@ -85015,6 +87358,7 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
     int *targets = NULL;
     int exec = 0, n_targets = 0, n_atoms = 0, rc = -1, i;
     bool argv_safe = true, args_captured = false;
+    int var_hi = -1;
 #if QJS_REGVM_THREAD
     bool all_threaded = true;
 #endif
@@ -85166,7 +87510,11 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
                         goto fail_ins;
                     }
                 } else if (fmt[m] == 's') {
-                    if (sv < 0 || (uint32_t)sv >= b->regvm_pic_count) {
+                    /* The baseline tier names REG_IC_NONE for every property
+                       site and has no site table (pic_count 0); it is the only
+                       writer of that value. */
+                    if (!(sv == (int32_t)REG_IC_NONE && b->regvm_pic_count == 0) &&
+                        (sv < 0 || (uint32_t)sv >= b->regvm_pic_count)) {
                         JS_ThrowSyntaxError(ctx, "register PIC site out of range");
                         goto fail_ins;
                     }
@@ -85189,6 +87537,11 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
         if (!regvm_slot_operands_ok(b, op, ops)) {
             JS_ThrowSyntaxError(ctx, "register slot out of range");
             goto fail_ins;
+        }
+        {
+            int vh = regvm_var_slot_hi(op, ops);
+            if (vh > var_hi)
+                var_hi = vh;
         }
         if (regvm_op_writes_args(op))
             argv_safe = false;
@@ -85264,9 +87617,22 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
     if (args_captured)
         b->args_captured = 1;
     b->argv_safe = argv_safe ? 1 : 0;
-    /* The promotion map is compile-time only, so a blob function keeps
-       `var_count`, clamped to the one-byte field. */
-    b->regvm_var_count = b->var_count > 255 ? 255 : (uint8_t)b->var_count;
+    /* The promotion map is compile-time only: derive the variable area from what the program and the inner closures name (F52). */
+    {
+        /* `regvm_var_count` holds the writer's value plus one (0: not recorded) until here. A recorded value is the compiler's own; it is accepted
+           when it covers every slot the program names and every slot an inner closure captures and fits `var_count`, so a hostile blob cannot
+           shrink the area below what the program uses. */
+        const int wire_vc = b->regvm_var_count;
+        const int need = regvm_blob_var_count(b, var_hi, false);
+        if (wire_vc == 0) {
+            b->regvm_var_count = regvm_blob_var_count(b, var_hi, true);
+        } else if (wire_vc - 1 < need || wire_vc - 1 > b->var_count) {
+            JS_ThrowSyntaxError(ctx, "invalid register variable area");
+            goto fail;
+        } else {
+            b->regvm_var_count = (uint8_t)(wire_vc - 1);
+        }
+    }
 #if QJS_REGVM_THREAD
     b->regvm_all_threaded = all_threaded;
 #endif
@@ -85428,6 +87794,10 @@ static JSValue JS_ReadBigInt(BCReaderState *s)
         /* zero case */
         bc_read_trace(s, "}\n");
         return __JS_NewShortBigInt(s->ctx, 0);
+    }
+    if (len > (size_t)(s->buf_end - s->ptr)) {   /* the limbs are in the input: reject before allocating for them */
+        bc_read_error_end(s);
+        goto fail;
     }
     p = js_bigint_new(s->ctx, (len - 1) / (JS_LIMB_BITS / 8) + 1);
     if (!p)
@@ -85700,7 +88070,8 @@ static int regvm_validate_code(JSContext *ctx, const JSFunctionBytecode *b)
                     goto done;
                 }
             } else if (fmt[m] == 's') {
-                if (v < 0 || (uint32_t)v >= b->regvm_pic_count) {
+                if (!(v == (int32_t)REG_IC_NONE && b->regvm_pic_count == 0) &&
+                    (v < 0 || (uint32_t)v >= b->regvm_pic_count)) {
                     JS_ThrowSyntaxError(ctx, "register PIC site out of range");
                     goto done;
                 }
@@ -86060,6 +88431,14 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         goto fail;
     if (bc_get_leb128_int(s, &bc.byte_code_len))
         goto fail;
+    /* The function object is allocated for these sizes before its body is read: a pool entry takes at least a byte of the input, and the
+       bytecode is at most the 16x expansion the register program check below allows. */
+    if (bc.cpool_count < 0 || bc.byte_code_len < 0 ||
+        (size_t)bc.cpool_count > (size_t)(s->buf_end - s->ptr) ||
+        (size_t)bc.byte_code_len > (size_t)(s->buf_end - s->ptr) * 16) {
+        JS_ThrowSyntaxError(ctx, "invalid function sizes");
+        goto fail;
+    }
     {
         uint32_t ic_count;
         if (bc_get_leb128(s, &ic_count))
@@ -86092,6 +88471,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         uint8_t compiled;
         if (bc_get_u8(s, &compiled))
             goto fail;
+        bc.regvm_var_count = compiled >> 1;   /* the writer's variable area plus one, 0 if not recorded: regvm_wire_decode checks it */
         if (!compiled) {
             /* No stack interpreter can run a function without a register
                program, so reject the blob at load. */
@@ -86315,7 +88695,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
     int i;
     uint8_t v8;
 
-    if (bc_get_atom(s, &module_name))
+    if (bc_get_name_atom(s, &module_name))
         goto fail;
 #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
     if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
@@ -86329,7 +88709,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
     if (!m)
         goto fail;
     obj = js_dup(JS_MKPTR(JS_TAG_MODULE, m));
-    if (bc_get_leb128_count(s, &rd_cnt))
+    if (bc_get_leb128_count_n(s, &rd_cnt, 1))
         goto fail;
     obj = JS_NewModuleValue(ctx, m);
     if (rd_cnt != 0) {
@@ -86342,7 +88722,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
             JSReqModuleEntry *rme = &m->req_module_entries[i];
             JSModuleDef **pm = &rme->module;
             rme->attributes = JS_UNDEFINED;
-            if (bc_get_atom(s, &rme->module_name))
+            if (bc_get_name_atom(s, &rme->module_name))
                 goto fail;
             // Resolves a module either from the cache or by requesting
             // it from the module loader. From cache is not ideal because
@@ -86360,7 +88740,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
         }
     }
 
-    if (bc_get_leb128_count(s, &rd_cnt))
+    if (bc_get_leb128_count_n(s, &rd_cnt, 3))
         goto fail;
     if (rd_cnt != 0) {
         m->export_entries_size = rd_cnt;
@@ -86381,15 +88761,15 @@ static JSValue JS_ReadModule(BCReaderState *s)
                     goto fail;
                 if ((uint32_t)me->u.req_module_idx >= (uint32_t)m->req_module_entries_count)
                     goto fail_index;
-                if (bc_get_atom(s, &me->local_name))
+                if (bc_get_name_atom(s, &me->local_name))
                     goto fail;
             }
-            if (bc_get_atom(s, &me->export_name))
+            if (bc_get_name_atom(s, &me->export_name))
                 goto fail;
         }
     }
 
-    if (bc_get_leb128_count(s, &rd_cnt))
+    if (bc_get_leb128_count_n(s, &rd_cnt, 1))
         goto fail;
     if (rd_cnt != 0) {
         m->star_export_entries_size = rd_cnt;
@@ -86406,7 +88786,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
         }
     }
 
-    if (bc_get_leb128_count(s, &rd_cnt))
+    if (bc_get_leb128_count_n(s, &rd_cnt, 3))
         goto fail;
     if (rd_cnt != 0) {
         m->import_entries_size = rd_cnt;
@@ -86418,7 +88798,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
             JSImportEntry *mi = &m->import_entries[i];
             if (bc_get_leb128_int(s, &mi->var_idx))
                 goto fail;
-            if (bc_get_atom(s, &mi->import_name))
+            if (bc_get_name_atom(s, &mi->import_name))
                 goto fail;
             if (bc_get_leb128_int(s, &mi->req_module_idx))
                 goto fail;
@@ -86946,6 +89326,11 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
     if (s->idx_to_atom_count > 1000*1000) {
         JS_ThrowInternalError(s->ctx, "unreasonable atom count: %u",
                               s->idx_to_atom_count);
+        return -1;
+    }
+    /* each atom entry takes at least one byte of the input */
+    if (s->idx_to_atom_count > (size_t)(s->buf_end - s->ptr)) {
+        JS_ThrowSyntaxError(s->ctx, "invalid count");
         return -1;
     }
 

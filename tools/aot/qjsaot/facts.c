@@ -87,6 +87,7 @@ int qjs_aot_prof_site_proto2(const uint8_t dg[16], int site);
 int qjs_aot_prof_unexecuted(const uint8_t dg[16], int pc);
 int qjs_aot_coldcopy_off(void);
 unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
+int qjs_aot_prof_pc_hot(const uint8_t dg[16], int pc);
 unsigned long long qjs_aot_prof_entries(const uint8_t dg[16]);
 unsigned long long qjs_aot_prof_site_calls(const uint8_t dg[16], int next_pc);
 
@@ -427,12 +428,18 @@ typedef struct Access {
   int fwd_ok;    /* the whole instruction is this one location's load */
 } Access;
 
+/* The location of an argument, local, closure cell or `this` read by an instruction of an inlined COPY is the CALLEE's, not the
+   root's: a copy's `get_var_ref 0` reads the callee closure's cell 0, a different variable from the root's cell 0 (the key
+   was the slot alone, so the second read took the first's value: octane typescript called the wrong function). The key's
+   spare field holds the owning copy (`in->own`, 0 for the root). A store still kills by slot over every owner, which only
+   over-kills. */
 static int insn_load(const Q2Insn *in, Access *a) {
   memset(a, 0, sizeof(*a));
   switch (in->rop) {
     case ROP_get_arg:
       a->kind = E_K_ARG;
       a->key.kind = E_K_ARG;
+      a->key.b = in->own;
       a->key.a = in->narg > 1 ? in->arg[1].val : -1;
       break;
     case ROP_get_arg2:
@@ -442,6 +449,7 @@ static int insn_load(const Q2Insn *in, Access *a) {
     case ROP_get_local:
       a->kind = E_K_LOCAL;
       a->key.kind = E_K_LOCAL;
+      a->key.b = in->own;
       a->key.a = in->narg > 1 ? in->arg[1].val : -1;
       break;
     case ROP_get_local_s0:
@@ -450,11 +458,13 @@ static int insn_load(const Q2Insn *in, Access *a) {
     case ROP_get_local_s3:
       a->kind = E_K_LOCAL;
       a->key.kind = E_K_LOCAL;
+      a->key.b = in->own;
       a->key.a = in->rop - ROP_get_local_s0;
       break;
     case ROP_get_var_ref:
       a->kind = E_K_VARREF;
       a->key.kind = E_K_VARREF;
+      a->key.b = in->own;
       a->key.a = in->narg > 1 ? in->arg[1].val : -1;
       break;
     case ROP_get_global: {
@@ -467,6 +477,7 @@ static int insn_load(const Q2Insn *in, Access *a) {
     case ROP_load_this:
       a->kind = E_K_THIS;
       a->key.kind = E_K_THIS;
+      a->key.b = in->own;
       break;
     case ROP_get_element: {
       Q2ValueId obj = regval(in, 1), idx = regval(in, 2);
@@ -514,6 +525,7 @@ static int insn_store(const Q2Insn *in, Access *a) {
     case ROP_put_arg_xfer:
       a->kind = E_K_ARG;
       a->key.kind = E_K_ARG;
+      a->key.b = in->own;
       a->key.a = in->narg > 0 ? in->arg[0].val : -1;
       a->val = regval(in, 1);
       break;
@@ -521,6 +533,7 @@ static int insn_store(const Q2Insn *in, Access *a) {
     case ROP_put_local_xfer:
       a->kind = E_K_LOCAL;
       a->key.kind = E_K_LOCAL;
+      a->key.b = in->own;
       a->key.a = in->narg > 0 ? in->arg[0].val : -1;
       a->val = regval(in, 1);
       break;
@@ -530,12 +543,14 @@ static int insn_store(const Q2Insn *in, Access *a) {
     case ROP_put_local_s3:
       a->kind = E_K_LOCAL;
       a->key.kind = E_K_LOCAL;
+      a->key.b = in->own;
       a->key.a = in->rop - ROP_put_local_s0;
       a->val = regval(in, 0);
       break;
     case ROP_put_var_ref:
       a->kind = E_K_VARREF;
       a->key.kind = E_K_VARREF;
+      a->key.b = in->own;
       a->key.a = in->narg > 0 ? in->arg[0].val : -1;
       a->val = regval(in, 1);
       break;
@@ -615,7 +630,7 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
       {
         Access stw;
         sites[n].write = insn_store(in, &stw) && stw.kind == E_K_FIELD;
-        sites[n].hot = !in->own && qjs_aot_prof_pc_count(e_dg(fn, in), in->opc) > 0;
+        sites[n].hot = !in->own && qjs_aot_prof_pc_hot(e_dg(fn, in), in->opc);
       }
       n++;
     }
@@ -2276,6 +2291,8 @@ done:
    into the caller after a guard on the callee value (see q2_build_inl). */
 const JSAotGenFunc *qjs_aot_unit_func(const char hex[33]);
 int qjs_aot_unit_has(const char hex[33]);
+int qjs_aot_prof_has_twin_hex(const char hex[33]);
+#define UNIT_HAS_NT(h_) (qjs_aot_unit_has(h_) && !qjs_aot_prof_has_twin_hex(h_))
 int qjs_aot_unit_argc(const char hex[33]);
 int qjs_aot_native_capable(const char hex[33]);
 int qjs_aot_light_need(const char hex[33]);
@@ -2501,7 +2518,7 @@ int e_inl_construct_allowed(const Q2Func *fn, const Q2Insn *ci) {
      would have lowered -- the condition is the same one, consulted earlier. */
   if (!qjs_aot_prof_callees(e_dg(fn, ci), ci->onext, &cnt, hex, kind, hits)) return 0;
   for (k = 0; k < cnt && k < 4; k++) {
-    if (kind[k] != 1 || !qjs_aot_unit_has(hex[k])) continue;
+    if (kind[k] != 1 || !UNIT_HAS_NT(hex[k])) continue;
     if (qjs_aot_light_need(hex[k]) <= 0) continue;
     if (ci->win_n < qjs_aot_unit_argc(hex[k])) continue;
     nb++;
@@ -2622,7 +2639,7 @@ static int plan_copy(
       int all = 1, k2, ord[4], a2, b2, n0 = *n, c0 = *copied, ok = 1, lift2 = 0, jj;
       for (k2 = 0; k2 < cnt; k2++) {
         ord[k2] = k2;
-        if (kind[k2] != 1 || !qjs_aot_unit_has(hex[k2])) all = 0;
+        if (kind[k2] != 1 || !UNIT_HAS_NT(hex[k2])) all = 0;
       }
       for (a2 = 0; a2 < cnt; a2++)
         for (b2 = a2 + 1; b2 < cnt; b2++)
@@ -2652,7 +2669,7 @@ static int plan_copy(
     if (ci != NULL && ci->win_n <= 6 && ci->nredef == 0 && ci->ndef == 1 &&
         (inl_hot_on() || qjs_aot_prof_pc_count(cg->digest, ci->ppc) > 0 || qjs_aot_prof_pc_count(cg->digest, ci->onext) > 0) &&
         qjs_aot_prof_callees(cg->digest, ci->next, &cnt, hex, kind, hits) && ((nested_thru = thru_filter(ci, hex, kind, hits, &cnt)), 1) &&
-        cnt == 1 && kind[0] == 1 && qjs_aot_unit_has(hex[0]))
+        cnt == 1 && kind[0] == 1 && UNIT_HAS_NT(hex[0]))
       cg2 = qjs_aot_unit_func(hex[0]);
     if (cg2 != NULL && inl_hot_on()) {
       double sf = inl_site_freq(cg->digest, ci->next, 0), cf_ = pfreq * sf;
@@ -2814,7 +2831,7 @@ int e_plan_inline(const Q2Func *fn, Q2InlReq **out) {
       for (ai = 0; ai < cnt && narm < arm_max; ai++) {
         int c1 = order[ai], n_before = n;
         if (kind[c1] != 1) { if (cnt > 1) continue; else break; }
-        if (!qjs_aot_unit_has(hex[c1])) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  not in unit\n"); continue; }
+        if (!UNIT_HAS_NT(hex[c1])) { if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  not in unit\n"); continue; }
         cg = qjs_aot_unit_func(hex[c1]);
         if (cg == NULL || cg == fn->g || memcmp(cg->digest, fn->g->digest, 16) == 0) continue;
         if (getenv("QJS_AOT_INLDEDUP") != NULL) {
@@ -2946,6 +2963,22 @@ static int ctor_summary(const JSAotGenFunc *cg, CtorSum *out) {
   return ok && out->nfields > 0;
 }
 
+/* The field map of the constructor with this digest when its body only stores parameters into fields of `this`:
+   the count, and per field the code offset of its atom and the parameter it stores. */
+int e_ctor_fields(const char hex[33], int *nf, int aoff[8], int argidx[8]) {
+  const JSAotGenFunc *cg = qjs_aot_unit_func(hex);
+  CtorSum sm;
+  int i;
+  if (cg == NULL || !ctor_summary(cg, &sm) || sm.nfields <= 0 || sm.nfields > 8) return 0;
+  for (i = 0; i < sm.nfields; i++) {
+    if (sm.aoff[i] < 0) return 0;
+    aoff[i] = sm.aoff[i];
+    argidx[i] = sm.argidx[i];
+  }
+  *nf = sm.nfields;
+  return 1;
+}
+
 /* A construct of a plain constructor the profile saw with one target: the target and what it does. */
 static int ctor_candidate(const Q2Func *fn, const Q2Insn *ci, const JSAotGenFunc **cg_out, CtorSum *sum) {
   char hex[4][33];
@@ -2955,7 +2988,7 @@ static int ctor_candidate(const Q2Func *fn, const Q2Insn *ci, const JSAotGenFunc
   if (ci->rop != ROP_construct || ci->ndef != 1 || ci->nuse < 2 || ci->win_n > 8) return 0;
   if (ci->use[0] != ci->use[1]) return 0; /* new.target is the constructor */
   if (!qjs_aot_prof_callees(e_dg(fn, ci), ci->onext, &cnt, hex, kind, hits) || cnt != 1 || kind[0] != 1) return 0;
-  if (!qjs_aot_unit_has(hex[0])) return 0;
+  if (!UNIT_HAS_NT(hex[0])) return 0;
   cg = qjs_aot_unit_func(hex[0]);
   if (cg == NULL || !ctor_summary(cg, sum) || sum->nparams > 8) return 0;
   *cg_out = cg;

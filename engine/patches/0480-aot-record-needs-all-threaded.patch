@@ -1,0 +1,17 @@
+Subject: A record call of a function the threaded interpreter cannot fully run takes the full activation
+
+What this does
+  - `aot_call_record` returns 0 (the caller takes the full activation) for a function that is not `regvm_all_threaded`.
+
+Why we need it
+  An exit of compiled code now continues in the interpreter on the frame it left (QJS_AOT_NOGENERIC). On an arena record that is the threaded dispatch, which has no handler for an instruction only the monolith runs; the record path answered with "compiled function cannot be resumed" (kit case sttest: a class with super()). The full activation (`js_regvm_execute`) resumes the monolith at any pc.
+
+Soundness
+  The decision is taken before anything of the call has run; the compiled body still runs in the full activation, only the frame it runs on changes.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -70002,0 +70003,4 @@
++    /* an exit continues in the interpreter on this record, and the threaded interpreter cannot run every instruction of a
++       function that is not all-threaded: that function takes the full activation, whose monolith resumes at any pc */
++    if (unlikely(!cb->regvm_all_threaded))
++        return 0;

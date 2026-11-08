@@ -308,12 +308,13 @@ static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char
       "    JSValue ret;\n"
       "    int k;\n"
       "\n"
-      "    if (x->rec != NULL) E_FL_TOP(ctx) = x->rec->prev;\n"
+      "    if (x->rec != NULL && x->rec->linked) { E_FL_TOP(ctx) = x->rec->prev; ((JSAotFlRec *)x->rec)->linked = 0; }\n"
       "    if (__builtin_expect(e_exit_log_v != 0, 0) && x->kind != NULL) {\n"
       "        static int seen_[1024];\n"
       "        int *sp_ = &seen_[(x->pc * 7 + x->kind[0]) & 1023];\n"
       "        if (!*sp_) e_exit_log(\"%s\", x->kind, x->pc, x->tag, sp_);\n"
       "    }\n"
+      "%s"
       "    if (%s__builtin_expect(*(void **)(cb + QJS_AOT_OFF_FNBC_REGVM_PIC) == "
       "NULL, 0)) {\n"
       "        if (qjs_aot_pic_ensure(ctx, co) < 0) return JS_EXCEPTION;\n"
@@ -350,7 +351,12 @@ static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char
       "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = prev;\n"
       "    return ret;\n"
       "}\n\n",
-      e_linkage(), prefix, hex, slotsx, hex, g->pic_count > 0 ? "" : "0 && ", nregs, hex);
+      e_linkage(), prefix, hex, slotsx, hex,
+      /* an exit at the entry with nothing live is the call itself handed back: the interpreter makes it, no frame is built here */
+      e_nogeneric() && getenv("QJS_AOT_KO_GATEFRAME") == NULL && strcmp(prefix, "aot_nx_") == 0
+          ? "    if (x->pc == 0 && x->n == 0) return qjs_aot_call_interp(ctx, co, this_obj, argv, argc);\n"
+          : "",
+      g->pic_count > 0 ? "" : "0 && ", nregs, hex);
 }
 
 /* `aot_f_HEX` for a frameless function: the engine still enters through it with a
@@ -696,7 +702,13 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
       if (rok) e_fl_clear();
       /* a region root keeps the speculative body as the native fallback of an entry the region cannot serve (its init failed, its facts word is down): aot_fs_, never the generic body */
       g_e_spec_fb = rok;
-      rc = e_emit_spec_body(f, have2 ? &fn2 : &fn, hex);
+      if (rok && e_nogeneric() && getenv("QJS_AOT_KO_SPECTWIN") == NULL && getenv("QJS_AOT_KO_GATEFRAME") == NULL) {
+        /* the interpreter serves an entry the region cannot, as it serves every other exit: the speculative twin of the root is not emitted */
+        fprintf(f, "E_TEXT static JSValue aot_fs_%s(JSContext *ctx, JSRegRun *f, JSValue *fr, uint32_t entry_pc)\n{\n"
+                   "    return qjs_aot_deopt(ctx, f, fr, entry_pc, QJS_AOT_NO_SITE);\n}\n", hex);
+        rc = 0;
+      } else
+        rc = e_emit_spec_body(f, have2 ? &fn2 : &fn, hex);
       g_e_spec_fb = 0;
     }
     e_pure_clear();

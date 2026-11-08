@@ -666,12 +666,20 @@ TEST(Bytecode, ModuleLoaderRejectsMalformedEntryCounts) {
   for (const auto &input : inputs) {
     JSRuntime *rt = JS_NewRuntime();
     ASSERT_NE(rt, nullptr);
+    // The count is rejected against the input that is left before a table is allocated (F49: the loader used to touch gigabytes first):
+    // under this limit an allocation before the check is "out of memory", not "invalid count".
+    JS_SetMemoryLimit(rt, 64u << 20);
     JSContext *ctx = JS_NewContext(rt);
     ASSERT_NE(ctx, nullptr);
     JSValue value =
         JS_ReadObject(ctx, input.data(), input.size(), JS_READ_OBJ_BYTECODE);
     EXPECT_TRUE(JS_IsException(value));
-    JS_FreeValue(ctx, JS_GetException(ctx));
+    JSValue e = JS_GetException(ctx);
+    const char *m = JS_ToCString(ctx, e);
+    EXPECT_TRUE(m != nullptr && std::strstr(m, "invalid count") != nullptr)
+        << (m ? m : "(no message)");
+    if (m) JS_FreeCString(ctx, m);
+    JS_FreeValue(ctx, e);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
   }
@@ -683,30 +691,30 @@ TEST(Bytecode, ModuleLoaderRejectsNonFunctionBody) {
   // and kept the realm alive: the context was never released and JS_FreeRuntime found objects left on the collector's list (an
   // assertion build aborts, a sanitizer build reports the leak). The loader must reject the container.
   const std::vector<uint8_t> input = {
-       0x1c, 0x96, 0x64, 0x86, 0xc8, 0x00, 0x0d, 0x01, 0x00, 0x00, 0x00, 0x02,
-       0x15, 0x0d, 0x0d, 0x00, 0x08, 0x7f, 0x00, 0x08, 0x7f, 0x00, 0x08, 0x00,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0xfc, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0xf2, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0xf2, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x0a, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-       0x01, 0x01, 0x01,
+      0x1c, 0x96, 0x64, 0x86, 0xc8, 0x00, 0x0d, 0x01, 0x00, 0x00, 0x00, 0x02,
+      0x15, 0x0d, 0x0d, 0x00, 0x08, 0x7f, 0x00, 0x08, 0x7f, 0x00, 0x08, 0x00,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0xfc, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0xf2, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0xf2, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x0a, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+      0x01, 0x01, 0x01,
   };
   JSRuntime *rt = JS_NewRuntime();
   ASSERT_NE(rt, nullptr);
@@ -724,19 +732,24 @@ TEST(Bytecode, ModuleLoaderRejectsNonFunctionBody) {
 // one byte moved (checksum fixed) must be rejected with a SyntaxError where that byte makes an index leave its table or a closure
 // constant stop being function bytecode. The check is reachability: over a handful of byte values at every offset, each message
 // must appear at least once. Without the checks the same mutations load and the expected messages never appear.
-static JSModuleDef *depLoader(JSContext *ctx, const char *name, void *, JSValueConst) {
+static JSModuleDef *depLoader(
+    JSContext *ctx, const char *name, void *, JSValueConst) {
   static const char src[] = "export var m = 41; export function k() {}";
-  JSValue v = JS_Eval(ctx, src, sizeof(src) - 1, name,
-                      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+  JSValue v = JS_Eval(
+      ctx, src, sizeof(src) - 1, name,
+      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
   if (JS_IsException(v)) return nullptr;
   JSModuleDef *m = static_cast<JSModuleDef *>(JS_VALUE_GET_PTR(v));
   JS_FreeValue(ctx, v);
   return m;
 }
 
-static std::vector<std::string> mutationMessages(JSContext *ctx, const char *source, const char *name, int evalFlags) {
+static std::vector<std::string> mutationMessages(
+    JSContext *ctx, const char *source, const char *name, int evalFlags) {
   std::vector<std::string> messages;
-  JSValue fn = JS_Eval(ctx, source, std::strlen(source), name, evalFlags | JS_EVAL_FLAG_COMPILE_ONLY);
+  JSValue fn = JS_Eval(
+      ctx, source, std::strlen(source), name,
+      evalFlags | JS_EVAL_FLAG_COMPILE_ONLY);
   EXPECT_FALSE(JS_IsException(fn));
   size_t size = 0;
   uint8_t *buf = JS_WriteObject(ctx, &size, fn, JS_WRITE_OBJ_BYTECODE);
@@ -752,8 +765,10 @@ static std::vector<std::string> mutationMessages(JSContext *ctx, const char *sou
       std::vector<uint8_t> blob = valid;
       blob[off] = v;
       const uint32_t crc = crc32cReference(blob.data() + 5, blob.size() - 5);
-      for (int i = 0; i < 4; ++i) blob[1 + i] = static_cast<uint8_t>(crc >> (8 * i));
-      JSValue r = JS_ReadObject(ctx, blob.data(), blob.size(), JS_READ_OBJ_BYTECODE);
+      for (int i = 0; i < 4; ++i)
+        blob[1 + i] = static_cast<uint8_t>(crc >> (8 * i));
+      JSValue r =
+          JS_ReadObject(ctx, blob.data(), blob.size(), JS_READ_OBJ_BYTECODE);
       if (JS_IsException(r)) {
         JSValue e = JS_GetException(ctx);
         if (const char *m = JS_ToCString(ctx, e)) {
@@ -769,7 +784,8 @@ static std::vector<std::string> mutationMessages(JSContext *ctx, const char *sou
   return messages;
 }
 
-static bool anyMessageHas(const std::vector<std::string> &messages, const char *needle) {
+static bool anyMessageHas(
+    const std::vector<std::string> &messages, const char *needle) {
   for (const auto &m : messages)
     if (m.find(needle) != std::string::npos) return true;
   return false;
@@ -782,11 +798,14 @@ TEST(Bytecode, ReaderRejectsOutOfRangeConstantsAndModuleIndices) {
   JSContext *ctx = JS_NewContext(rt);
   ASSERT_NE(ctx, nullptr);
   const auto script = mutationMessages(
-      ctx, "function a(x){ function b(y){ return y+x; } return b(2)+[1,2,3].map(function(z){return z*x;}).length; } a(3);",
+      ctx,
+      "function a(x){ function b(y){ return y+x; } return "
+      "b(2)+[1,2,3].map(function(z){return z*x;}).length; } a(3);",
       "a.js", 0);
   const auto module = mutationMessages(
       ctx,
-      "import {m} from 'dep'; import * as ns from 'dep'; export var b = m + 1; export function g(){ return b + ns.m; }"
+      "import {m} from 'dep'; import * as ns from 'dep'; export var b = m + 1; "
+      "export function g(){ return b + ns.m; }"
       " export {m as mm} from 'dep'; export * from 'dep';",
       "m.mjs", JS_EVAL_TYPE_MODULE);
 #if QJS_TEST_REGVM
@@ -795,9 +814,134 @@ TEST(Bytecode, ReaderRejectsOutOfRangeConstantsAndModuleIndices) {
   EXPECT_TRUE(anyMessageHas(script, "invalid constant operand"));
 #endif
   EXPECT_TRUE(anyMessageHas(module, "invalid module entry index"));
+  // A required-module name whose first byte is mutated to 0 decodes as atom 0 (JS_ATOM_NULL, a predefined-atom index): the reader rejects
+  // it where it reads it. Without the check the load resolved a module named by the atom-0 entry, whose C string had no terminator
+  // (F46: an AddressSanitizer overflow in js_default_module_normalize_name); here the missing message is the failure.
+  EXPECT_TRUE(anyMessageHas(module, "invalid module name atom"));
   JS_FreeContext(ctx);
   JS_FreeRuntime(rt);
 }
+
+#if QJS_TEST_REGVM
+TEST(Bytecode, RegisterFunctionWithMoreThan65535PropertySitesRoundTrips) {
+  // F51: a function with more property reads than the 16-bit site index can name is encoded by the baseline tier, which writes
+  // REG_IC_NONE (0xffff) for every site and keeps no site table. The reader rejected that operand ("register PIC site out of
+  // range"), so qjsc's own output for such a function (tools/benchmark/octane mandreel) could not be loaded.
+  std::string src = "function big(o){";
+  for (int i = 0; i < 70000; ++i) src += "o.p;";
+  src += "return 1;} big({p:1});";
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+  JSValue fn =
+      JS_Eval(ctx, src.data(), src.size(), "big.js", JS_EVAL_FLAG_COMPILE_ONLY);
+  ASSERT_FALSE(JS_IsException(fn));
+  size_t size = 0;
+  uint8_t *buf = JS_WriteObject(ctx, &size, fn, JS_WRITE_OBJ_BYTECODE);
+  JS_FreeValue(ctx, fn);
+  ASSERT_NE(buf, nullptr);
+  JSValue back = JS_ReadObject(ctx, buf, size, JS_READ_OBJ_BYTECODE);
+  js_free(ctx, buf);
+  ASSERT_FALSE(JS_IsException(back));
+  JSValue r = JS_EvalFunction(ctx, back);
+  EXPECT_FALSE(JS_IsException(r));
+  JS_FreeValue(ctx, r);
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+}
+#endif
+
+#if QJS_TEST_REGVM
+extern "C" int JS_TestRegvmVarCountOfChild(
+    JSContext *ctx, JSValueConst fn, int child);
+
+TEST(Bytecode, RegisterFunctionFromBytecodeKeepsTheCompilersVariableArea) {
+  // F52: the compiler promotes locals to registers, so a call needs no variable slots (`regvm_var_count`); the promotion map is not
+  // serialized, and the reader gave every blob function all `var_count` slots. Same register program, a bigger frame filled and released on
+  // every call: richards/deltablue 6-10% slower loaded from bytecode than from source. The reader derives the area from what the program
+  // names and what inner closures capture.
+  static const char *src =
+      "function promoted(n) { var a = n, b = a + 1, c = b + 1; return a + b + "
+      "c; }"
+      "function captured(n) { var a = n, b = 2; return function () { return b; "
+      "}; }"
+      "function named(n) { var a = n; with ({}) { return a; } }"
+      "promoted(1);";
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+  JSValue fn =
+      JS_Eval(ctx, src, std::strlen(src), "v.js", JS_EVAL_FLAG_COMPILE_ONLY);
+  ASSERT_FALSE(JS_IsException(fn));
+  size_t size = 0;
+  uint8_t *buf = JS_WriteObject(ctx, &size, fn, JS_WRITE_OBJ_BYTECODE);
+  ASSERT_NE(buf, nullptr);
+  JSValue back = JS_ReadObject(ctx, buf, size, JS_READ_OBJ_BYTECODE);
+  js_free(ctx, buf);
+  ASSERT_FALSE(JS_IsException(back));
+  for (int child = 0; child < 3; ++child) {
+    const int fromSource = JS_TestRegvmVarCountOfChild(ctx, fn, child);
+    const int fromBytecode = JS_TestRegvmVarCountOfChild(ctx, back, child);
+    EXPECT_GE(fromSource, 0) << "child " << child;
+    EXPECT_EQ(fromSource, fromBytecode) << "child " << child;
+  }
+  JS_FreeValue(ctx, fn);
+  JS_FreeValue(ctx, back);
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+}
+#endif
+
+#if QJS_TEST_REGVM
+TEST(Bytecode, RegisterFunctionVariableAreaBelowWhatTheProgramNamesIsRejected) {
+  // The writer records the compiler's variable area in the register program's flag byte; the reader accepts it only if it covers every slot the
+  // program names and every slot an inner closure captures. A function with a try/catch keeps its three locals in the frame (no promotion),
+  // so its area is 4 slots (a, b, c, e): the byte is 1 | (4 + 1) << 1 = 11, followed by REGVM_FORMAT_VERSION. Lowering it must fail the load, not leave slots
+  // the program reads outside the area the frame fills.
+  static const char *src =
+      "function f(n) { var a = n, b = 2, c = 3; try { a = b + c; } catch (e) { "
+      "a = 0; } return a + b + c; } f(1);";
+  JSRuntime *rt = JS_NewRuntime();
+  ASSERT_NE(rt, nullptr);
+  JSContext *ctx = JS_NewContext(rt);
+  ASSERT_NE(ctx, nullptr);
+  JSValue fn =
+      JS_Eval(ctx, src, std::strlen(src), "v.js", JS_EVAL_FLAG_COMPILE_ONLY);
+  ASSERT_FALSE(JS_IsException(fn));
+  size_t size = 0;
+  uint8_t *buf = JS_WriteObject(ctx, &size, fn, JS_WRITE_OBJ_BYTECODE);
+  JS_FreeValue(ctx, fn);
+  ASSERT_NE(buf, nullptr);
+  const std::vector<uint8_t> valid(buf, buf + size);
+  js_free(ctx, buf);
+  int tried = 0, rejected = 0;
+  for (size_t off = 5; off + 1 < valid.size(); ++off) {
+    // a flag byte with a recorded area of 1 or more slots, followed by the format version byte
+    if (valid[off + 1] != 19 || (valid[off] & 1) == 0 || (valid[off] >> 1) < 2)
+      continue;
+    std::vector<uint8_t> blob = valid;
+    blob[off] = 1 | (1 << 1);  // area 0: below what the program names
+    const uint32_t crc = crc32cReference(blob.data() + 5, blob.size() - 5);
+    for (int i = 0; i < 4; ++i)
+      blob[1 + i] = static_cast<uint8_t>(crc >> (8 * i));
+    ++tried;
+    JSValue r =
+        JS_ReadObject(ctx, blob.data(), blob.size(), JS_READ_OBJ_BYTECODE);
+    if (JS_IsException(r)) {
+      ++rejected;
+      JS_FreeValue(ctx, JS_GetException(ctx));
+    } else {
+      JS_FreeValue(ctx, r);
+    }
+  }
+  EXPECT_GT(tried, 0);
+  EXPECT_EQ(tried, rejected);
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+}
+#endif
 
 TEST(Engine, ComputeMemoryUsageWalksPlainObjects) {
   // A plain object has no class data, so the walk must not read the union that other classes use for their records (an object

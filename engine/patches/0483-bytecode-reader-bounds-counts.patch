@@ -1,0 +1,56 @@
+Subject: The bytecode reader bounds every count that sizes an allocation by the input that is left, before it allocates
+
+What this does
+  - `bc_get_leb128_count_n(s, &n, min_bytes)` replaces `bc_get_leb128_count`: a count above (bytes left in the input / minimum encoded size of one entry) fails the load with SyntaxError "invalid count". The four module tables use it (required modules and star exports 1 byte per entry, exports and imports 3).
+  - `JS_ReadFunctionTag` rejects a function whose constant-pool count exceeds the bytes left, or whose bytecode length exceeds 16x the bytes left (the register program's own expansion bound), before the function object is allocated.
+  - The atom table count and a BigInt's limb bytes are bounded by the bytes left before their tables are allocated.
+
+Why we need it
+  F49: Bytecode.ModuleLoaderRejectsMalformedEntryCounts feeds 19- and 23-byte module containers that declare 0x7fffffff entries; the loader allocated and touched count x entry size (6.6 GB peak RSS on a plain release build) before it noticed the input could not hold them, then rejected it. A tiny untrusted blob must not be able to force a multi-gigabyte allocation. (It also made the TSan run of quickjs_bytecode_tests exceed 10 GB.) Patch 0468 bounded the count by INT32_MAX only.
+
+Soundness
+  Every entry the writer emits takes at least the bytes assumed, so no valid container is rejected; the bound only fires where the input is shorter than the entries it claims. The test sets JS_SetMemoryLimit(64 MB) on the runtime and requires the "invalid count" message, so an allocation before the check shows as "out of memory" and fails it.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -84654,2 +84654,4 @@
+-/* An entry count: a value that does not fit an int is not one any writer produced. */
+-static int bc_get_leb128_count(BCReaderState *s, int *pval)
++/* An entry count: a value that does not fit an int is not one any writer produced, and neither is one the rest of the input cannot hold:
++   every entry takes at least `min_bytes` bytes, so a count above (bytes left / min_bytes) is rejected before the table for it is allocated
++   (a 19-byte blob declaring INT32_MAX entries used to make the loader touch gigabytes before it failed). */
++static int bc_get_leb128_count_n(BCReaderState *s, int *pval, size_t min_bytes)
+@@ -84660 +84662 @@
+-    if (val > INT32_MAX) {
++    if (val > INT32_MAX || (size_t)val > (size_t)(s->buf_end - s->ptr) / min_bytes) {
+@@ -85513,0 +85516,4 @@
++    }
++    if (len > (size_t)(s->buf_end - s->ptr)) {   /* the limbs are in the input: reject before allocating for them */
++        bc_read_error_end(s);
++        goto fail;
+@@ -86145,0 +86152,8 @@
++    /* The function object is allocated for these sizes before its body is read: a pool entry takes at least a byte of the input, and the
++       bytecode is at most the 16x expansion the register program check below allows. */
++    if (bc.cpool_count < 0 || bc.byte_code_len < 0 ||
++        (size_t)bc.cpool_count > (size_t)(s->buf_end - s->ptr) ||
++        (size_t)bc.byte_code_len > (size_t)(s->buf_end - s->ptr) * 16) {
++        JS_ThrowSyntaxError(ctx, "invalid function sizes");
++        goto fail;
++    }
+@@ -86415 +86429 @@
+-    if (bc_get_leb128_count(s, &rd_cnt))
++    if (bc_get_leb128_count_n(s, &rd_cnt, 1))
+@@ -86446 +86460 @@
+-    if (bc_get_leb128_count(s, &rd_cnt))
++    if (bc_get_leb128_count_n(s, &rd_cnt, 3))
+@@ -86475 +86489 @@
+-    if (bc_get_leb128_count(s, &rd_cnt))
++    if (bc_get_leb128_count_n(s, &rd_cnt, 1))
+@@ -86492 +86506 @@
+-    if (bc_get_leb128_count(s, &rd_cnt))
++    if (bc_get_leb128_count_n(s, &rd_cnt, 3))
+@@ -87033,0 +87048,5 @@
++    /* each atom entry takes at least one byte of the input */
++    if (s->idx_to_atom_count > (size_t)(s->buf_end - s->ptr)) {
++        JS_ThrowSyntaxError(s->ctx, "invalid count");
++        return -1;
++    }

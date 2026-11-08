@@ -1,0 +1,26 @@
+Subject: A compiled coroutine resumed at a yield or await continues in the interpreter as a resumption; the first run of a coroutine is not a resume
+
+What this does
+  - `JS_CALL_FLAG_AOT_KEEP_MARKER`: with `JS_CALL_FLAG_AOT_DEOPT` on a coroutine resume, the frame's resume marker is kept (the deopt pc is the instruction being resumed), so the yield or await at that pc completes as a resumption instead of suspending again. `js_aot_run_coroutine` sets it when the pc the unit asked the interpreter to continue at is the pc it was entered at.
+  - `js_regvm_resume_coroutine` does not take the compiled-coroutine path when `pc` is NULL (the first run of the coroutine): the entry pc computed from a NULL pc was garbage.
+
+Why we need it
+  With the unit's generic bodies gone (QJS_AOT_NOGENERIC) a compiled coroutine resumed at an await takes the stub, which hands the frame to the interpreter at the resume pc. The flag AOT_DEOPT cleared the resume marker ("a deopt continues at an instruction, it does not resume a yield"), so the interpreter ran the await as a fresh one: it suspended again at the same pc, and every resume repeated it forever (aot_bench async.await / async.forawait hang in `check.sh t1`).
+
+Soundness
+  The resume marker means "the instruction at this pc is the yield/await whose resumption this is". A stub resume enters at exactly that pc, so keeping it is the interpreter's own resume. A real deopt at another pc keeps the old rule (the marker is dropped).
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -25488,0 +25489,2 @@
++/* with AOT_DEOPT on a coroutine resume: the instruction the frame continues at is the one it is resuming (a yield or await), not a fresh one */
++#define JS_CALL_FLAG_AOT_KEEP_MARKER (1 << 4)
+@@ -35349 +35351 @@
+-            if (unlikely(flags & JS_CALL_FLAG_AOT_DEOPT))
++            if (unlikely((flags & (JS_CALL_FLAG_AOT_DEOPT | JS_CALL_FLAG_AOT_KEEP_MARKER)) == JS_CALL_FLAG_AOT_DEOPT))
+@@ -45139 +45141,2 @@
+-                                JS_CALL_FLAG_GENERATOR | JS_CALL_FLAG_AOT_DEOPT, 0);
++                                JS_CALL_FLAG_GENERATOR | JS_CALL_FLAG_AOT_DEOPT |
++                                    (run.deopt_pc == entry_pc ? JS_CALL_FLAG_AOT_KEEP_MARKER : 0), 0);
+@@ -45180 +45183 @@
+-    if (b->aot_fn != NULL && !throw_pending && b->regvm_compiled) {
++    if (b->aot_fn != NULL && !throw_pending && b->regvm_compiled && pc != NULL) {   /* pc is NULL for the first run of the coroutine: that is no resume */

@@ -1,0 +1,148 @@
+Subject: A register function read from bytecode gets the compiler's variable area (recorded in the flag byte, checked against what the program names), not all of var_count
+
+What this does
+  - `regvm_wire_decode` set every blob function's `regvm_var_count` to `var_count`: the compiler's promotion map is not serialized, and an unpromoted frame has to fill and release every variable slot. The compiler, though, promotes most locals to registers, so a function compiled from source has `regvm_var_count` 0 (richards, deltablue: 0 for nearly every function) and its frame has no variable area at all.
+  - The writer records `regvm_var_count` in the register program's flag byte (bit 0 is the flag; bits 1-7 hold the area plus one, 0 meaning "not recorded"; recorded for functions with at most 126 variables). The reader takes the recorded value when it is at least the area the program and its inner closures need and at most `var_count`, else the load fails ("invalid register variable area"). Without a recorded value (a blob from an older writer, the checked-in builtin blobs, more than 126 variables) it derives the area: one past the highest variable slot the decoded program names (the variable cases of `regvm_slot_operands_ok`, factored as `regvm_var_slot_hi`), or one past the highest slot an inner closure captures (`JS_CLOSURE_LOCAL` entries of the function's constant-pool children; a captured local is never promoted and only the capturing child names it). The `arguments` variable (never promoted) counts. A direct eval (`ROP_eval`/`ROP_apply_eval`) or more than 255 slots keeps all of `var_count`. `regvm_slot_operands_ok` now also bounds the implicit-slot forms `put_local_xfer_s0..3` and `get_local_field_0..3` by `var_count` (it did not).
+  - `JS_TestRegvmVarCountOfChild` (register builds): a test hook returning a nested function's `regvm_var_count`, so a test can compare a function compiled from source with the same function read back.
+
+Why we need it
+  F52: the same register program loaded from bytecode ran 6-10% slower than from source (octane richards -5.4..-6.2%, deltablue -9.2..-10.0%; the kit deltablue executes 12% more instructions, 2111M against 1885M, with identical dynamic opcode counts). Cause: every call filled and released all `var_count` variable slots and a light frame was bigger (deltablue's function at line 1000: light_need 400 against 304). After the change the bytecode run executes 1855M instructions against 1885M from source; across 13,510 functions of the differential corpora, the kit and the Octane corpus, the source-compiled and the read-back functions agree on every call-descriptor and frame field (ready, light, fast, threaded, pic, vc, regs, ctl, frame/light need, scan, args_captured, var_refs, argv_safe) except the entry fill list (source: precise; a blob always fills every register, the safe superset) and `regvm_var_count` of two functions with 301 variables, a field no consumer reads above 255.
+
+Soundness
+  A slot the frame does not reserve must never be touched. The program touches variable slots only through the instructions `regvm_slot_operands_ok` already bounds by `var_count` (the same list, now also taken as the high-water mark), and an inner closure reaches a parent's slot only through its `JS_CLOSURE_LOCAL` descriptor; the area covers both. Direct eval, which reads variables by name, keeps the full area. The derivation uses only validated operands of the decoded program, so a hostile blob cannot make it smaller than what the program names.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -83901 +83901,2 @@
+-    bc_put_u8(s, b->regvm_compiled ? 1 : 0);
++    /* Bit 0 is the flag; the other bits carry the compiler's variable area plus one (0: not recorded, the reader derives it). */
++    bc_put_u8(s, !b->regvm_compiled ? 0 : b->var_count <= 126 ? (uint8_t)(1 | ((b->regvm_var_count + 1) << 1)) : 1);
+@@ -85019,0 +85021,6 @@
++    case ROP_put_local_xfer_s0: case ROP_put_local_xfer_s1:
++    case ROP_put_local_xfer_s2: case ROP_put_local_xfer_s3:
++        slot = op - ROP_put_local_xfer_s0; bound = b->var_count; break;
++    case ROP_get_local_field_0: case ROP_get_local_field_1:
++    case ROP_get_local_field_2: case ROP_get_local_field_3:
++        slot = op - ROP_get_local_field_0; bound = b->var_count; break;
+@@ -85084,0 +85092,92 @@
++/* The highest variable (var_buf) slot an instruction names, or -1. Mirrors the variable cases of regvm_slot_operands_ok: a slot the program
++   names is a slot the frame must fill and release. INT_MAX means "unknown": direct eval reads variables by name. */
++static int regvm_var_slot_hi(int op, const int32_t *ops)
++{
++    int hi = -1, t;
++    switch (op) {
++    case ROP_get_local: case ROP_get_arg_el: case ROP_get_local_field:
++    case ROP_local_rmw_imm: case ROP_local_rmw_branch:
++        hi = ops[1]; break;
++    case ROP_put_local: case ROP_local_check: case ROP_local_check_init:
++    case ROP_local_uninit: case ROP_close_local: case ROP_put_local_xfer:
++        hi = ops[0]; break;
++    case ROP_get_local_s0: case ROP_get_local_s1: case ROP_get_local_s2: case ROP_get_local_s3:
++        hi = op - ROP_get_local_s0; break;
++    case ROP_put_local_s0: case ROP_put_local_s1: case ROP_put_local_s2: case ROP_put_local_s3:
++        hi = op - ROP_put_local_s0; break;
++    case ROP_put_local_xfer_s0: case ROP_put_local_xfer_s1: case ROP_put_local_xfer_s2: case ROP_put_local_xfer_s3:
++        hi = op - ROP_put_local_xfer_s0; break;
++    case ROP_get_local_field_0: case ROP_get_local_field_1: case ROP_get_local_field_2: case ROP_get_local_field_3:
++        hi = op - ROP_get_local_field_0; break;
++    case ROP_make_local_ref:
++        hi = ops[4] == 0 ? ops[3] : -1; break;
++    case ROP_using_dispose: hi = ops[2] + 1; break;
++    case ROP_using_dispose_async: hi = ops[1] + 1; break;
++    case ROP_binary_loc_reg: hi = ops[2]; break;
++    case ROP_binary_reg_loc: hi = ops[3]; break;
++    case ROP_binary_loc_loc: hi = ops[2] > ops[3] ? ops[2] : ops[3]; break;
++    case ROP_branch_cmp_loc_reg: hi = ops[1]; break;
++    case ROP_branch_cmp_reg_loc: hi = ops[2]; break;
++    case ROP_branch_cmp_loc_loc: hi = ops[1] > ops[2] ? ops[1] : ops[2]; break;
++    case ROP_eval: case ROP_apply_eval:
++        return INT_MAX;
++    default:
++        break;
++    }
++    t = hi;
++    return t;
++}
++
++/* The variable slots a blob function's frame must fill and release (`regvm_var_count`): the compiler's promotion map is not serialized, but the
++   slots that are not promoted are exactly the ones the program names, the `arguments` variable, and the ones an inner closure captures (a
++   captured local is never promoted, and only the capturing child names it). `var_hi` is the highest slot the program names. A direct eval, or more than 255 slots,
++   keeps all of `var_count`. */
++static uint8_t regvm_blob_var_count(const JSFunctionBytecode *b, int var_hi, bool with_arguments)
++{
++    int vc = var_hi == INT_MAX ? b->var_count : var_hi + 1, i, k;
++    if (b->var_count > 255)
++        return 255;
++    /* The `arguments` variable is never promoted: the compiler counts its slot even when the program no longer names it (an elided
++       `arguments.length` / `arguments[i]`). Only the derivation without a recorded value needs it; it is not something the program reads. */
++    if (with_arguments && b->vardefs)
++        for (i = 0; i < b->var_count; i++)
++            if (b->vardefs[b->arg_count + i].var_name == JS_ATOM_arguments && i + 1 > vc)
++                vc = i + 1;
++    for (i = 0; i < b->cpool_count && vc < b->var_count; i++) {
++        const JSFunctionBytecode *c;
++        if (JS_VALUE_GET_TAG(b->cpool[i]) != JS_TAG_FUNCTION_BYTECODE)
++            continue;
++        c = JS_VALUE_GET_PTR(b->cpool[i]);
++        for (k = 0; k < c->closure_var_count; k++)
++            if (c->closure_var[k].closure_type == JS_CLOSURE_LOCAL && (int)c->closure_var[k].var_idx + 1 > vc)
++                vc = (int)c->closure_var[k].var_idx + 1;
++    }
++    if (vc > b->var_count)
++        vc = b->var_count;
++    return (uint8_t)(vc < 0 ? 0 : vc);
++}
++
++#if QJS_REGVM
++/* Test hook (tests/bytecode_test.cpp, F52): `regvm_var_count` of the `child`-th function in the constant pool of the function bytecode `fn`
++   (counting only function entries), or -1. Lets a test compare a function compiled from source with the same function read from a blob. */
++int JS_TestRegvmVarCountOfChild(JSContext *ctx, JSValueConst fn, int child);
++int JS_TestRegvmVarCountOfChild(JSContext *ctx, JSValueConst fn, int child)
++{
++    const JSFunctionBytecode *b;
++    int i, n = 0;
++    (void)ctx;
++    if (JS_VALUE_GET_TAG(fn) != JS_TAG_FUNCTION_BYTECODE)
++        return -1;
++    b = JS_VALUE_GET_PTR(fn);
++    for (i = 0; i < b->cpool_count; i++) {
++        if (JS_VALUE_GET_TAG(b->cpool[i]) != JS_TAG_FUNCTION_BYTECODE)
++            continue;
++        if (n++ == child) {
++            const JSFunctionBytecode *c = JS_VALUE_GET_PTR(b->cpool[i]);
++            return c->regvm_compiled ? (int)c->regvm_var_count : -1;
++        }
++    }
++    return -1;
++}
++#endif
++
+@@ -85102,0 +85202 @@
++    int var_hi = -1;
+@@ -85281,0 +85382,5 @@
++        {
++            int vh = regvm_var_slot_hi(op, ops);
++            if (vh > var_hi)
++                var_hi = vh;
++        }
+@@ -85356,3 +85461,16 @@
+-    /* The promotion map is compile-time only, so a blob function keeps
+-       `var_count`, clamped to the one-byte field. */
+-    b->regvm_var_count = b->var_count > 255 ? 255 : (uint8_t)b->var_count;
++    /* The promotion map is compile-time only: derive the variable area from what the program and the inner closures name (F52). */
++    {
++        /* `regvm_var_count` holds the writer's value plus one (0: not recorded) until here. A recorded value is the compiler's own; it is accepted
++           when it covers every slot the program names and every slot an inner closure captures and fits `var_count`, so a hostile blob cannot
++           shrink the area below what the program uses. */
++        const int wire_vc = b->regvm_var_count;
++        const int need = regvm_blob_var_count(b, var_hi, false);
++        if (wire_vc == 0) {
++            b->regvm_var_count = regvm_blob_var_count(b, var_hi, true);
++        } else if (wire_vc - 1 < need || wire_vc - 1 > b->var_count) {
++            JS_ThrowSyntaxError(ctx, "invalid register variable area");
++            goto fail;
++        } else {
++            b->regvm_var_count = (uint8_t)(wire_vc - 1);
++        }
++    }
+@@ -86196,0 +86315 @@
++        bc.regvm_var_count = compiled >> 1;   /* the writer's variable area plus one, 0 if not recorded: regvm_wire_decode checks it */

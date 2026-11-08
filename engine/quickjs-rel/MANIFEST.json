@@ -1875,12 +1875,80 @@
       "sha256": "d2b07807e7ce5bd434a010bbdb4fdd83af5a84b0038ec6455f9229413ddaf5b3"
     },
     {
+      "name": "0476-deopt-record-not-trivial-return.patch",
+      "sha256": "b3aa1718e26eb8ad4c5c5f25a2cf8d0151c9ee7b84a18ecb71822648ef7e2856"
+    },
+    {
+      "name": "0477-aot-run-to-end-steps-unsafe-frames.patch",
+      "sha256": "a49f9b6971321d571caa4e086f1a3e5bf65ba35503221cf757af2c82d332dfbc"
+    },
+    {
+      "name": "0478-unwind-c-entry-first.patch",
+      "sha256": "72377990fe46d21163bb97919439fc5121ea06113617163c97b50f24f75ba77e"
+    },
+    {
+      "name": "0479-aot-call-interp-and-gated-call.patch",
+      "sha256": "41ea952212158c818441e06713a9f2efcec2e3b72406a6d4062785475d3793b1"
+    },
+    {
+      "name": "0480-aot-record-needs-all-threaded.patch",
+      "sha256": "8c77d0102113ff10b76c067b3811f79e8fc8504601b2888dc479f3887dbc60e8"
+    },
+    {
+      "name": "0481-atom-null-entry-terminator.patch",
+      "sha256": "148feef94d38e7993e35feb001d5d2301a63832ce5f5cde42f88e20b19b22f0a"
+    },
+    {
+      "name": "0482-aot-coroutine-resume-keeps-marker.patch",
+      "sha256": "c2223188524469a59d9e24c1ee5dd5b6efbc05504cb97f804cef36a9a5f79ef3"
+    },
+    {
+      "name": "0483-bytecode-reader-bounds-counts.patch",
+      "sha256": "bee63f03dab62d64338eb492671a7217898995135040b9264ffa65a152db8122"
+    },
+    {
+      "name": "0484-regvm-fuse-branches-no-uninit-read.patch",
+      "sha256": "3aa6215e67dfca75125818587e9df8a593653a6e56d113287110ec2833e7816d"
+    },
+    {
+      "name": "0485-regvm-reader-accepts-ic-none.patch",
+      "sha256": "4aa7f2602f13c2eb9d4d98a67eb0e2650c31955efef2134bb769b02fc985fe36"
+    },
+    {
+      "name": "0486-regvm-blob-variable-area.patch",
+      "sha256": "1c38e40269398a3d1aac658febcb29a724def9e4cf5835590f53d82ce2b1a057"
+    },
+    {
+      "name": "0487-aot-copy-pool-helpers.patch",
+      "sha256": "503fea030295388c24405731b79462839b88c4e2ea1347f7acade6ec51c35938"
+    },
+    {
+      "name": "0488-aot-global-watch-cheap-stores.patch",
+      "sha256": "f59e37beb056f20ab617d0fb8366c904e64a51d1824d909c67ae363ae901b662"
+    },
+    {
+      "name": "0489-aot-call-light-pads-short-calls.patch",
+      "sha256": "bc6d5f838c88c29a85f6253f1b1c7381c851474e013e17d9e982247ba5570822"
+    },
+    {
+      "name": "0490-aot-lean-c-frame-global-warm-lexical-fold.patch",
+      "sha256": "703e9a3dde0ac16a65fa36ce9764510ccd768c8b4a954086ec35454eef4c3d7b"
+    },
+    {
+      "name": "0491-aot-unbind-gated-function.patch",
+      "sha256": "87b81bb9ec15632a63c37f2ea50c9cc6808bd9228663c25ddbaa636f5472fe09"
+    },
+    {
+      "name": "0492-aot-lean-lifecycle-lift-frameless-helpers.patch",
+      "sha256": "d645ce9f67302799c6a6b7165400c8273c7bc394bfa15d52f082bd6826b7fb8b"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "f2ab1fa020eadf8b0bd84391e548c8bc1b84923532f448f5fc0bf24d5798585d",
+    "quickjs.c": "3ca1bcc9757ee7e1b706050510a04c9b2817fb1b05ec96afacfe547e37247f95",
     "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

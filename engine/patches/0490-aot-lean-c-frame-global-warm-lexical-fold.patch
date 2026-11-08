@@ -1,0 +1,167 @@
+Subject: AOT: a leaner C-call frame for compiled calls, a cache-warming helper for cold global reads, top-level let/const folds, math builtins called through their own pointer, and the argument count and vector offsets
+
+What this does
+  - `aot_call_c_frame` is the frame `js_call_c_function` builds for a generic or generic_magic C function (previous frame link, the light chain parked and cleared, `cur_func`, `arg_count`, `arg_buf`), without its alloca, per-prototype switch and constructor handling. A short argument list is padded with undefined in a small stack array (declared length up to 8; longer keeps `js_call_c_function`). `qjs_aot_call_c` calls it where it called `js_call_c_function`.
+  - `qjs_aot_global_warm(ctx, f, site, atom)` fills the read cache cell of a global site for a plain data property of the global object or the lexical object, running no user code and never throwing (an accessor, an uninitialised binding or a missing property returns 0).
+  - `qjs_aot_global_fold` also folds a top-level `let`/`const` (found first, in the lexical object), since every write to it already reports through `js_aot_gwrite_val`.
+  - `qjs_aot_call_c` calls a one- or two-double math builtin (`f_f`, `f_f_f`) through the pointer its own function object holds, before consulting the per-site table, so a site that sees several builtins binds nothing and re-stores nothing per call.
+  - The layout block gains `off_regrun_argc` and `off_regrun_argv` (JSRegRun argument count and argument vector), for a compiled `arguments[i]`.
+
+Why we need it
+  R5 (aot_bench): call.host 0.69x of the interpreter (js_call_c_function's frame cost 52% of the row; 685 ms against 302 ms with this frame on the repro), host_arity 0.89x, cfunc_change 0.89x and math_change 0.91x (the site re-stored its binding on every alternation), callee.change and call.polymorphic and wl-60 arguments-object-4. A compiled loop whose hoisted global read found its cell empty, or whose entry folded a top-level `let` (refused for ever), left to the interpreter for the whole activation.
+
+Soundness
+  The frame carries the fields js_call_c_function sets for these prototypes and the same restore; a constructor, a getter/setter or a declared length above 8 take the old path. The warm helper finds the property with `find_own_property` and calls `JS_GetGlobalVar` only for a plain data property, which runs nothing. The lexical fold compares the current int32 with the folded one and registers the same watch as the global-object fold. The math path is the old per-site path without the binding: the pointer is the object's own, the realm test and the poll are unchanged.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -64090,0 +64091,2 @@
++    out->off_regrun_argc = (uint32_t)offsetof(JSRegRun, argc);
++    out->off_regrun_argv = (uint32_t)offsetof(JSRegRun, argv);
+@@ -68214,3 +68216,5 @@
+-    if (find_own_property(&pr, JS_VALUE_GET_OBJ(ctx->global_var_obj), (JSAtom)atom) != NULL)
+-        return 0;
+-    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(ctx->global_obj), (JSAtom)atom);
++    /* a top-level let/const lives in the lexical object and is found first, as a read finds it; every write to it reports through the same
++       watch (JS_SetGlobalVarS and the cell stores call js_aot_gwrite_val for both objects), and an uninitialised binding is not an int */
++    prs = find_own_property(&pr, JS_VALUE_GET_OBJ(ctx->global_var_obj), (JSAtom)atom);
++    if (prs == NULL)
++        prs = find_own_property(&pr, JS_VALUE_GET_OBJ(ctx->global_obj), (JSAtom)atom);
+@@ -69506,0 +69511,39 @@
++/* Fill the global-read cache cell of `site` for a plain data property of the global object, without running user code or throwing:
++   1 when the site now holds (the caller probes it again), 0 when the global is absent, an accessor, uninitialised or the function has no
++   cache array yet. A compiled loop whose hoisted global read found the cell empty (a process that has not run the site yet) fills it here
++   and goes on, where the miss would hand the rest of the activation to the interpreter. */
++QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int atom)
++{
++    JSValue v;
++    JSObject *p;
++    JSShapeProperty *prs;
++    JSProperty *pr;
++    int k;
++
++    if (f->pic == NULL)
++        return 0;
++    if (!js_gv_cell_peek(ctx, (JSAtom)atom, &v)) {
++        for (k = 0; k < 2; k++) {
++            p = JS_VALUE_GET_OBJ(k == 0 ? ctx->global_var_obj : ctx->global_obj);
++            if (p->shape->prop_count == 0)
++                continue;
++            prs = find_own_property(&pr, p, (JSAtom)atom);
++            if (prs == NULL)
++                continue;
++            if ((prs->flags & JS_PROP_TMASK) != 0 || JS_IsUninitialized(pr->u.value))
++                return 0;
++            break;
++        }
++        if (k == 2)
++            return 0;
++        v = JS_GetGlobalVar(ctx, (JSAtom)atom, false);
++        if (JS_IsException(v)) {
++            JS_FreeValue(ctx, JS_GetException(ctx));
++            return 0;
++        }
++        JS_FreeValue(ctx, v);
++    }
++    regvm_global_site_fill(ctx, f->b, &f->pic, (JSAtom)atom, site);
++    return 1;
++}
++
+@@ -70460,0 +70504,52 @@
++/* A call from compiled code to a generic or generic_magic C function, with the stack frame the
++   function's backtrace line and a nested JS call need and nothing else: js_call_c_function's
++   alloca, per-prototype switch and constructor handling cost a compiled loop that makes only
++   plain calls more than the call itself (call.host: 2.3x). A short argument list is padded
++   with undefined up to the declared length in a small stack array; a declared length above
++   that, or a function the generic path must handle, takes js_call_c_function. */
++static JSValue aot_call_c_frame(JSContext *ctx, JSValueConst callee, JSObject *p,
++                                JSValueConst this_obj, int na, JSValueConst *argv)
++{
++    JSRuntime *rt = ctx->rt;
++    JSStackFrame sf_s, *sf = &sf_s;
++    JSValueConst padded[8];
++    JSValueConst *av = argv;
++    JSContext *rctx = p->u.cfunc.realm;
++    int len = p->u.cfunc.length, ac = na;
++    JSValue ret;
++
++    if (unlikely(na < len)) {
++        int k;
++
++        if (len > 8)
++            return js_call_c_function(ctx, callee, this_obj, na, argv, 0);
++        for (k = 0; k < na; k++)
++            padded[k] = argv[k];
++        for (; k < len; k++)
++            padded[k] = JS_UNDEFINED;
++        av = padded;
++        ac = len;
++    }
++    if (js_check_stack_overflow(rt, sizeof(JSValue) * len))
++        return JS_ThrowStackOverflow(ctx);
++    sf->prev_frame = rt->current_stack_frame;
++    regvm_light_seal(rt, rt->regvm_cur);
++    sf->rv_light = rt->regvm_cur;
++    sf->rv_rec = NULL;
++    rt->regvm_cur = NULL;
++    REGVM_SET_ROOT(sf, NULL, 0);
++    rt->current_stack_frame = sf;
++    sf->is_strict_mode = false;
++    sf->is_constructor = false;
++    sf->cur_func = unsafe_unconst(callee);
++    sf->arg_count = ac;
++    sf->arg_buf = (JSValue *)av;
++    if (p->u.cfunc.cproto == JS_CFUNC_generic)
++        ret = p->u.cfunc.c_function.generic(rctx, this_obj, na, av);
++    else
++        ret = p->u.cfunc.c_function.generic_magic(rctx, this_obj, na, av, p->u.cfunc.magic);
++    rt->regvm_cur = sf->rv_light;
++    rt->current_stack_frame = sf->prev_frame;
++    return ret;
++}
++
+@@ -70545 +70640 @@
+-        rv = js_call_c_function(ctx, callee, this_obj, na, argv, 0);
++        rv = aot_call_c_frame(ctx, callee, p, this_obj, na, argv);
+@@ -70550,0 +70646,30 @@
++    /* A math builtin of the one-double or two-double form is called through the pointer its own function object holds, so a site that sees
++       several of them (Math.abs then Math.sqrt) binds nothing and re-stores nothing per call: the identity is the object's. */
++    if (p->u.cfunc.cproto == JS_CFUNC_f_f && na == 1 && p->u.cfunc.realm == ctx
++#ifndef AOT_MUT_SKIP_CALLEE_GUARD
++        && (cproto < 0 || cproto == JS_CFUNC_f_f)
++#endif
++        ) {
++        double d1;
++
++        if (JS_ToFloat64(ctx, &d1, argv[0]))
++            return -1;
++        if (js_poll_interrupts(ctx))
++            return -1;
++        *out = js_number(p->u.cfunc.c_function.f_f(d1));
++        return 1;
++    }
++    if (p->u.cfunc.cproto == JS_CFUNC_f_f_f && na == 2 && p->u.cfunc.realm == ctx
++#ifndef AOT_MUT_SKIP_CALLEE_GUARD
++        && (cproto < 0 || cproto == JS_CFUNC_f_f_f)
++#endif
++        ) {
++        double d1, d2;
++
++        if (JS_ToFloat64(ctx, &d1, argv[0]) || JS_ToFloat64(ctx, &d2, argv[1]))
++            return -1;
++        if (js_poll_interrupts(ctx))
++            return -1;
++        *out = js_number(p->u.cfunc.c_function.f_f_f(d1, d2));
++        return 1;
++    }
+@@ -70604 +70729 @@
+-            rv = js_call_c_function(ctx, callee, this_obj, na, argv, 0);
++            rv = aot_call_c_frame(ctx, callee, p, this_obj, na, argv);
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -117,0 +118,2 @@
++    /* The call's argument count (a uint16_t) and the argument vector the activation was called with (record frames only). */
++    uint32_t off_regrun_argc, off_regrun_argv;
+@@ -690,0 +693,3 @@
++/* Fill the cache cell of a global-read site for a plain data property, running no user code: 1 when the site now holds, else 0. */
++QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int atom);
++

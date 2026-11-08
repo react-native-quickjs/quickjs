@@ -1,0 +1,15 @@
+Subject: regvm_fuse_branches reads the operands of the instruction before a branch only when it has some
+
+What this does
+  - `regvm_fuse_branches` tested `prev->ops[0] != d` and then read `prev->ops[1]` for every instruction that precedes a conditional branch, including ones with no operands (`n_ops` 0 or 1). The instruction array comes from js_malloc and `regvm_ir_add` copies only `n_ops` operands, so those reads were of uninitialised memory. The gate now requires `prev->n_ops >= 2` first.
+
+Why we need it
+  F50: valgrind (register VM host build, quickjs_bytecode_tests, the module-dependency compile in the bytecode sweep test) reported "Conditional jump or move depends on uninitialised value(s)" at this test (rc=9). Every fusion below the gate is guarded by `prev->rop` and an exact `n_ops`, so a stale value could not produce a wrong fusion; it made the gate's outcome depend on heap contents, which is a determinism defect the valgrind lane is there to catch.
+
+Soundness
+  A fusion needs the previous instruction's operands 0 and 1 (the destination and the compare sub-op), so an instruction with fewer than two operands never qualified.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -73873 +73873 @@
+-                prev->ops[0] != d)
++                prev->n_ops < 2 || prev->ops[0] != d)

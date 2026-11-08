@@ -1,0 +1,19 @@
+Subject: An entry record that resumes in the interpreter after a deopt returns through the caller-less path
+
+What this does
+  - `aot_call_record` clears `REGVM_FLAG_TRIVIAL_RET` on the record before it resumes the threaded interpreter at the deopt pc.
+
+Why we need it
+  A record eligible for the trivial return carries the flag. The record entered through `aot_call_record` has no caller: its return leaves to the C function that entered it (`regvm_t_return_common` returns NULL, and the C function reads `rec->ret`). The trivial return path instead moves the value into the register of `f->caller` and dispatches there.
+
+Failure
+  Not reachable from the code the generator emitted until now: its only deopt was an impossible entry pc. With the generic bodies replaced by a continuation in the interpreter (QJS_AOT_NOGENERIC), any compiled function entered as a record whose exit is followed by a `return` in the interpreter dereferenced a NULL caller (EXC_BAD_ACCESS at `regvm_t_return_trivial`, `c->fr`). vcase f41-throw-after-exit.
+
+Soundness
+  The flag only selects the cheaper return path; without it the record takes the general path, which is the one a caller-less record already takes everywhere else. A record that never deopts keeps the flag.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -69979,0 +69980,3 @@
++            /* the record has no caller: a return from the interpreter leaves through regvm_t_return_common
++               (NULL), never through the trivial path, which moves the value into `caller`'s register */
++            rec->flags &= ~REGVM_FLAG_TRIVIAL_RET;

@@ -166,8 +166,8 @@ static int def_from_record(const Q2Insn *in) {
          speculation about one value. */
       return in->ndef > 0;
     case Q2_OP_UNARY:
-      /* `neg` carries its result's type in the record as well. */
-      return in->rop == ROP_neg;
+      /* `neg` and the bitwise `~` (ROP_not) carry their result's type in the record as well: a loop-carried `x = ~x` was boxed for good otherwise. */
+      return in->rop == ROP_neg || in->rop == ROP_not;
     default:
       return 0;
   }
@@ -478,6 +478,9 @@ static int transfer_def(
         return E_LB_TAG;
       }
       if (sub == REG_UN_INC || sub == REG_UN_DEC) return rep_inc_rec(a, dv);
+      /* `v === undefined`, `v === null`, `v == null`: the engine's handler is a tag test, so the result is a bool whatever the operand's representation. */
+      if (sub == REG_UN_IS_UNDEFINED || sub == REG_UN_IS_NULL || sub == REG_UN_IS_UNDEFINED_OR_NULL)
+        return a == E_LB_BOT ? E_LB_BOT : E_LB_BOOL;
       if (sub == REG_UN_NOT || sub == REG_UN_LNOT) {
         if (a == E_LB_BOT) return E_LB_BOT;
         if (a == E_LB_BOOL || lb_num(a)) return E_LB_BOOL;

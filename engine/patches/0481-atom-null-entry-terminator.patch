@@ -1,0 +1,47 @@
+Subject: The bytecode reader rejects JS_ATOM_NULL as a module, import or export name; the JS_ATOM_NULL entry carries the terminator of an empty string body
+
+What this does
+  - `bc_get_name_atom` reads an atom that must name something (a module's name, a required module, an export's local and export names, an import's name) and fails the load with a SyntaxError ("invalid module name atom") when it is JS_ATOM_NULL.
+  - The atom table's entry 0 (JS_ATOM_NULL) is allocated one byte longer, so the zero-filled allocation ends with the NUL that every string body has (defence in depth).
+
+Why we need it
+  A mutated container named its required module with atom 0. JS_AtomToString(JS_ATOM_NULL) returns that entry as an empty 8-bit string and JS_ToCStringLen returns the bytes of a normal string in place; the entry was only sizeof(JSString) long, so the C string pointed one byte past the allocation and js_default_module_normalize_name read name[0] there (ASan heap-buffer-overflow in quickjs_bytecode_tests ReaderRejectsOutOfRangeConstantsAndModuleIndices). The writer never emits atom 0 for these names, so the reader should not have accepted it.
+
+Soundness
+  Containers the writer produces never use JS_ATOM_NULL for these names (every bytecode and round-trip test loads as before). The extra byte is zero from js_mallocz_rt; nothing reads the entry as longer than 0 characters.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -6062,2 +6062,3 @@
+-            /* JS_ATOM_NULL entry */
+-            p = js_mallocz_rt(rt, sizeof(JSAtomStruct));
++            /* JS_ATOM_NULL entry. JS_AtomToString hands it out as the (empty) string it is, and JS_ToCStringLen
++               returns a string's bytes in place: they need the terminator that follows every string body. */
++            p = js_mallocz_rt(rt, sizeof(JSAtomStruct) + 1);
+@@ -84921,0 +84923,12 @@
++/* An atom that names a module or one of its imports and exports: JS_ATOM_NULL names nothing, and the writer never emits it. */
++static int bc_get_name_atom(BCReaderState *s, JSAtom *patom)
++{
++    if (bc_get_atom(s, patom))
++        return -1;
++    if (unlikely(*patom == JS_ATOM_NULL)) {
++        JS_ThrowSyntaxError(s->ctx, "invalid module name atom");
++        return -1;
++    }
++    return 0;
++}
++
+@@ -86385 +86398 @@
+-    if (bc_get_atom(s, &module_name))
++    if (bc_get_name_atom(s, &module_name))
+@@ -86412 +86425 @@
+-            if (bc_get_atom(s, &rme->module_name))
++            if (bc_get_name_atom(s, &rme->module_name))
+@@ -86451 +86464 @@
+-                if (bc_get_atom(s, &me->local_name))
++                if (bc_get_name_atom(s, &me->local_name))
+@@ -86454 +86467 @@
+-            if (bc_get_atom(s, &me->export_name))
++            if (bc_get_name_atom(s, &me->export_name))
+@@ -86488 +86501 @@
+-            if (bc_get_atom(s, &mi->import_name))
++            if (bc_get_name_atom(s, &mi->import_name))

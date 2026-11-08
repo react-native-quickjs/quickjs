@@ -1,0 +1,31 @@
+Subject: A throw in the interpreter on a C-entered frame that has a caller returns to its C owner
+
+What this does
+  - `regvm_t_unwind_loop` tests `REGVM_FLAG_C_ENTRY` before `f->caller == NULL`, so a C-entered frame that has a caller ends the unwind and hands `JS_EXCEPTION` back to the C function that entered it.
+
+Why we need it
+  The frames compiled code builds for its callees (native entries, exit frames, inlined levels) are on the C stack, flagged C_ENTRY, and have a caller. The unwind loop took such a frame for an arena light frame: it computed the arena top from a C-stack address (a huge value stored in `regvm_frames_top`), freed the variable area, and continued in the caller. The next light call then allocated its frame at that bogus top.
+
+Failure
+  Not reachable until exits continue in the interpreter instead of the generated generic body (QJS_AOT_NOGENERIC): a TypeError thrown in the interpreter after an exit (null receiver in a native-method call from a region) crashed in `regvm_t_return` storing the next callee's result through `c->fr == NULL`. vcases r-native-this, r-construct, r-native-construct.
+
+Soundness
+  C-entered frames were already documented to be released by their C frame on both the return and the throw path; the test only moves ahead of the caller test.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -34597,0 +34598,8 @@
++    /* A C-entered activation is released by the C frame that entered it, on
++       both the return and the throw path. The frame compiled code builds for its
++       callee has a caller, so the flag is tested first: such a frame is on the C
++       stack, not in the arena. */
++    if (unlikely(f->flags & REGVM_FLAG_C_ENTRY)) {
++        f->ret = JS_EXCEPTION;
++        return REGVM_C_RET;
++    }
+@@ -34599,6 +34606,0 @@
+-        /* A C-entered activation is released by the C frame that entered it, on
+-           both the return and the throw path. */
+-        if (unlikely(f->flags & REGVM_FLAG_C_ENTRY)) {
+-            f->ret = JS_EXCEPTION;
+-            return REGVM_C_RET;
+-        }

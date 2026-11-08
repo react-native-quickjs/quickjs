@@ -1,0 +1,25 @@
+Subject: AOT: dropping the binding of a function the unit has switched off
+
+What this does
+  - `qjs_aot_unbind_fn(f)` drops the compiled binding of the running frame's function (`js_aot_unbind`). The generated deopt stub of a function calls it once the profitability gate has switched the function off (`e_gate`), so the function's later calls take the interpreter's own call path.
+
+Why we need it
+  R5 call.method_poly (0.87x of the interpreter): the anonymous method crossed the exit gate and was switched off, but stayed bound: each of its 129 million later calls entered the compiled stub and left through the deopt. A function that exits on more than a sixteenth of its entries is cheaper left to the interpreter altogether (the kit repro gatebind: 343 entries instead of 600000).
+
+Soundness
+  It is the same unbind `qjs_aot_deopt` performs when a deopt site crosses its limit, at the same point (inside the entry of the function being left); a compiled caller that compared the callee's entry sees the function unbound and takes its miss path.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -69901,0 +69902,7 @@
++/* A function the unit has switched off (its exits crossed the profitability gate) is bound for ever otherwise: each call enters the compiled stub only to
++   deopt, which costs more than the interpreter's own call. Dropping the binding makes its later calls take the interpreter's path. */
++QJS_AOT_STUB void qjs_aot_unbind_fn(JSRegRun *f)
++{
++    js_aot_unbind(f->b);
++}
++
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -311,0 +312,2 @@
++/* Drop the compiled binding of f's function (a function the unit has switched off): its later calls run the interpreter's own call path. */
++QJS_AOT_STUB void qjs_aot_unbind_fn(JSRegRun *f);

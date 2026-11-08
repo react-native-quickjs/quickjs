@@ -1,79 +1,74 @@
 #!/usr/bin/env python3
-"""Size anatomy of a generated AOT unit: lines and bytes by kind of C function (brace-depth count), the largest functions, exit-stub count.
+"""Size anatomy of a generated AOT unit: C lines and bytes by kind of top-level item, the largest functions, exit-stub labels.
 
   unit-anatomy.py u.c [--top N] [--tsv]
 
-Kinds are the generator's name prefixes: aot_s_/aot_f_ (speculative body), aot_g_ (generic body), aot_n_/aot_nb_/aot_nx_/aot_rx_ (entries, trampolines), e_*/q2_*/rg_* (helpers
-re-emitted in every unit), everything else at file scope (prelude: macros, tables, declarations) is counted as 'other'.
+Uses the item parser of unit-build.py, so multi-line function heads and conditional braces are handled. Kinds, by symbol prefix:
+  spec     aot_s_/aot_f_ bodies (the speculative and the region bodies)
+  generic  aot_g_ bodies and the e_gfs_ flags
+  inline   ei_ always-inline copies of callees
+  tramp    aot_nx_/aot_nb_/aot_rx_/aot_nr_ trampolines
+  entry    aot_n_ entries, aot_fs_
+  region   rg_/rk_/rgc_ per-function support (caches, init, claims)
+  helper   e_*/q2_* helpers of the prelude
+  other    everything else at file scope (types, tables, macros, declarations)
 """
-import re, sys, collections
+import collections, importlib.util, os, re, sys
 
-def kind(name):
-    for p, k in (("aot_s_", "spec"), ("aot_f_", "spec"), ("aot_g_", "generic"), ("aot_nx_", "tramp"), ("aot_nb_", "tramp"),
-                 ("aot_rx_", "tramp"), ("aot_n_", "entry"), ("ei_", "inline"), ("e_", "helper"), ("q2_", "helper"), ("rg_", "helper"), ("qjs_aot_", "helper")):
+here = os.path.dirname(os.path.abspath(__file__))
+spec = importlib.util.spec_from_file_location('ub', os.path.join(here, 'unit-build.py'))
+ub = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ub)
+
+PREFIX = (('aot_s_', 'spec'), ('aot_f_', 'spec'), ('aot_g_', 'generic'), ('e_gfs_', 'generic'), ('ei_', 'inline'),
+          ('aot_nx_', 'tramp'), ('aot_nb_', 'tramp'), ('aot_rx_', 'tramp'), ('aot_nr_', 'tramp'), ('aot_n_', 'entry'),
+          ('aot_fs_', 'entry'), ('rg_', 'region'), ('rk_', 'region'), ('rgc_', 'region'), ('rgga_', 'region'), ('rgp_', 'region'),
+          ('e_', 'helper'), ('q2_', 'helper'), ('qjs_aot_', 'helper'))
+
+
+def kind_of(name):
+    for p, k in PREFIX:
         if name.startswith(p):
             return k
-    return "other-fn"
+    return 'other'
+
 
 def main():
     path = sys.argv[1]
-    top = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else 10
-    src = open(path, errors="replace").read().split("\n")
-    funcs = []          # (name, start line, lines, bytes)
-    depth = 0
-    cur = None
-    kinds = collections.Counter(); kbytes = collections.Counter()
-    total_lines = len(src)
-    in_fn_lines = 0
-    for i, line in enumerate(src):
-        if depth == 0 and cur is None:
-            m = re.match(r'^(?:E_TEXT\s+)?(?:static\s+)?(?:inline\s+)?(?:__attribute__\(\([^)]*\)\)\s+)*[A-Za-z_][\w\s\*]*?\b([A-Za-z_]\w*)\s*\([^;]*$', line)
-            if m and "{" not in line and not line.strip().startswith("#"):
-                # a definition starts on a following line with '{'; remember the candidate name
-                cand = (m.group(1), i)
-            else:
-                cand = None
-            if line.rstrip().endswith("{") and cand is None:
-                m2 = re.match(r'^(?:E_TEXT\s+)?(?:static\s+)?(?:inline\s+)?[\w\s\*]*?\b([A-Za-z_]\w*)\s*\(.*\)\s*\{\s*$', line)
-                if m2:
-                    cur = [m2.group(1), i, 0, 0]
-            elif cand is not None:
-                pending = cand
-        # brace counting (ignore braces inside strings/comments crudely: strip string literals)
-        s = re.sub(r'"(\\.|[^"\\])*"', '""', line)
-        s = re.sub(r"'(\\.|[^'\\])'", "''", s)
-        s = re.sub(r'/\*.*?\*/', '', s)
-        s = s.split("//")[0]
-        opens = s.count("{"); closes = s.count("}")
-        if cur is None and depth == 0 and opens > 0:
-            # find name from preceding lines (up to 4 lines back)
-            back = " ".join(src[max(0, i - 4):i + 1])
-            m3 = re.findall(r'\b([A-Za-z_]\w*)\s*\([^()]*(?:\([^()]*\)[^()]*)*\)\s*(?:__attribute__\(\([^)]*\)\))?\s*\{?', back)
-            nm = m3[-1] if m3 else "?"
-            cur = [nm, i, 0, 0]
-        depth += opens - closes
-        if cur is not None:
-            cur[3] += len(line) + 1
-            if depth == 0:
-                cur[2] = i - cur[1] + 1
-                funcs.append(tuple(cur))
-                kinds[kind(cur[0])] += cur[2]; kbytes[kind(cur[0])] += cur[3]
-                in_fn_lines += cur[2]
-                cur = None
-    kinds["other-file-scope"] = total_lines - in_fn_lines
-    kbytes["other-file-scope"] = sum(len(l) + 1 for l in src) - sum(kbytes.values())
-    stubs = sum(1 for l in src if re.match(r'^\s*(vx|dx|ox|hx|rx|rp)_\d+:;?\s*$', l))
-    if "--tsv" in sys.argv:
-        print("\t".join([path, str(total_lines), str(sum(kbytes.values()))] + ["%s=%d" % (k, kinds[k]) for k in sorted(kinds)] + ["stubs=%d" % stubs, "maxfn=%d" % (max([f[2] for f in funcs]) if funcs else 0)]))
+    top = int(sys.argv[sys.argv.index('--top') + 1]) if '--top' in sys.argv else 10
+    src = open(path, errors='replace').read().split('\n')
+    items = ub.parse_items(src)
+    lines = collections.Counter()
+    nbytes = collections.Counter()
+    nfn = collections.Counter()
+    fns = []
+    for it in items:
+        if it.kind == 'code':
+            ub.classify(it)
+        if it.kind in ('fndef', 'data', 'proto'):
+            k = kind_of(it.name or '')
+        else:
+            k = 'other'
+        lines[k] += it.nlines
+        nbytes[k] += len(it.text) + 1
+        if it.kind == 'fndef':
+            nfn[k] += 1
+            fns.append((it.nlines, it.name))
+    total = len(src)
+    stubs = sum(1 for l in src if re.match(r'^\s*(?:[a-z]+_\d+|x_\d+|vx_\d+|dx_\d+|ix_\d+)\s*:', l))
+    if '--tsv' in sys.argv:
+        print('\t'.join([os.path.basename(os.path.dirname(os.path.abspath(path))), str(total), str(sum(nbytes.values()))] +
+                        [str(lines[k]) for k in ('spec', 'generic', 'inline', 'tramp', 'entry', 'region', 'helper', 'other')]))
         return
-    print("%s: %d lines, %.1f MB, %d C functions, %d exit-stub labels" % (path, total_lines, sum(kbytes.values()) / 1e6, len(funcs), stubs))
-    print("%-18s %10s %6s %10s" % ("kind", "lines", "%", "MB"))
-    for k, v in sorted(kinds.items(), key=lambda x: -x[1]):
-        print("%-18s %10d %5.1f%% %10.2f" % (k, v, 100.0 * v / total_lines, kbytes[k] / 1e6))
-    print("largest functions:")
-    for f in sorted(funcs, key=lambda f: -f[2])[:top]:
-        print("  %7d lines  %-60s (line %d)" % (f[2], f[0][:60], f[1] + 1))
-    over = sum(1 for f in funcs if f[2] > 3000)
-    print("functions over 3000 lines: %d" % over)
+    print('%s: %d lines, %.1f MB, %d C functions, %d exit-stub labels' % (path, total, sum(nbytes.values()) / 1e6, len(fns), stubs))
+    print('%-10s %9s %6s %7s %6s' % ('kind', 'lines', '%', 'MB', 'fns'))
+    for k, n in lines.most_common():
+        print('%-10s %9d %5.1f%% %7.2f %6d' % (k, n, 100.0 * n / total, nbytes[k] / 1e6, nfn[k]))
+    fns.sort(reverse=True)
+    print('largest functions:')
+    for n, nm in fns[:top]:
+        print('  %7d lines  %s' % (n, nm))
+    print('functions over 3000 lines: %d' % sum(1 for n, _ in fns if n > 3000))
+
 
 main()

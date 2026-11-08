@@ -1,0 +1,104 @@
+Subject: AOT: a store to a global no fact group lists skips the group scan, and an atom watched only by int32 folds is dropped by the first write it reports
+
+What this does
+  - `js_aot_obj_event` returns at once for a STORE event whose atom no fact group lists. `JSAotFacts` gains `listed_bloom[4]` (a bit per atom hash, set when a group lists a property, never cleared); a STORE breaks a group only through a listed atom (`k >= 0`), so skipping the scan for any other atom is exact. The scan walked every fact group of the runtime on every direct store to a watched global.
+  - The global watch list records, per watched atom, whether a fact group depends on it (`aot_gwatch_fact[]`: set by `qjs_aot_global_watch`, clear when only `qjs_aot_global_fold` registered it). The first write the engine reports for an atom watched only by folds moves the epoch and drops the atom from the list (`js_aot_gwatch_drop`, which also invalidates the global cells so they refill and take the direct store again). `js_aot_gwatch_find` replaces the boolean test where the index is needed.
+
+Why we need it
+  R5 (compiler_bench var.global_write ran at 0.20x of the interpreter inside the full benchmark and at 1.0x alone). A global the profile showed constant at its read sites is folded as a literal and watched; every later write took the slow store path, bumped the epoch and scanned all fact groups (sampled: most of the time in js_aot_obj_event), so the cost grew with the size of the program. With the two changes the same kernel in the same program runs in 14.3 ms against 54.7 ms in the interpreter (it was 283 ms).
+
+Soundness
+  The epoch bump of the first reported write makes every body that holds the literal leave at its next epoch test, and a body entered later re-confirms its folds against the live value at the entry that follows an epoch change (`qjs_aot_global_fold` compares the value and watches the atom again when it still matches), so a write that is no longer reported cannot be missed by a body that holds the old value. An atom a fact group depends on is never dropped, and its stores still reach `js_aot_obj_event`; the bloom test only removes calls that could not have broken a group.
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -888,0 +889,4 @@
++    /* per watched atom: 1 when a fact group (not only an int32 fold) depends on it. An atom watched only by folds is dropped from the list by the first
++       write it reports: the epoch moved, every folded literal is stale, and the next entry of a body re-confirms its folds against the live value (which
++       watches the atom again if it still matches). Otherwise a global written in a loop paid the epoch bump and the list on every store. */
++    uint8_t aot_gwatch_fact[JS_AOT_GWATCH_MAX];
+@@ -17007,0 +17012,14 @@
++}
++
++static void js_gv_cell_invalidate(JSRuntime *rt);
++
++/* The index of `atom` on the watch list, or -1. */
++static inline int js_aot_gwatch_find(JSRuntime *rt, JSAtom atom)
++{
++    uint32_t i;
++    if (likely(rt->aot_gwatch_n == 0) || !(rt->aot_gwatch_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
++        return -1;
++    for (i = 0; i < rt->aot_gwatch_n; i++)
++        if (rt->aot_gwatch[i] == atom)
++            return (int)i;
++    return -1;
+@@ -17009,0 +17028,12 @@
++/* Drop entry `gi` (swap with the last). The bloom filter keeps the bit: it only ever over-reports. The cells filled while the atom was watched never took the
++   direct store, so they are dropped and refill. */
++static void js_aot_gwatch_drop(JSRuntime *rt, int gi)
++{
++    uint32_t last = --rt->aot_gwatch_n;
++    JSAtom a = rt->aot_gwatch[gi];
++    rt->aot_gwatch[gi] = rt->aot_gwatch[last];
++    rt->aot_gwatch_fact[gi] = rt->aot_gwatch_fact[last];
++    JS_FreeAtomRT(rt, a);
++    js_gv_cell_invalidate(rt);
++}
++
+@@ -17014 +17044,2 @@
+-    if (unlikely(rt->aot_gwatch_n != 0) && js_aot_gwatched(rt, atom))
++    int gi;
++    if (unlikely(rt->aot_gwatch_n != 0) && (gi = js_aot_gwatch_find(rt, atom)) >= 0) {
+@@ -17015,0 +17047,3 @@
++        if (!rt->aot_gwatch_fact[gi])
++            js_aot_gwatch_drop(rt, gi);
++    }
+@@ -17024 +17058,2 @@
+-    if (!js_aot_gwatched(rt, atom))
++    int gi = js_aot_gwatch_find(rt, atom);
++    if (gi < 0)
+@@ -17028,0 +17064,2 @@
++    if (!rt->aot_gwatch_fact[gi])
++        js_aot_gwatch_drop(rt, gi);
+@@ -17079,0 +17117,3 @@
++    /* The atoms any group lists as an expected property value (a bit per atom hash, never cleared): a STORE of an atom no group lists cannot break one, so
++       the event scan is skipped for it. Without this every direct store to a watched global walked every group of the runtime. */
++    uint64_t listed_bloom[4];
+@@ -17081,0 +17122,5 @@
++static inline void js_aot_facts_note_listed(JSAotFacts *F, JSAtom atom)
++{
++    F->listed_bloom[(atom >> 6) & 3] |= (uint64_t)1 << (atom & 63);
++}
++
+@@ -17201,0 +17247,4 @@
++    /* a store breaks a group only through an atom the group lists (the STORE case below needs k >= 0) */
++    if (ev == JS_AOT_EV_STORE && atom != JS_ATOM_NULL &&
++        !(F->listed_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
++        return;
+@@ -17340,0 +17390 @@
++        js_aot_facts_note_listed(F, atoms[i]);
+@@ -17389,0 +17440,2 @@
++        if (g->rt->aot_facts != NULL)
++            js_aot_facts_note_listed(g->rt->aot_facts, atom);
+@@ -68138,7 +68190,13 @@
+-    if (!js_aot_gwatched(rt, (JSAtom)atom)) {
+-        if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
+-            return 0;
+-        rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
+-        rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
+-        /* the cells filled so far may take the direct store */
+-        js_gv_cell_invalidate(rt);
++    {
++        int gi = js_aot_gwatch_find(rt, (JSAtom)atom);
++        if (gi >= 0) {
++            rt->aot_gwatch_fact[gi] = 1;
++        } else {
++            if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
++                return 0;
++            rt->aot_gwatch_fact[rt->aot_gwatch_n] = 1;
++            rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
++            rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
++            /* the cells filled so far may take the direct store */
++            js_gv_cell_invalidate(rt);
++        }
+@@ -68166,0 +68225 @@
++        rt->aot_gwatch_fact[rt->aot_gwatch_n] = 0;   /* a fold only: the first reported write drops it */
