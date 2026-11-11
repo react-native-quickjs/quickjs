@@ -1,0 +1,27 @@
+Subject: Register VM: the activation counter table reports its length
+
+What this does
+  - quickjs.c: qjs_aot_icount_table() returns the number of counters (the unit table's size) through its argument.
+
+Why we need it
+  The unit's report read QJS_AOT_NFUNCS counters from a table allocated for the unit table's count; the functions past it printed heap garbage.
+
+Soundness
+  Read-only.
+
+Failure modes
+  None.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -68604,8 +68604,9 @@
+ uint64_t *js_aot_icount;
+ 
+ /* The unit's report reads the counters through this (a weak reference there, so a unit also links against an engine without it). */
+-const uint64_t *qjs_aot_icount_table(void)
++const uint64_t *qjs_aot_icount_table(unsigned *n)
+ {
++    *n = js_aot_icount != NULL ? (unsigned)qjs_aot_count : 0u;
+     return js_aot_icount;
+ }
+ #endif

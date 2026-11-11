@@ -1,0 +1,52 @@
+Subject: The free walk prefetches the cells it is about to touch
+
+What this does
+  - quickjs.c free_plain_object: before releasing a plain object's fields it prefetches the count cell of every counted child, so the cache misses of the decrements overlap; a child pushed on the pending stack has its property block prefetched.
+  - quickjs.c js_drc_reconcile_locked: the loop that frees parked plain objects prefetches the cell of the object 8 entries ahead and the property block of the one 4 ahead.
+
+Why we need it
+  On splay 57% of the reconcile is one instruction: the miss on a dead child's reference count during subtree teardown. Each decrement waited for its own miss.
+
+Soundness
+  Prefetches have no architectural effect; the addresses are derived from pointers already held.
+
+Failure modes
+  A few extra instructions per freed object on a heap that fits in cache (about +1% instructions on kit/tree.js).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -11597,6 +11597,15 @@
+         assert(rt->gc_phase == JS_GC_PHASE_DECREF);
+         sh = p->shape;
+         pr = get_shape_prop(sh);
++        /* The children's counts live in cells that are usually cold: ask for all of them first so the misses overlap
++           instead of each decrement waiting for its own. */
++        if (likely(sh->prop_count > 1)) {
++            for(i = 0; i < sh->prop_count; i++) {
++                JSValue v0 = p->prop[i].u.value;
++                if (JS_VALUE_HAS_REF_COUNT(v0))
++                    __builtin_prefetch(js_rc(JS_VALUE_GET_PTR(v0)), 1, 3);
++            }
++        }
+         for(i = 0; i < sh->prop_count; i++) {
+             if (likely(!(pr->flags & JS_PROP_TMASK))) {
+                 JSValue v = p->prop[i].u.value;
+@@ -11611,6 +11620,7 @@
+ 
+                         if (likely(c->class_id == JS_CLASS_OBJECT) && likely(!c->has_weak_ref) &&
+                             !JS_GC_IN_ZCT(c)) {
++                            __builtin_prefetch(c->prop, 0, 3);
+                             stk[sp++] = c;
+                             pr++;
+                             continue;
+@@ -12267,6 +12277,10 @@
+         facc.count = facc.size = 0;
+         rt->gc_phase = JS_GC_PHASE_DECREF;
+         for (i = 0; i < w; i++) {
++            if (i + 8 < w)
++                __builtin_prefetch(js_rc(rt->zpark[i + 8]), 1, 3);
++            if (i + 4 < w)
++                __builtin_prefetch(((JSObject *)rt->zpark[i + 4])->prop, 0, 3);
+             p = rt->zpark[i];
+             assert(JS_REF_COUNT(p) == 0 && JS_GC_IN_ZCT(p));
+             DRC_ST(drc_st_freed);

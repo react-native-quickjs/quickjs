@@ -417,6 +417,8 @@ static int transfer_def(
         case REG_BIN_XOR:
         case REG_BIN_SHL:
         case REG_BIN_SAR:
+          /* a boolean operand of an immediate form converts to 0 or 1 (ToInt32 of a boolean) */
+          if ((in->rop == ROP_binary_imm || in->rop == ROP_binary_imm_s) && a == E_LB_BOOL) a = E_LB_I32;
           return rep_bit(a, b);
         case REG_BIN_SHR:
           /* A logical shift right by a constant of 1 to 31 gives a value below 2^31 whatever the

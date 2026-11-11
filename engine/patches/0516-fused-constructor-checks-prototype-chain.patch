@@ -1,0 +1,53 @@
+Subject: A fused constructor build checks the prototype chain for its field names
+
+What this does
+  - `JSFunctionBytecode.ctor_fused_ep`: the aot_pic_epoch under which the constructor's field names were last checked against the prototype chain of the finished shape (set unchecked when the shape is learned).
+  - `qjs_aot_new_fused` builds the instance only when `ic_store_is_plain_add(shape, atom)` holds for every field (no exotic prototype, no setter or read-only property of that name on the chain); the check repeats only after aot_pic_epoch has moved. Otherwise it returns JS_UNINITIALIZED and the caller constructs the ordinary way.
+
+Why we need it
+  The fused build stores the fields by allocating the finished shape. A setter added to the prototype after the shape was learned (it defines the own property itself, so the shape is the same) was skipped. The prototype-watchpoint epoch cannot say so once it has saturated, and the fused build never looked at it; aot_pic_epoch moves for every such definition whether saturated or not. .local/kit/cases/stub_sat.js (setter ran 6000 times, expected 12000).
+
+Soundness
+  Any definition of an accessor, a read-only property or a new property on an object that is a prototype moves aot_pic_epoch (ic_watchpoint_bump), so a verdict taken at epoch E holds while the epoch is E.
+
+Failure modes
+  A runtime that moves the epoch constantly re-walks the chain per construct (a few property lookups per field).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1887,6 +1887,7 @@
+     uint8_t ctor_final_tries;
+     uint16_t ctor_proto_slot;
+     uint8_t ctor_inst_next;
++    uint32_t ctor_fused_ep; /* aot_pic_epoch when the field names were last checked against the prototype chain (see qjs_aot_new_fused) */
+     int byte_code_len;
+     /* Runtime-only unified IC storage. It is allocated on first successful fill. */
+     JSICEntry *ic_table;
+@@ -71035,6 +71036,19 @@
+         !cb->is_derived_class_constructor && !JS_AOT_LAYOUT_CTOR(cb)) {
+         pv = ctor->prop[cb->ctor_proto_slot].u.value;
+         if (JS_VALUE_GET_TAG(pv) == JS_TAG_OBJECT && sh->proto == JS_VALUE_GET_OBJ(pv)) {
++            /* Each field is stored by the constructor as a property add; building the object from the finished shape is the same
++               only while no object on the prototype chain has a setter, a read-only property or an exotic behaviour for that name.
++               Every such definition moves aot_pic_epoch (also once the watchpoint epoch is saturated), so the check is repeated
++               only after it moved. */
++            if (unlikely(cb->ctor_fused_ep != ctx->rt->aot_pic_epoch)) {
++                for (i = 0; i < nf; i++) {
++                    JSAtom atom;
++                    memcpy(&atom, cb->regvm_code + fm[1 + 2 * i], sizeof(atom));
++                    if (!ic_store_is_plain_add(sh, atom))
++                        return JS_UNINITIALIZED;
++                }
++                cb->ctor_fused_ep = ctx->rt->aot_pic_epoch;
++            }
+             { qjs_y_oldcap[cb->inst_inline_cap & 15]++; }
+             obj = js_new_plain_object(ctx, js_dup_shape(sh), cb->inst_inline_cap);
+             if (unlikely(JS_IsException(obj)))
+@@ -71133,6 +71147,7 @@
+     js_fnbc_gc_force_trace(rt, cb);
+     cb->ctor_final_shape = js_dup_shape(sh);
+     cb->ctor_fused_ok = !cb->is_derived_class_constructor && !JS_AOT_LAYOUT_CTOR(cb);
++    cb->ctor_fused_ep = rt->aot_pic_epoch - 1;
+ }
+ 
+ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)

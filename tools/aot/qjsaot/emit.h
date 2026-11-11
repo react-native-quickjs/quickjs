@@ -246,4 +246,5 @@ int qjs_aot_frame_regs(int index);
 #include <stdlib.h>
 static inline int e_nogeneric(void) { return getenv("QJS_AOT_GENERIC") == NULL; }
 
+int qjs_aot_rat_mode(void);
 #endif /* QJSAOT_EMIT_H */

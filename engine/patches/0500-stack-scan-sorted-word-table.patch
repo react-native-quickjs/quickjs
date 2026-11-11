@@ -1,0 +1,210 @@
+Subject: The native-stack scan looks up the stack's words, not every parked value's ranges
+
+What this does
+  - quickjs.c: `ss_scan` reads the stack first and keeps only the words that can name a heap block (inside the span of addresses the allocator has returned blocks from, which `js_heap_note` maintains at every block allocation). Those words go into a granule hash with a bit filter (a sorted array only for long ranges); each parked value then tests its object, property and element ranges against the filter and looks up only on a hit.
+
+Why we need it
+  The scan sorted and searched a range table of every parked value (3,000 or more per reconcile) and looked up every stack word in it: 11% of pdfjs cycles, 27% of raytrace cycles and 40% of splay cycles went to `ss_rng_*`, qsort and the scan itself.
+
+Soundness
+  A word inside two ranges pins both values (the earlier nearest-start rule pinned one), which is a superset; a word outside the heap span cannot name a block. Interior pointers into long ranges are found through the sorted array.
+
+Failure modes
+  None beyond the earlier scan's conservative pinning.
+
+Tests
+  Octane pdfjs, raytrace, splay, deltablue, richards and earleyboyer units run to a score with their checks; the pin phase per scan fell by about half.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -3451,6 +3451,16 @@
+     return ar->blocks + (size_t)idx * block_size;
+ }
+ 
++/* The span of addresses the allocator has ever returned a block from, so the native-stack scan can skip a word that cannot point into a heap block
++   (a return address, a stack address, a small integer). A block only ever lies inside it. */
++static uintptr_t js_heap_lo = ~(uintptr_t)0, js_heap_hi;
++static inline void js_heap_note(const void *p, size_t size)
++{
++    uintptr_t a = (uintptr_t)p;
++    if (a < js_heap_lo) js_heap_lo = a;
++    if (a + size > js_heap_hi) js_heap_hi = a + size;
++}
++
+ static no_inline JSArena *arena_new(JSRuntime *rt, int block_size_idx)
+ {
+     JSMallocBlockHeader *b;
+@@ -3462,6 +3472,7 @@
+     ar = rt->mf.js_malloc(rt->malloc_state.opaque, sizeof(JSArena) + (size_t)n_blocks * block_size);
+     if (!ar)
+         return NULL;
++    js_heap_note(ar, sizeof(JSArena) + (size_t)n_blocks * block_size);
+     ar->block_size_idx = block_size_idx;
+     ar->n_blocks = n_blocks;
+     ar->n_used_blocks = 0;
+@@ -3487,6 +3498,7 @@
+                          sizeof(JSMallocBlockHeader) + size);
+     if (!b)
+         return NULL;
++    js_heap_note(b, sizeof(JSMallocBlockHeader) + size);
+     b->u.block_idx = JS_ARENA_FREE_NIL;
+     b->block_size_idx = 0xff; /* fail safe */
+     b->gc_notrace = 0;
+@@ -3501,6 +3513,7 @@
+                          sizeof(JSMallocBlockHeader) + size);
+     if (!b)
+         return NULL;
++    js_heap_note(b, sizeof(JSMallocBlockHeader) + size);
+     b->u.block_idx = JS_ARENA_FREE_NIL;
+     b->block_size_idx = 0xff; /* fail safe */
+     b->gc_notrace = 0;
+@@ -3693,6 +3706,7 @@
+                                    sizeof(JSMallocBlockHeader) + size);
+             if (!nb)
+                 return NULL;
++            js_heap_note(nb, sizeof(JSMallocBlockHeader) + size);
+             nb->u.block_idx = JS_ARENA_FREE_NIL;
+             nb->block_size_idx = 0xff;
+             return nb->user_data;
+@@ -11885,35 +11899,71 @@
+ static JSValue *ss_vec; static uint32_t ss_n, ss_cap;
+ static void *ss_set_key[1 << 16]; static JSValue ss_set_val[1 << 16]; static uint32_t ss_used[1 << 15];
+ static inline void ss_push(JSValue v) { if (ss_n >= ss_cap) { ss_cap = ss_cap ? ss_cap * 2 : 4096; ss_vec = __builtin_realloc(ss_vec, ss_cap * sizeof(JSValue)); } ss_vec[ss_n++] = v; }
+-typedef struct { uintptr_t lo, hi; JSValue val; } SsRng;
+-static uint64_t ss_bm[1 << 12]; static SsRng *ss_rng; static uint32_t ss_rng_n, ss_rng_cap; static uintptr_t ss_rmin, ss_rmax;
+-static void ss_rng_add(uintptr_t lo, uintptr_t hi, JSValue val)
+-{
+-    if (ss_rng_n >= ss_rng_cap) { ss_rng_cap = ss_rng_cap ? ss_rng_cap * 2 : 8192; ss_rng = __builtin_realloc(ss_rng, ss_rng_cap * sizeof(SsRng)); }
+-    ss_rng[ss_rng_n].lo = lo; ss_rng[ss_rng_n].hi = hi; ss_rng[ss_rng_n].val = val; ss_rng_n++;
+-    { uintptr_t g_; uint32_t ng_ = 0; for (g_ = lo >> 6; g_ <= (hi - 1) >> 6 && ng_ < 128; g_++, ng_++) { uint32_t h_ = (uint32_t)((g_ * 0x9E3779B97F4A7C15ull) >> 46); ss_bm[h_ >> 6] |= (uint64_t)1 << (h_ & 63); } }
+-    if (lo < ss_rmin) ss_rmin = lo;
+-    if (hi > ss_rmax) ss_rmax = hi;
++/* The words of the native stack that could point into a heap block. A parked value is a root when one of them lies in one of its blocks.
++   Most blocks span a few 64-byte granules, so the words are entered in a small hash table keyed by granule and a block asks for each of
++   its granules; a block that spans many (an element array) or a stack with more words than the table holds uses the words sorted, which
++   is built the first time it is needed. The cost of a scan is then the words plus the parked blocks, not a sort of either. */
++#define SS_HT_BITS 11
++static uintptr_t *ss_sw; static uint32_t ss_sw_n, ss_sw_cap, ss_sw_sorted;
++static uintptr_t ss_hw[1 << SS_HT_BITS]; static uint32_t ss_hs[1 << SS_HT_BITS], ss_hep;
++/* a bit per hashed granule of the words entered, so a block that holds no word is rejected without probing the table */
++#define SS_BL_BITS 13
++static uint64_t ss_bl[1 << (SS_BL_BITS - 6)];
++static inline uint32_t ss_bh(uintptr_t g) { return (uint32_t)((g * 0xC2B2AE3D27D4EB4Full) >> (64 - SS_BL_BITS)); }
++static int ss_sw_cmp(const void *a, const void *b) { uintptr_t x = *(const uintptr_t *)a, y = *(const uintptr_t *)b; return x < y ? -1 : x > y; }
++static inline uint32_t ss_hh(uintptr_t g) { return (uint32_t)((g * 0x9E3779B97F4A7C15ull) >> (64 - SS_HT_BITS)); }
++static inline void ss_hadd(uintptr_t v)
++{
++    uint32_t h = ss_hh(v >> 6);
++    while (ss_hs[h] == ss_hep) h = (h + 1) & ((1u << SS_HT_BITS) - 1);
++    ss_hs[h] = ss_hep; ss_hw[h] = v;
++    { uint32_t q = ss_bh(v >> 6); ss_bl[q >> 6] |= (uint64_t)1 << (q & 63); }
++}
++/* Whether a stack word lies in [lo, hi); the value then gains one counted reference the unpin releases. */
++static inline int ss_hit(uintptr_t lo, uintptr_t hi, JSValue val)
++{
++    int found = 0;
++    uintptr_t g0 = lo >> 6, g1 = (hi - 1) >> 6;
++    if (ss_sw_n <= (1u << (SS_HT_BITS - 1)) && g1 - g0 < 16) {
++        uintptr_t g;
++        for (g = g0; g <= g1 && !found; g++) {
++            uint32_t h, q = ss_bh(g);
++            if (!((ss_bl[q >> 6] >> (q & 63)) & 1)) continue;
++            h = ss_hh(g);
++            while (ss_hs[h] == ss_hep) {
++                uintptr_t w = ss_hw[h];
++                if (w >= lo && w < hi) { found = 1; break; }
++                h = (h + 1) & ((1u << SS_HT_BITS) - 1);
++            }
++        }
++    } else {
++        uint32_t a = 0, b = ss_sw_n;
++        if (!ss_sw_sorted) { qsort(ss_sw, ss_sw_n, sizeof(uintptr_t), ss_sw_cmp); ss_sw_sorted = 1; }
++        while (a < b) { uint32_t mid = (a + b) / 2; if (ss_sw[mid] < lo) a = mid + 1; else b = mid; }
++        found = a < ss_sw_n && ss_sw[a] < hi;
++    }
++    if (found) { ++JS_REF_COUNT(JS_VALUE_GET_PTR(val)); ss_push(val); ss_stat[5]++; }
++    return found;
+ }
+ /* every byte range a derived pointer into a parked value can point into: the block (header word included), the property block, the array element block */
+ static void ss_rng_of(void *ptr, JSValue val)
+ {
+     uintptr_t p = (uintptr_t)ptr;
++    ss_stat[6]++;
+     if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
+         JSObject *o = ptr;
+-        ss_rng_add(p - 8, p + sizeof(JSObject) + 8 * sizeof(JSProperty) + 16, val);
+-        if (o->shape != NULL && o->prop != NULL && !o->prop_inline_cap && (uintptr_t)o->prop > 4096)
+-            ss_rng_add((uintptr_t)o->prop, (uintptr_t)o->prop + (size_t)o->shape->prop_size * sizeof(JSProperty), val);
++        if (ss_hit(p - 8, p + sizeof(JSObject) + 8 * sizeof(JSProperty) + 16, val)) return;
++        if (o->shape != NULL && o->prop != NULL && !o->prop_inline_cap && (uintptr_t)o->prop > 4096 &&
++            ss_hit((uintptr_t)o->prop, (uintptr_t)o->prop + (size_t)o->shape->prop_size * sizeof(JSProperty), val)) return;
+         if (o->fast_array && o->class_id == JS_CLASS_ARRAY && o->u.array.u.values != NULL)
+-            ss_rng_add((uintptr_t)o->u.array.u.values, (uintptr_t)o->u.array.u.values + (size_t)o->u.array.count * sizeof(JSValue), val);
++            ss_hit((uintptr_t)o->u.array.u.values, (uintptr_t)o->u.array.u.values + (size_t)o->u.array.count * sizeof(JSValue), val);
+     } else if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING || JS_VALUE_GET_TAG(val) == JS_TAG_STRING_ROPE) {
+         JSString *st = ptr;
+-        ss_rng_add(p - 8, p + sizeof(JSString) + ((size_t)st->len << st->is_wide_char) + 24, val);
++        ss_hit(p - 8, p + sizeof(JSString) + ((size_t)st->len << st->is_wide_char) + 24, val);
+     } else {
+-        ss_rng_add(p - 8, p + 64, val);
++        ss_hit(p - 8, p + 64, val);
+     }
+ }
+-static int ss_rng_cmp(const void *a, const void *b) { uintptr_t x = ((const SsRng *)a)->lo, y = ((const SsRng *)b)->lo; return x < y ? -1 : x > y; }
+ static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
+ {
+     uintptr_t lo, hi = rt->stack_top, *w;
+@@ -11921,18 +11971,11 @@
+     struct list_head *el;
+     __builtin_unwind_init();
+     __asm__ volatile("mov %%rsp, %0" : "=r"(lo));
+-    ss_rng_n = 0; ss_rmin = ~(uintptr_t)0; ss_rmax = 0; memset(ss_bm, 0, sizeof ss_bm);
+-    for (i = 0; i < rt->zpark_len; i++) __builtin_prefetch(rt->zpark[i]);
+-    for (i = 0; i < rt->zct_len; i++) __builtin_prefetch(JS_VALUE_GET_PTR(rt->zct[i]));
+-    for (i = 0; i < rt->zpark_len; i++) ss_rng_of(rt->zpark[i], JS_MKPTR(JS_TAG_OBJECT, rt->zpark[i]));
+-    list_for_each(el, &rt->gc_zero_ref_count_list) {
+-        JSGCObjectHeader *g = list_entry(el, JSGCObjectHeader, link);
+-        if (JS_GC_TYPE(g) == JS_GC_OBJ_TYPE_JS_OBJECT) ss_rng_of((void *)g, JS_MKPTR(JS_TAG_OBJECT, g));
+-    }
+-    for (i = 0; i < rt->zct_len; i++) ss_rng_of(JS_VALUE_GET_PTR(rt->zct[i]), rt->zct[i]);
+-    ss_stat[6] += ss_rng_n; ss_stat[7]++;
+-    qsort(ss_rng, ss_rng_n, sizeof(SsRng), ss_rng_cmp);
+     ss_n = 0;
++    ss_sw_n = 0;
++    ss_sw_sorted = 0;
++    memset(ss_bl, 0, sizeof ss_bl);
++    if (++ss_hep == 0) { memset(ss_hs, 0, sizeof ss_hs); ss_hep = 1; }
+     for (w = (uintptr_t *)(lo & ~(uintptr_t)7); (uintptr_t)w < hi; w++) {
+         uintptr_t v = *w;
+         ss_stat[0]++;
+@@ -11951,16 +11994,22 @@
+                 }
+             }
+         }
+-        if (v > 4096) {
+-        if (ss_rng_n && v >= ss_rmin && v < ss_rmax && ({ uint32_t h_ = (uint32_t)(((v >> 6) * 0x9E3779B97F4A7C15ull) >> 46); (ss_bm[h_ >> 6] >> (h_ & 63)) & 1; })) {
+-            uint32_t lo_i = 0, hi_i = ss_rng_n;
+-            while (lo_i < hi_i) { uint32_t mid = (lo_i + hi_i) / 2; if (ss_rng[mid].lo <= v) lo_i = mid + 1; else hi_i = mid; }
+-            /* ranges may overlap: walk back over the few that start below v */
+-            { uint32_t q; for (q = lo_i; q > 0 && q + 16 > lo_i; q--) if (v < ss_rng[q - 1].hi) { JSValue pv = ss_rng[q - 1].val; ++JS_REF_COUNT(JS_VALUE_GET_PTR(pv)); ss_push(pv); ss_stat[5]++; break; } }
+-        }
+-        next_w: ;
++        if (v - js_heap_lo < js_heap_hi - js_heap_lo || Y_REG((void *)v)) {
++            if (ss_sw_n >= ss_sw_cap) { ss_sw_cap = ss_sw_cap ? ss_sw_cap * 2 : 4096; ss_sw = __builtin_realloc(ss_sw, ss_sw_cap * sizeof(uintptr_t)); }
++            ss_sw[ss_sw_n++] = v; ss_stat[2]++;
++            if (ss_sw_n <= (1u << (SS_HT_BITS - 1))) ss_hadd(v);
+         }
+     }
++    if (ss_sw_n == 0) return;
++    ss_stat[7]++;
++    for (i = 0; i < rt->zpark_len; i++) __builtin_prefetch(rt->zpark[i]);
++    for (i = 0; i < rt->zct_len; i++) __builtin_prefetch(JS_VALUE_GET_PTR(rt->zct[i]));
++    for (i = 0; i < rt->zpark_len; i++) ss_rng_of(rt->zpark[i], JS_MKPTR(JS_TAG_OBJECT, rt->zpark[i]));
++    list_for_each(el, &rt->gc_zero_ref_count_list) {
++        JSGCObjectHeader *g = list_entry(el, JSGCObjectHeader, link);
++        if (JS_GC_TYPE(g) == JS_GC_OBJ_TYPE_JS_OBJECT) ss_rng_of((void *)g, JS_MKPTR(JS_TAG_OBJECT, g));
++    }
++    for (i = 0; i < rt->zct_len; i++) ss_rng_of(JS_VALUE_GET_PTR(rt->zct[i]), rt->zct[i]);
+ }
+ static void js_drc_pend_flush(JSRuntime *rt);
+ /* The unit tells the engine its root form: 1 = roots are found by scanning the native stack, 2 = frame records are found by their magic word. */

@@ -1,0 +1,226 @@
+Subject: Cycle collection also runs at the reconcile safepoint; a reconcile no longer ratchets the threshold
+
+What this does
+  - quickjs.c js_drc_reconcile: after the parked values are drained and while the registers are pinned, if the heap is past malloc_gc_threshold (and the runtime is not in deferred mode) it runs the cycle collection (js_gc_auto_pinned: young or full as js_gc_auto decides) and rearms the pace. js_run_gc is split into the pin and drain part and js_gc_passes, which the safepoint path shares.
+  - quickjs.c js_trigger_gc_slow: when a reconcile alone brought the heap under the threshold, the threshold is set to size + max(size / 2, 16 MB) directly; it no longer goes through js_gc_rearm_pace, which counted that reconcile as an unproductive collection and multiplied the step (up to 4x the heap) each time.
+  - quickjs.c js_gc_rearm_pace: the growth step is at least 16 MB.
+  - QJS_GC_STATS additionally prints the number of reconciles, the largest heap size seen at one, the last threshold, and how many collections each trigger path started.
+
+Why we need it
+  Compiled code that allocates from the nursery adds chunk bytes to malloc_size without going through the allocation threshold check, so the only collections were the teardown ones: deltablue piled up 1 GB of cyclic garbage. The reconcile safepoint runs often (the nursery trips it) and is a point where collection is as safe as in the allocation path. Separately, the reconcile-only branch fed the pace's unproductive streak, which raises the threshold by up to 5x per event.
+
+Soundness
+  The collection runs exactly as js_run_gc does after its own pin and drain (same state: registers pinned, parked lists drained, drc_in_reconcile cleared by the drain). Deferred mode keeps its rule (collect when the host asks).
+
+Failure modes
+  A collection at a safepoint in code that holds an object only in a native temporary that is neither pinned nor counted would free it; the allocation path had the same exposure. The 16 MB floor lets a small program hold up to 16 MB of cyclic garbage.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -3293,9 +3293,16 @@
+    objects but only frees cyclic garbage, so one that reclaimed nothing can be
+    delayed without retaining anything it would have freed; garbage produced
+    meanwhile is bounded by JS_GC_PACE_MAX_PCT. */
++/* Where collections were asked for (QJS_GC_STATS): the allocation threshold path (calls, reconcile that was enough, collection run) and the safepoint path. */
++static uint64_t gc_trig[4], gc_rec_n, gc_rec_peak, gc_rec_thr;
++static int gc_stat_on = -1;
++#define GC_MIN_STEP ((size_t)16 << 20)
++
+ static void js_gc_rearm_pace(JSRuntime *rt, size_t before, size_t after)
+ {
+     size_t step = after >> 1, maxstep;
++    if (step < GC_MIN_STEP)
++        step = GC_MIN_STEP;
+     size_t freed = before > after ? before - after : 0;
+     int unproductive;
+ 
+@@ -3315,6 +3322,8 @@
+     maxstep = (size_t)((uint64_t)after * JS_GC_PACE_MAX_PCT / 100);
+     if (maxstep < (after >> 1))
+         maxstep = after >> 1;                     /* never tighter than the rule */
++    if (maxstep < GC_MIN_STEP)
++        maxstep = GC_MIN_STEP;
+     if (step > maxstep)
+         step = maxstep;
+     rt->malloc_gc_threshold = after + step;
+@@ -3330,6 +3339,7 @@
+                 rt->malloc_gc_threshold);
+ #endif
+     if (force_gc) {
++        gc_trig[0]++;
+         /* deferred: collect at the next safepoint, not under running JS */
+         if (rt->gc_deferred && (rt->current_stack_frame != NULL
+                                 || regvm_light_head(rt->regvm_cur) != NULL) &&
+@@ -3363,12 +3373,19 @@
+                 js_drc_reconcile(rt);
+                 if (rt->malloc_state.malloc_size + size <=
+                     rt->malloc_gc_threshold) {
+-                    js_gc_rearm_pace(rt, before,
+-                                     rt->malloc_state.malloc_size);
++                    /* A reconcile is not a collection: it must not count as an unproductive one, or the threshold ratchets up by a factor of
++                       five each time the parked values are what grew the heap and cyclic garbage is never collected. */
++                    gc_trig[1]++;
++                    {
++                        size_t step_ = rt->malloc_state.malloc_size >> 1;
++
++                        rt->malloc_gc_threshold = rt->malloc_state.malloc_size + (step_ < GC_MIN_STEP ? GC_MIN_STEP : step_);
++                    }
+                     return;
+                 }
+             }
+ #endif
++            gc_trig[2]++;
+             js_gc_auto(rt);
+             rt->gc_pending = false;
+             js_gc_rearm_pace(rt, before, rt->malloc_state.malloc_size);
+@@ -12336,6 +12353,7 @@
+ }
+ 
+ static void js_drc_rearm_malloc_mark(JSRuntime *rt);
++static void js_gc_auto_pinned(JSRuntime *rt);
+ 
+ static void js_drc_reconcile(JSRuntime *rt)
+ {
+@@ -12343,6 +12361,19 @@
+     js_drc_pin(rt);
+     q1 = y_tsc();
+     js_drc_reconcile_locked(rt);
++    if (unlikely(gc_stat_on > 0)) {
++        gc_rec_n++;
++        if (rt->malloc_state.malloc_size > gc_rec_peak)
++            gc_rec_peak = rt->malloc_state.malloc_size;
++        gc_rec_thr = rt->malloc_gc_threshold;
++    }
++    /* The parked values are drained and the registers are pinned: if the heap has grown past the collection threshold, collect cycles here, while the
++       recent allocations are still in cache, instead of waiting for an allocation that goes through the slow path (compiled code that allocates from
++       the nursery never does). */
++    if (unlikely(rt->malloc_state.malloc_size > rt->malloc_gc_threshold) && !rt->gc_deferred) {
++        gc_trig[3]++;
++        js_gc_auto_pinned(rt);
++    }
+     q2 = y_tsc();
+     js_drc_unpin(rt);
+     q3 = y_tsc();
+@@ -13131,10 +13162,23 @@
+ /* Collector statistics, printed at exit when QJS_GC_STATS is set: per kind (0 full, 1 young) the number of runs, the cycles spent in the pin and reconcile, the trial-deletion
+    passes, the freeing of the garbage and the unpin, the objects examined (young: the set S; full: the length of gc_obj_list), the garbage found and the bytes freed. */
+ static struct { uint64_t n, c_pin, c_pass, c_free, c_unpin, examined, max_examined, garbage, bytes; } gc_stat[2];
+-static int gc_stat_on = -1;
++
++static void gc_stat_report(void);
++static void gc_stat_init(void)
++{
++    if (unlikely(gc_stat_on < 0)) {
++        gc_stat_on = getenv("QJS_GC_STATS") != NULL;
++        if (gc_stat_on)
++            atexit(gc_stat_report);
++    }
++}
+ 
+ static void gc_stat_report(void)
+ {
++    fprintf(stderr, "gc reconciles=%lu peak_malloc_size_at_reconcile=%lu threshold_at_last=%lu\n", (unsigned long)gc_rec_n, (unsigned long)gc_rec_peak,
++            (unsigned long)gc_rec_thr);
++    fprintf(stderr, "gc trigger: allocation threshold calls=%lu reconcile_enough=%lu collections=%lu; safepoint collections=%lu\n", (unsigned long)gc_trig[0],
++            (unsigned long)gc_trig[1], (unsigned long)gc_trig[2], (unsigned long)gc_trig[3]);
+     static const char *nm[2] = { "full", "young" };
+     int k;
+ 
+@@ -13148,15 +13192,13 @@
+     }
+ }
+ 
++static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0);
++
+ static void js_run_gc(JSRuntime *rt, bool young)
+ {
+-    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, tp = 0;
++    uint64_t t0 = 0;
+     size_t sz0 = rt->malloc_state.malloc_size;
+-    if (unlikely(gc_stat_on < 0)) {
+-        gc_stat_on = getenv("QJS_GC_STATS") != NULL;
+-        if (gc_stat_on)
+-            atexit(gc_stat_report);
+-    }
++    gc_stat_init();
+     if (unlikely(gc_stat_on))
+         t0 = __builtin_ia32_rdtsc();
+ #if QJS_REGVM && QJS_DRC_VALIDATE
+@@ -13169,6 +13211,23 @@
+     js_drc_pin(rt);
+     js_drc_reconcile_locked(rt);
+ #endif
++    js_gc_passes(rt, young, t0, sz0);
++#if QJS_DRC
++    js_drc_unpin(rt);
++    rt->zct_limit = (rt->zct_len + rt->zct_nobj) * 2;
++    if (rt->zct_limit < js_drc_minlim)
++        rt->zct_limit = js_drc_minlim;
++#ifdef QJS_DRC_STRESS
++    rt->zct_limit = 0;
++#endif
++    js_drc_rearm_malloc_mark(rt);
++#endif
++}
++
++/* The collection proper, with the registers pinned and the parked values drained by the caller. */
++static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0)
++{
++    uint64_t t1 = 0, t2 = 0, t3 = 0, t4 = 0, tp = 0;
+     if (unlikely(gc_stat_on))
+         t1 = __builtin_ia32_rdtsc();
+     if (young) {
+@@ -13213,16 +13272,6 @@
+         rt->gc_need_full = false;
+         rt->gc_full_after = rt->malloc_state.malloc_size;
+     }
+-#if QJS_DRC
+-    js_drc_unpin(rt);
+-    rt->zct_limit = (rt->zct_len + rt->zct_nobj) * 2;
+-    if (rt->zct_limit < js_drc_minlim)
+-        rt->zct_limit = js_drc_minlim;
+-#ifdef QJS_DRC_STRESS
+-    rt->zct_limit = 0;
+-#endif
+-    js_drc_rearm_malloc_mark(rt);
+-#endif
+     if (unlikely(gc_stat_on)) {
+         int k = young;
+ 
+@@ -13244,13 +13293,33 @@
+ /* The collection an allocation threshold or a pending request asks for: a young one while the heap has not grown past what the last full one left,
+    a full one at least every 8 collections and whenever a young one leaves the heap more than half larger than the last full one did (older
+    garbage cycles are then the likely cause). QJS_NOYOUNGGC=1 always runs the full one. */
++static bool js_gc_pick_young(JSRuntime *rt)
++{
++    if (js_gc_young_on < 0)
++        js_gc_young_on = getenv("QJS_NOYOUNGGC") == NULL;
++    return js_gc_young_on && !rt->gc_need_full && rt->gc_young_streak < 7 && rt->gc_full_after != 0;
++}
++
++/* The collection at a safepoint, with the registers pinned and the parked values drained by the caller (js_drc_reconcile). */
++static void js_gc_auto_pinned(JSRuntime *rt)
++{
++    bool young = js_gc_pick_young(rt);
++    size_t sz0 = rt->malloc_state.malloc_size;
++
++    gc_stat_init();
++    if (young)
++        rt->gc_young_streak++;
++    js_gc_passes(rt, young, unlikely(gc_stat_on) ? __builtin_ia32_rdtsc() : 0, sz0);
++    if (young && rt->malloc_state.malloc_size > rt->gc_full_after + (rt->gc_full_after >> 1))
++        rt->gc_need_full = true;
++    js_gc_rearm_pace(rt, sz0, rt->malloc_state.malloc_size);
++}
++
+ static void js_gc_auto(JSRuntime *rt)
+ {
+     bool young;
+ 
+-    if (js_gc_young_on < 0)
+-        js_gc_young_on = getenv("QJS_NOYOUNGGC") == NULL;
+-    young = js_gc_young_on && !rt->gc_need_full && rt->gc_young_streak < 7 && rt->gc_full_after != 0;
++    young = js_gc_pick_young(rt);
+     if (!young) {
+         js_run_gc(rt, false);
+         return;

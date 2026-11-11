@@ -3664,6 +3664,9 @@ typedef enum {
     RE_EXEC_STATE_SPLIT,
     RE_EXEC_STATE_LOOKAHEAD,
     RE_EXEC_STATE_NEGATIVE_LOOKAHEAD,
+    /* a greedy run of a single-character atom: four slots (run start, exit
+       pc, current end, link) that give back one character per backtrack */
+    RE_EXEC_STATE_RUN,
 } REExecStateEnum;
 
 #if INTPTR_MAX >= INT64_MAX
@@ -3706,6 +3709,108 @@ static int lre_poll_timeout(REExecContext *s)
     return 0;
 }
 
+/* ASCII fast path of lre_canonicalize(), called per character by the
+   case-insensitive opcodes. */
+static inline __attribute__((always_inline)) uint32_t lre_canon_fast(uint32_t c, bool is_unicode)
+{
+    if (c < 128) {
+        if (is_unicode) {
+            if (c - 'A' < 26u)
+                c += 'a' - 'A';
+        } else {
+            if (c - 'a' < 26u)
+                c -= 'a' - 'A';
+        }
+        return c;
+    }
+    return lre_canonicalize(c, is_unicode);
+}
+
+/* Length of the bytecode of a single-character atom that a loop can run
+   without saving a state per iteration, or 0 for any other opcode. */
+static inline __attribute__((always_inline)) int lre_simple_atom_len(const uint8_t *p)
+{
+    switch (p[0]) {
+    case REOP_dot:
+    case REOP_any:
+    case REOP_space:
+    case REOP_not_space:
+        return 1;
+    case REOP_char:
+    case REOP_char_i:
+        return 3;
+    case REOP_range:
+    case REOP_range_i:
+        return 3 + 4 * get_u16(p + 1);
+    default:
+        return 0;
+    }
+}
+
+/* Test c against the n ranges of a REOP_range operand. */
+static inline __attribute__((always_inline)) bool lre_range_has(const uint8_t *pc, int n, uint32_t c)
+{
+    uint32_t low, high, idx_min, idx_max, idx;
+
+    low = get_u16(pc);
+    if (c < low)
+        return false;
+    idx_max = n - 1;
+    high = get_u16(pc + idx_max * 4 + 2);
+    /* 0xffff in for last value means +infinity */
+    if (unlikely(c >= 0xffff) && high == 0xffff)
+        return true;
+    if (c > high)
+        return false;
+    idx_min = 0;
+    while (idx_min <= idx_max) {
+        idx = (idx_min + idx_max) / 2;
+        low = get_u16(pc + idx * 4);
+        high = get_u16(pc + idx * 4 + 2);
+        if (c < low)
+            idx_max = idx - 1;
+        else if (c > high)
+            idx_min = idx + 1;
+        else
+            return true;
+    }
+    return false;
+}
+
+/* Bitmap of the code units below 256 that a REOP_range operand accepts. */
+static void lre_range_bitmap(uint64_t bm[4], const uint8_t *pc, int n)
+{
+    int i;
+    bm[0] = bm[1] = bm[2] = bm[3] = 0;
+    for (i = 0; i < n; i++) {
+        uint32_t lo = get_u16(pc + i * 4), hi = get_u16(pc + i * 4 + 2);
+        uint32_t w;
+        if (lo > 255)
+            break;
+        if (hi > 255)
+            hi = 255;
+        for (w = lo >> 6; w <= (hi >> 6); w++) {
+            uint64_t m = ~(uint64_t)0;
+            if (w == (lo >> 6))
+                m &= ~(uint64_t)0 << (lo & 63);
+            if (w == (hi >> 6))
+                m &= ~(uint64_t)0 >> (63 - (hi & 63));
+            bm[w] |= m;
+        }
+    }
+}
+
+/* The backtrack stack that outgrew the in-frame buffer. The buffer is kept
+   between matches (one per thread, handed out by moving it) so a pattern
+   that needs a deep stack on every call does not allocate and regrow it each
+   time. It comes from the C library, not the context's allocator, because
+   it outlives the context that grew it. */
+#define LRE_SCRATCH_MAX_ELEMS ((size_t)1 << 20)
+static _Thread_local struct {
+    StackElem *buf;
+    size_t size;
+} lre_scratch;
+
 static no_inline int stack_realloc(REExecContext *s, size_t n)
 {
     StackElem *new_stack;
@@ -3713,14 +3818,30 @@ static no_inline int stack_realloc(REExecContext *s, size_t n)
     new_size = s->stack_size * 3 / 2;
     if (new_size < n)
         new_size = n;
-    if (s->stack_buf == s->static_stack_buf) {
-        new_stack = lre_realloc(s->opaque, NULL, new_size * sizeof(StackElem));
-        if (!new_stack)
+    if (!(s->stack_buf == s->static_stack_buf && lre_scratch.buf &&
+          lre_scratch.size >= new_size)) {
+        /* the block is not charged to the context's allocator, so ask it
+           whether a block of this size would fit under its limit */
+        void *probe = lre_realloc(s->opaque, NULL, new_size * sizeof(StackElem));
+        if (!probe)
             return -1;
+        lre_realloc(s->opaque, probe, 0);
+    }
+    if (s->stack_buf == s->static_stack_buf) {
+        if (lre_scratch.buf && lre_scratch.size >= new_size) {
+            new_stack = lre_scratch.buf;
+            new_size = lre_scratch.size;
+            lre_scratch.buf = NULL;
+            lre_scratch.size = 0;
+        } else {
+            new_stack = malloc(new_size * sizeof(StackElem));
+            if (!new_stack)
+                return -1;
+        }
         /* XXX: could use correct size */
         memcpy(new_stack, s->stack_buf, s->stack_size * sizeof(StackElem));
     } else {
-        new_stack = lre_realloc(s->opaque, s->stack_buf, new_size * sizeof(StackElem));
+        new_stack = realloc(s->stack_buf, new_size * sizeof(StackElem));
         if (!new_stack)
             return -1;
     }
@@ -3728,6 +3849,22 @@ static no_inline int stack_realloc(REExecContext *s, size_t n)
     s->stack_buf = new_stack;
     return 0;
 }
+
+static void stack_release(REExecContext *s)
+{
+    if (s->stack_buf == s->static_stack_buf)
+        return;
+    if (!lre_scratch.buf && s->stack_size <= LRE_SCRATCH_MAX_ELEMS) {
+        lre_scratch.buf = s->stack_buf;
+        lre_scratch.size = s->stack_size;
+    } else {
+        free(s->stack_buf);
+    }
+}
+
+/* Address stored in the first slot of a run frame while a lookahead copies
+   the stack, so that the copy can tell its four slots from three. */
+static const char lre_run_frame_mark = 0;
 
 /* return 1 if match, 0 if not match or < 0 if error. */
 #define LRE_BT_FUNC lre_exec_backtrack
@@ -3776,8 +3913,7 @@ static int lre_exec_internal(uint8_t **capture, const uint8_t *bc_buf,
     ret = lre_exec_backtrack(s, capture,
                              bc_buf + RE_HEADER_LEN + bytecode_offset, cptr);
 
-    if (s->stack_buf != s->static_stack_buf)
-        lre_realloc(s->opaque, s->stack_buf, 0);
+    stack_release(s);
     return ret;
 }
 
@@ -3838,6 +3974,255 @@ int lre_check_bytecode(const uint8_t *bc_buf, int bc_buf_len, void *opaque)
                            meta.entry_offset))
         return -1;
     return 0;
+}
+
+/* ==== Static analysis of compiled bytecode ================================ *
+ * What every match of a pattern must contain, derived from the instruction
+ * stream without changing it: a literal run that every path executes, how far
+ * before it a match can start, and whether a match can only start at index 0. */
+
+#define LRE_ANALYZE_MAX_CODE 4096
+
+static bool lre_op_target(const uint8_t *code, size_t pos, int *ptarget)
+{
+    switch (code[pos]) {
+    case REOP_goto:
+    case REOP_split_goto_first:
+    case REOP_split_next_first:
+    case REOP_lookahead:
+    case REOP_negative_lookahead:
+        *ptarget = (int)pos + 5 + (int32_t)get_u32(code + pos + 1);
+        return true;
+    case REOP_loop:
+        *ptarget = (int)pos + 6 + (int32_t)get_u32(code + pos + 2);
+        return true;
+    case REOP_loop_split_goto_first:
+    case REOP_loop_split_next_first:
+    case REOP_loop_check_adv_split_goto_first:
+    case REOP_loop_check_adv_split_next_first:
+        *ptarget = (int)pos + 10 + (int32_t)get_u32(code + pos + 6);
+        return true;
+    default:
+        return false;
+    }
+}
+
+int lre_analyze2(const uint8_t *bc_buf, size_t bc_buf_len, LRERequired *out)
+{
+    int32_t cover[LRE_ANALYZE_MAX_CODE + 2];
+    int32_t maxw[LRE_ANALYZE_MAX_CODE + 2];
+    const uint8_t *code;
+    size_t code_len, pos, len, entry = 11;
+    int best_pos = -1, best_len = 0, run_pos = -1, run_len = 0;
+    uint16_t run[LRE_REQ_MAX];
+    uint32_t run_ci = 0;
+    int unit, flags, c, i;
+
+    memset(out, 0, sizeof(*out));
+    out->prefix_max = -1;
+    if (bc_buf_len < RE_HEADER_LEN)
+        return 0;
+    code_len = get_u32(bc_buf + RE_HEADER_BYTECODE_LEN);
+    if (code_len > bc_buf_len - RE_HEADER_LEN || code_len > LRE_ANALYZE_MAX_CODE ||
+        code_len < entry + 2)
+        return 0;
+    flags = lre_get_flags(bc_buf);
+    /* a sticky pattern has no scan prologue and never scans */
+    if (flags & LRE_FLAG_STICKY)
+        return 0;
+    code = bc_buf + RE_HEADER_LEN;
+    if (code[0] != REOP_split_goto_first || code[5] != REOP_any ||
+        code[6] != REOP_goto || code[entry] != REOP_save_start ||
+        code[entry + 1] != 0)
+        return 0;
+    unit = (flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) ? 2 : 1;
+    out->entry = (uint32_t)entry;
+    if (code_len >= entry + 3 && code[entry + 2] == REOP_line_start) {
+        out->anchored = 1;
+        /* the exact characters that must follow the ^ */
+        pos = entry + 3;
+        while (pos < code_len && out->alen < LRE_REQ_MAX) {
+            uint8_t op = code[pos];
+            if (!re_checked_op_len(code + pos, code_len - pos, &len))
+                break;
+            if (op == REOP_save_start || op == REOP_save_end) {
+                pos += len;
+                continue;
+            }
+            if (op != REOP_char || get_u16(code + pos + 1) > 0xff)
+                break;
+            out->apre[out->alen++] = (uint8_t)get_u16(code + pos + 1);
+            pos += len;
+        }
+    }
+
+    /* cover[p] > 0: a jump passes over the instruction boundary p, so the
+       instruction at p is not executed by every path */
+    memset(cover, 0, sizeof(int32_t) * (code_len + 2));
+    for (pos = entry; pos < code_len; pos += len) {
+        int target;
+        if (!re_checked_op_len(code + pos, code_len - pos, &len))
+            return 0;
+        if (lre_op_target(code, pos, &target)) {
+            int lo, hi;
+            if (target < 0 || (size_t)target > code_len)
+                return 0;
+            if ((size_t)target > pos) {
+                lo = (int)pos + 1;
+                hi = target;
+            } else {
+                lo = target;
+                hi = (int)(pos + len);
+            }
+            for (i = lo; i < hi; i++)
+                cover[i] = 1;
+        }
+    }
+    /* the longest run of exact characters executed by every path */
+    for (pos = entry; pos < code_len; pos += len) {
+        uint8_t op = code[pos];
+        if (!re_checked_op_len(code + pos, code_len - pos, &len))
+            return 0;
+        /* an ASCII letter under /i outside Unicode mode matches exactly the
+           two cases of itself */
+        if (op == REOP_char_i && !cover[pos] && get_u16(code + pos + 1) < 128 &&
+            !(((get_u16(code + pos + 1) | 0x20) >= 'a') &&
+              ((get_u16(code + pos + 1) | 0x20) <= 'z'))) {
+            /* ASCII digits and punctuation have no other case */
+            c = get_u16(code + pos + 1);
+            if (run_len == 0)
+                run_pos = (int)pos;
+            if (run_len < LRE_REQ_MAX)
+                run[run_len++] = (uint16_t)c;
+            continue;
+        }
+        if (op == REOP_char_i && !cover[pos] && unit == 1 &&
+            (((c = get_u16(code + pos + 1)) | 0x20) >= 'a') &&
+            ((c | 0x20) <= 'z') && c < 128) {
+            if (run_len == 0)
+                run_pos = (int)pos;
+            if (run_len < LRE_REQ_MAX) {
+                run_ci |= (uint32_t)1 << run_len;
+                run[run_len++] = (uint16_t)(c | 0x20);
+            }
+            continue;
+        }
+        if ((op == REOP_char || op == REOP_char32) && !cover[pos]) {
+            c = op == REOP_char ? get_u16(code + pos + 1) :
+                (int)get_u32(code + pos + 1);
+            if (c > 0xffff || (c >= 0xd800 && c <= 0xdfff)) {
+                goto flush;
+            }
+            if (run_len == 0)
+                run_pos = (int)pos;
+            if (run_len < LRE_REQ_MAX)
+                run[run_len++] = (uint16_t)c;
+            continue;
+        }
+        if (cover[pos] == 0 && (op == REOP_save_start || op == REOP_save_end ||
+                                op == REOP_save_reset) && run_len)
+            continue;
+    flush:
+        if (run_len > best_len) {
+            best_len = run_len;
+            best_pos = run_pos;
+            out->ci = run_ci;
+            memcpy(out->lit, run, sizeof(run[0]) * run_len);
+        }
+        run_len = 0;
+        run_ci = 0;
+    }
+    if (run_len > best_len) {
+        best_len = run_len;
+        best_pos = run_pos;
+        out->ci = run_ci;
+        memcpy(out->lit, run, sizeof(run[0]) * run_len);
+    }
+    if (best_len == 0)
+        return out->anchored;
+    out->len = best_len;
+    /* the unit least likely to occur in text, to search for first */
+    {
+        int best_score = 1 << 30;
+        for (i = 0; i < best_len; i++) {
+            int u = out->lit[i], score;
+            if (u >= 128)
+                score = 0;
+            else if (u >= 'A' && u <= 'Z')
+                score = 1;
+            else if (u >= '0' && u <= '9')
+                score = 2;
+            else if (u == ' ')
+                score = 12;
+            else if (u == 'e' || u == 't' || u == 'a' || u == 'o' || u == 'i' ||
+                     u == 'n' || u == 's' || u == 'r')
+                score = 10;
+            else if (u >= 'a' && u <= 'z')
+                score = 7;
+            else if (u == ',' || u == '.' || u == '"' || u == '\'' ||
+                     u == '(' || u == ')' || u == '=' || u == '/')
+                score = 6;
+            else
+                score = 3;
+            if ((out->ci >> i) & 1)
+                score += 1;
+            if (score < best_score) {
+                best_score = score;
+                out->rare = i;
+            }
+        }
+    }
+
+    /* the farthest the match start can lie before the literal, in code units */
+    for (i = 0; i <= (int)code_len; i++)
+        maxw[i] = -1;
+    maxw[entry] = 0;
+    for (pos = entry; (int)pos < best_pos; pos += len) {
+        uint8_t op = code[pos];
+        int w = maxw[pos], target, nw, ok = 1;
+        if (!re_checked_op_len(code + pos, code_len - pos, &len))
+            return 1;
+        if (w < 0)
+            continue;
+        nw = w;
+        switch (op) {
+        case REOP_char: case REOP_char_i: case REOP_char32: case REOP_char32_i:
+        case REOP_dot: case REOP_any: case REOP_space: case REOP_not_space:
+        case REOP_range: case REOP_range_i: case REOP_range32: case REOP_range32_i:
+            nw = w + unit;
+            break;
+        case REOP_line_start: case REOP_line_start_m: case REOP_line_end:
+        case REOP_line_end_m: case REOP_save_start: case REOP_save_end:
+        case REOP_save_reset: case REOP_word_boundary: case REOP_word_boundary_i:
+        case REOP_not_word_boundary: case REOP_not_word_boundary_i:
+        case REOP_set_i32: case REOP_set_char_pos: case REOP_check_advance:
+            break;
+        case REOP_goto: case REOP_split_goto_first: case REOP_split_next_first:
+        case REOP_lookahead: case REOP_negative_lookahead:
+            lre_op_target(code, pos, &target);
+            if ((size_t)target <= pos || (int)target > best_pos) {
+                if ((size_t)target <= pos)
+                    ok = 0;
+                break;
+            }
+            if (maxw[target] < w)
+                maxw[target] = w;
+            if (op == REOP_goto || op == REOP_lookahead ||
+                op == REOP_negative_lookahead)
+                continue;
+            break;
+        default:
+            ok = 0;
+            break;
+        }
+        if (!ok)
+            return 1;
+        if (pos + len <= (size_t)best_pos && maxw[pos + len] < nw)
+            maxw[pos + len] = nw;
+    }
+    if (maxw[best_pos] >= 0)
+        out->prefix_max = maxw[best_pos];
+    return 1;
 }
 
 int lre_get_capture_count(const uint8_t *bc_buf)

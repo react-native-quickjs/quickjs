@@ -1,0 +1,27 @@
+Subject: AOT: a layout build skips the walk over the heap's object lists when no other object has the shape
+
+What this does
+  - quickjs.c `qjs_aot_layout_build`: after the chain is built and the final shape is stamped, the check "does a prototype already hold this shape" walked gc_obj_list, gc_zero_ref_count_list and gc_notrace_list. Every object with a shape holds a counted reference on it, so when the count is two (the object built here and the chain's own reference) no other object can have the shape, and the walk is skipped. A larger count takes the walk as before.
+
+Why we need it
+  The walk visits every object once per layout. On a row that has built its data before the unit binds (splay builds a 5000-node tree in setup) it was 1.35% of the timed region.
+
+Failure modes
+  None known. A shape that is shared with a live prototype, with a parked object or with any other object has a count above two and is decided by the walk exactly as before.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -70897,7 +70897,12 @@
+        object. Our own references keep every shape in the chain alive. */
+     final_sh = p->shape;
+     final_sh->layout_id = (uint16_t)layout_id;
+-    if (js_aot_layout_held_by_prototype(ctx->rt, final_sh))
++    /* Every object that has a shape holds a counted reference on it. The
++       object built here and the chain's own reference are two; with no
++       other holder no object, and so no prototype, has this shape and the
++       walk over the heap's object lists can be skipped. */
++    if (JS_REF_COUNT(final_sh) > 2 &&
++        js_aot_layout_held_by_prototype(ctx->rt, final_sh))
+         js_aot_layout_break(ctx->rt, layout_id);
+     JS_FreeValue(ctx, obj);
+     return stored;

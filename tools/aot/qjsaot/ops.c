@@ -55,6 +55,9 @@ static char g_e_inl_why[160];
    of the instruction it belongs to. */
 static int g_e_inl_dirty;
 static uint8_t *g_e_dirty_ins;
+/* Per instruction, whether a loop that contains it has an effect somewhere in its body: the instruction is then reached after an effect
+   on every iteration but the first, whatever the order the text was written in. Filled from a quiet pass over the body. */
+static uint8_t *g_e_dirty_loop;
 extern int g_e_spec_fb;
 static int g_e_exit_ins = -1;
 static int g_e_exit_dirty;
@@ -65,7 +68,10 @@ static void e_arr_region_start(FILE *f, Q2ValueId av, Q2ValueId root, const char
 static void e_arr_region_start_grp(FILE *f, Q2ValueId av, Q2ValueId root, const char *fail, int grp);
 static void e_cell_hoist_check(FILE *f, int site, int group, const char *kind, int pc);
 static int e_pure_call_site(const Q2Func *fn, const Q2Insn *in);
+static int e_pure_ctor_site(const Q2Func *fn, const Q2Insn *in);
 static const char *e_slotfn(int site);
+static int e_direct(void);
+static const char *e_gslot(int g);
 static int e_group_copy_claim_refused(int g);
 static int e_group_copy_layout(const Q2Func *fn, int g);
 static const char *e_cellidx(char *buf, size_t n, int site);
@@ -85,6 +91,87 @@ static const char *e_cc_fn(const Q2Func *fn, const Q2Insn *in) {
   return e_cc_mono(fn, in) ? "q2_call_entry_c(ctx, " : "q2_call_entry_u(ctx, ";
 }
 static int e_cc_ix(const Q2Func *fn, const Q2Insn *in) { return e_cc_mono(fn, in) ? g_cc_count++ : 0; }
+/* Constant function globals. A global the bundle stores exactly once, a function of the unit, that no store the analysis can not see could change
+   (qjs_aot_bundle_global_closed) is read from the unit slot q2_kv[k], not through the cache cell; the unit validates the slot against the live property
+   once, when the first function using it is entered, and one fact word per function (q2_kw[fi]) protects the set. A call through such a value needs no
+   identity test of its callee. */
+int qjs_aot_bundle_global_func(const char *name, char hex[33]);
+int qjs_aot_bundle_global_closed(const char *name);
+int qjs_aot_bundle_fn_kok(const JSAotGenFunc *g);
+int qjs_aot_layout_of_ctor(const char hex[33]);
+int qjs_aot_bundle_global_writes(const char *name);
+int qjs_aot_bundle_atom_name(uint32_t atom, char *out, size_t cap);
+#define E_KMAX 256
+typedef struct { char name[64]; char hex[33]; int ok; int called; int layout; } EKSlot;
+static EKSlot g_kslot[E_KMAX];
+static int g_nk;
+static unsigned char *g_kfn_used;
+static int g_kfn_cap;
+static signed char g_kval[8192];
+/* A value read from a unit constant slot (q2_kv): the slot holds a reference for the life of the runtime, so a safepoint needs no root for it. */
+static int e_kimmortal(unsigned v) { return v < sizeof(g_kval) && g_kval[v] > 0; }
+static int e_kon(void) {
+  static int v = -1;
+  if (v < 0) v = getenv("QJS_AOT_NOKCONST") == NULL;
+  return v;
+}
+/* Entry checks folded into the fact word (see specs/EB-B3.md): the function has a word and is kok. Set by the entry emitter, read by the later pieces of the same function. */
+static int g_e_kfast;
+/* The slot index of the constant global `name`, or -1. */
+static int e_kslot_of(const char *name) {
+  int i;
+  for (i = 0; i < g_nk; i++)
+    if (strcmp(g_kslot[i].name, name) == 0) return g_kslot[i].ok ? i : -1;
+  if (g_nk >= E_KMAX || strlen(name) >= sizeof(g_kslot[0].name)) return -1;
+  snprintf(g_kslot[g_nk].name, sizeof(g_kslot[0].name), "%s", name);
+  {
+    int w = qjs_aot_bundle_global_writes(name), fnc = qjs_aot_bundle_global_func(name, g_kslot[g_nk].hex), cl = qjs_aot_bundle_global_closed(name);
+    g_kslot[g_nk].ok = w == 1 && fnc && cl;
+    if (getenv("QJS_AOT_KDEBUG")) fprintf(stderr, "kconst %s: writes=%d func=%d closed=%d %s\n", name, w, fnc, cl, g_kslot[g_nk].ok ? g_kslot[g_nk].hex : "no");
+  }
+  return g_kslot[g_nk++].ok ? g_nk - 1 : -1;
+}
+/* Whether the call whose callee value is `cexp` (a local "v<N>") reads a constant global whose function is `callee`: the entry test is then not emitted. */
+static void e_kcopy(Q2ValueId d, Q2ValueId sv) {
+  if ((unsigned)sv < sizeof(g_kval) && (unsigned)d < sizeof(g_kval) && g_kval[sv] > 0) g_kval[d] = g_kval[sv];
+}
+static int e_kcallee(const char *cexp, const char *callee) {
+  int id;
+  if (cexp[0] != 'v') return 0;
+  id = atoi(cexp + 1);
+  if ((unsigned)id < sizeof(g_kval) && g_kval[id] > 0 && strcmp(g_kslot[g_kval[id] - 1].hex, callee) == 0) {
+    g_kslot[g_kval[id] - 1].called = 1;
+    return 1;
+  }
+  return 0;
+}
+static const char *e_cc_fnv(const Q2Func *fn, const Q2Insn *in, const char *cexp, const char *callee) {
+  return e_kcallee(cexp, callee) ? "q2_call_entry_k(ctx, " : e_cc_fn(fn, in);
+}
+static int e_cc_ixv(const Q2Func *fn, const Q2Insn *in, const char *cexp, const char *callee) {
+  return e_kcallee(cexp, callee) ? 0 : e_cc_ix(fn, in);
+}
+int qjs_aot_k_count(void) { return g_nk; }
+const char *qjs_aot_k_name(int k) { return g_kslot[k].name; }
+const char *qjs_aot_k_hex(int k) { return g_kslot[k].ok ? g_kslot[k].hex : NULL; }
+int qjs_aot_k_called(int k) { return g_kslot[k].called; }
+int qjs_aot_k_layout(int k) { return g_kslot[k].layout; }
+int qjs_aot_k_used(int fi, int k) { return fi >= 0 && fi < g_kfn_cap && g_kfn_used[(size_t)fi * E_KMAX + k]; }
+static void e_kmark(int fi, int k) {
+  if (fi >= g_kfn_cap) {
+    int nc = fi + 64;
+    g_kfn_used = realloc(g_kfn_used, (size_t)nc * E_KMAX);
+    memset(g_kfn_used + (size_t)g_kfn_cap * E_KMAX, 0, (size_t)(nc - g_kfn_cap) * E_KMAX);
+    g_kfn_cap = nc;
+  }
+  g_kfn_used[(size_t)fi * E_KMAX + k] = 1;
+}
+static int e_khas(int fi) {
+  int k;
+  for (k = 0; k < g_nk; k++)
+    if (qjs_aot_k_used(fi, k)) return 1;
+  return 0;
+}
 /* Prototype-method tables: the read sites of the body being generated whose receiver shapes and method
    values are resolved once per cache epoch at the entry (see q2_pm_fill in driver.c), and the values
    whose entry pointer the read leaves in `pme<id>` for the call that follows. */
@@ -102,6 +189,7 @@ static int e_pm_index(int site) {
 static int e_pm_flagged(unsigned id) { return g_pm_flag != NULL && id < (unsigned)g_pm_flag_n && g_pm_flag[id]; }
 static void e_slot_off(char *out, size_t n, int g, int site);
 static int e_group_layout(int g);
+static int e_entry_skip(int g);
 static void e_group_test(
     char *out, size_t n, int skip, int cellskip, const char *recv, int g, int site, int write);
 static int emit_hit_result(
@@ -227,6 +315,7 @@ int e_pic_sites(const Q2Func *fn) {
    carries the engine's format; the name comes from the same generated source so
    a reader sees the op the way the engine does. */
 void e_rop_name(uint16_t rop, char *out, size_t n);
+int e_vargs_slot(const Q2Func *fn);
 
 /* The profile's execution count at one pc (qjsaot.c): the op-call weight. */
 unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
@@ -2181,6 +2270,7 @@ static int e_emit_generic_body_raw(FILE *f, const Q2Func *fn, char hex[33]) {
   /* Set by a speculative body just before it calls this one, so a loop hook below can hand
      back to it by returning instead of by a nested call. */
   fprintf(f, "static uint8_t e_gfs_%s;\n", hex);
+  if (qjs_aot_rat_mode()) fputs("#line 1 \"NOFRAME\"\n", f);
   fprintf(
       f, "E_TEXT %sJSValue aot_g_%s(JSContext *ctx, JSRegRun *f,\n", e_linkage(), hex);
   fprintf(
@@ -2542,6 +2632,15 @@ static int g_e_fl_chosen;
    keeps an activation record (JSAotFlRec) for the backtrace, and polls and checks
    the C stack at its entry. Kept from the trial emission into the real one. */
 static int g_e_fl_calls;
+static int g_e_lazy_ra; /* the body in progress fills its published-root array at the first mention */
+/* The typed-slot scratch `fr` of a frameless body is written before every read (a result slot is stored, then read; the exit stubs pass
+   values by list, never the array), and no collector scans it, so it needs no undefined fill. QJS_AOT_EAGERFR=1 keeps the fill. */
+static const char *e_fr_fill(int nregs) {
+  static char buf[64];
+  if (getenv("QJS_AOT_EAGERFR") == NULL) return "";
+  snprintf(buf, sizeof(buf), "    Q2_FILL_UNDEF(fr, %d);\n", nregs > 0 ? nregs : 1);
+  return buf;
+}
 /* The next site number of a direct call to a builtin (see emit_typed_call). */
 static int g_e_ccall_next;
 /* The published root array of a frameless body that calls (see JSAotFlRec): the slots
@@ -2581,6 +2680,196 @@ static int e_spill_slot(Q2ValueId v) {
     g_e_spill_slot[v] = g_e_spill_n++;
   }
   return g_e_spill_slot[v];
+}
+
+/* Compact root windows (.local/specs/EB-ROOTS.md): at a publishing site the k live roots go to ra_[0..k-1] and the window
+   right after them at ra_[k..k+w-1]; the record's range is [0, E) with E = k + max(w, 1) (slot k, window slot 0, is where a
+   call result parks). An inlined body's array is a slice that starts where its caller's range ends (caller E), so a chain of
+   bodies shares one gap-free range. g_e_cm: compact scheme on (QJS_AOT_NOCOMPACT unset); g_e_compact: the text being emitted
+   is compact (a frameless body with safepoint calls, or an inline body that publishes); g_e_site_k: the current site's k;
+   g_e_rt: the slots a body needs (its largest E plus the slice of the largest body it inlines there). */
+static int g_e_cm = 1, g_e_compact, g_e_site_k, g_e_rt;
+/* QJS_AOT_RAT=0: frame records carry func and pc (the old form). Otherwise (stack-map form) a compiled frame carries nothing: each op is
+   tagged with a #line naming its function and pc, the unit is built with -g1, and a table made from the line table maps a return address to
+   the frames (function digest, pc) it stands for. An op of an inlined copy gets line 1000000+index and a chain in the side file. */
+static int e_scan(void);
+static int e_recscan(void);
+static int e_rat(void) {
+  const char *e = getenv("QJS_AOT_RAT");
+  return e_scan() && e_recscan() && (e != NULL ? *e != '0' : 1);
+}
+int qjs_aot_rat_mode(void);
+static FILE *g_rat_side;
+static void e_rat_line(FILE *f, const Q2Func *fn, const Q2Insn *in, int i2, const char *hex) {
+  const char *sp;
+  if (!e_rat()) return;
+  if (in->pc >= 0x3ffff || i2 >= 0x3ffff) {
+    fprintf(f, "#line 1 \"NOFRAME\"\n");
+    return;
+  }
+  if (in->own <= 0) {
+    fprintf(f, "#line %d \"%s\"\n", (in->pc << 12) + 1, hex);
+    return;
+  }
+  fprintf(f, "#line %d \"%s\"\n", 0x40000000 + (i2 << 12) + 1, hex);
+  if (g_rat_side == NULL && (sp = getenv("QJS_AOT_RAT_FILE")) != NULL && *sp) g_rat_side = fopen(sp, "a");
+  if (g_rat_side != NULL) {
+    int c = in->own - 1, pc = in->opc;
+    fprintf(g_rat_side, "C %s %d", hex, i2);
+    while (c >= 0) {
+      const JSAotGenFunc *pg = fn->inl[c].parent < 0 ? fn->g : fn->inl[fn->inl[c].parent].g;
+      fprintf(g_rat_side, " %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x %d", fn->inl[c].g->digest[0], fn->inl[c].g->digest[1], fn->inl[c].g->digest[2], fn->inl[c].g->digest[3], fn->inl[c].g->digest[4], fn->inl[c].g->digest[5], fn->inl[c].g->digest[6], fn->inl[c].g->digest[7], fn->inl[c].g->digest[8], fn->inl[c].g->digest[9], fn->inl[c].g->digest[10], fn->inl[c].g->digest[11], fn->inl[c].g->digest[12], fn->inl[c].g->digest[13], fn->inl[c].g->digest[14], fn->inl[c].g->digest[15], pc);
+      pc = fn->inl[c].call_pc;
+      c = fn->inl[c].parent;
+      (void)pg;
+    }
+    fprintf(g_rat_side, " ROOT %d\n", pc);
+    fflush(g_rat_side);
+  }
+}
+int qjs_aot_rat_mode(void) { return e_rat(); }
+/* A region's op: it runs in the root's body, and the functions that were expanded above it (each at its call's pc) are named by a chain in the side file. */
+void qjs_aot_rat_region_line(FILE *f, const char *rhex, int n, const JSAotGenFunc *const *gs, const int *pcs, int rootpc) {
+  static int key = 0x38000;
+  const char *sp;
+  int i, d;
+  if (!e_rat()) return;
+  if (n == 0) {
+    if (rootpc >= 0x3ffff) fprintf(f, "#line 1 \"NOFRAME\"\n");
+    else fprintf(f, "#line %d \"%s\"\n", (rootpc << 12) + 1, rhex);
+    return;
+  }
+  if (key >= 0x3ffff || rootpc >= 0x3ffff) {
+    fprintf(f, "#line 1 \"NOFRAME\"\n");
+    return;
+  }
+  fprintf(f, "#line %d \"%s\"\n", 0x40000000 + (key << 12) + 1, rhex);
+  if (g_rat_side == NULL && (sp = getenv("QJS_AOT_RAT_FILE")) != NULL && *sp) g_rat_side = fopen(sp, "a");
+  if (g_rat_side == NULL) { key++; return; }
+  fprintf(g_rat_side, "C %s %d", rhex, key++);
+  for (i = 0; i < n; i++) {
+    fprintf(g_rat_side, " ");
+    for (d = 0; d < 16; d++) fprintf(g_rat_side, "%02x", gs[i]->digest[d]);
+    fprintf(g_rat_side, " %d", pcs[i]);
+  }
+  fprintf(g_rat_side, " ROOT %d\n", rootpc);
+  fflush(g_rat_side);
+}
+/* The call that resumes a callee of a nest from an exit stub: the callee names itself, and the copies still waiting above it (down to the
+   function the stub belongs to) are named by a chain in the side file. */
+static void e_rat_stub_line(FILE *f, const Q2Func *fn, const char *hex, int lvl_copy) {
+  static int key = 0x30000;
+  const Q2Inl *iv = &fn->inl[lvl_copy];
+  int c = iv->parent, pc = iv->call_pc, k = key++;
+  const char *sp;
+  if (!e_rat() || k >= 0x37fff) {
+    if (e_rat()) fprintf(f, "#line 1 \"NOFRAME\"\n");
+    return;
+  }
+  fprintf(f, "#line %d \"%s\"\n", 0x40000000 + (k << 12) + 1, hex);
+  if (g_rat_side == NULL && (sp = getenv("QJS_AOT_RAT_FILE")) != NULL && *sp) g_rat_side = fopen(sp, "a");
+  if (g_rat_side == NULL) return;
+  fprintf(g_rat_side, "C %s %d", hex, k);
+  while (c >= 0) {
+    int d;
+    fprintf(g_rat_side, " ");
+    for (d = 0; d < 16; d++) fprintf(g_rat_side, "%02x", fn->inl[c].g->digest[d]);
+    fprintf(g_rat_side, " %d", pc);
+    pc = fn->inl[c].call_pc;
+    c = fn->inl[c].parent;
+  }
+  fprintf(g_rat_side, " ROOT %d\n", pc);
+  fflush(g_rat_side);
+}
+/* linkage text of a leaf entry followed by the calling convention of the unit's own entries */
+static const char *e_none_linkage(void) {
+  static char b[160];
+  snprintf(b, sizeof(b), "%sE_NONE ", e_linkage());
+  return b;
+}
+/* QJS_AOT_NOSTACKMAPS=1: scan builds keep the root-range initialisation of the array (the old scan build) */
+static int e_stackmaps(void) {
+  static int s = -1;
+  if (s < 0) s = getenv("QJS_AOT_NOSTACKMAPS") == NULL;
+  return s;
+}
+/* QJS_AOT_STACKSCAN=1: the collector finds the roots by scanning the native stack, so a site publishes nothing but its pc. */
+static int e_norec(void);
+static int e_recscan(void);
+static int e_scan(void) {
+  static int s = -1;
+  if (s < 0) {
+    /* the publication form is the default; QJS_AOT_STACKSCAN=1 builds the stack-map form */
+    const char *e = getenv("QJS_AOT_STACKSCAN");
+    s = e != NULL ? *e != '0' : 0;
+  }
+  return s;
+}
+int qjs_aot_scan_mode(void) { return e_scan(); }
+int qjs_aot_recscan_mode(void);
+/* ceiling only (QJS_AOT_NOREC with the scan build): no activation record is linked at all */
+static int e_norec(void) { return e_scan() && getenv("QJS_AOT_NOREC") != NULL; }
+/* scan build: the frame record is not linked; a backtrace finds it on the C stack by its magic word (QJS_AOT_RECSCAN) */
+static int e_recscan(void) {
+  const char *e = getenv("QJS_AOT_RECSCAN");
+  return e_scan() && (e != NULL ? *e != '0' : 1);
+}
+int qjs_aot_recscan_mode(void) { return e_recscan(); }
+static void e_rt_note(int e) {
+  if (e > g_e_rt) g_e_rt = e;
+}
+/* A format string whose "&ra_[SB_]" window address is the current site's (compact: right after its k roots). */
+static const char *e_wk(const char *fmt, int k) {
+  static char b[4][2048];
+  static int i;
+  char rep[32];
+  const char *p = fmt;
+  size_t n = 0;
+  i = (i + 1) & 3;
+  if (!g_e_compact) return fmt;
+  snprintf(rep, sizeof(rep), "&ra_[%d]", k);
+  while (*p != 0 && n + 40 < sizeof(b[i])) {
+    if (strncmp(p, "&ra_[SB_]", 9) == 0) {
+      n += (size_t)snprintf(b[i] + n, sizeof(b[i]) - n, "%s", rep);
+      p += 9;
+    } else
+      b[i][n++] = *p++;
+  }
+  b[i][n] = 0;
+  return b[i];
+}
+/* The text a site writes before its call: the live roots, then the record's range and pc (the old scheme: the roots in
+   their per-value slots, then the lazy link). */
+static size_t e_pub_text(
+    char *buf, size_t cap, const Q2ValueId *spv, int nsp, int wn, int pc, int pad, const char *ind) {
+  size_t sl = 0;
+  int q;
+  (void)pad;
+  e_rt_note(nsp + (wn < 1 ? 1 : wn));
+  if (e_scan() && e_rat()) {
+    buf[0] = 0;
+    return 0;
+  }
+  if (e_scan()) return (size_t)snprintf(buf, cap, "%srec_->pc = %d;\n", ind, pc);
+  for (q = 0; q < nsp; q++) {
+    if (g_e_compact)
+      sl += (size_t)snprintf(buf + sl, cap - sl, "%sra_[%d] = v%u;\n", ind, q, (unsigned)spv[q]);
+    else
+      sl += (size_t)snprintf(buf + sl, cap - sl, "%sra_[%d] = v%u;\n", ind, e_spill_slot(spv[q]), (unsigned)spv[q]);
+  }
+  if (g_e_compact) {
+    if (wn < 1) {
+      /* slot nsp is inside the range (a result parks there): it is written here, so a range never takes in a slot holding a
+         pointer from an earlier site (it may have been freed while the slot was outside the range) */
+      if (getenv("QJS_AOT_NOPARKINIT") == NULL) /* the negative control of the range check */
+        sl += (size_t)snprintf(buf + sl, cap - sl, "%sra_[%d] = JS_UNDEFINED;\n", ind, nsp);
+      wn = 1;
+    }
+    sl += (size_t)snprintf(buf + sl, cap - sl, "%sE_RANGE(rec_, %d);\n%srec_->pc = %d;\n", ind, nsp + wn, ind, pc);
+  } else {
+    sl += (size_t)snprintf(buf + sl, cap - sl, "%sE_RLINK(rec_);\n%srec_->pc = %d;\n", ind, ind, pc);
+  }
+  return sl;
 }
 
 /* Which blocks sit in a loop, and whether some loop of the function may run long
@@ -2646,6 +2935,7 @@ static int e_lmt_site(const Q2Insn *in, int fvlb) {
   return in->own == 0 && (in->rop == ROP_get_field2 || in->rop == ROP_get_this_field2) && fvlb == E_LB_TAG && in->narg >= 4 && in->arg[2].kind == 'a' &&
          in->arg[2].off >= 0 && getenv("QJS_AOT_NOLMT") == NULL;
 }
+int qjs_aot_prof_store_uncached(const uint8_t dg[16], int site, int pc);
 int qjs_aot_prof_site(const uint8_t dg[16], int site, int *nshapes, uint64_t shapes[4]);
 static int e_fl_site_ok(const Q2Func *fn, const Q2Insn *in, int site) {
   if (!g_e_fl) return 1;
@@ -2730,6 +3020,291 @@ static void e_sweep_guard_set(
   g_e_sweep_store = NULL;
 }
 
+/* Index values proven in range by a dense or packed element access. An access that exits when `(uint32_t)i >= count`
+   leaves `i` in [0, count) on the path after it, and a fast array's count never exceeds INT32_MAX (expand_fast_array and
+   the packed growth refuse a larger length), so `i + 1` cannot overflow in the rest of the block. SSA values do not change, so
+   the fact needs no killing; it is only valid in the block of the access (the epoch changes at every block start). */
+static unsigned g_e_blk_epoch;
+static unsigned *g_e_idx_epoch;
+static size_t g_e_idx_cap;
+
+static void e_idx_mark(Q2ValueId v) {
+  if ((size_t)v >= g_e_idx_cap) {
+    size_t nc = (size_t)v + 256;
+    unsigned *a = realloc(g_e_idx_epoch, nc * sizeof(unsigned));
+    if (a == NULL) return;
+    memset(a + g_e_idx_cap, 0, (nc - g_e_idx_cap) * sizeof(unsigned));
+    g_e_idx_epoch = a;
+    g_e_idx_cap = nc;
+  }
+  g_e_idx_epoch[v] = g_e_blk_epoch;
+}
+
+static int e_idx_known(Q2ValueId v) {
+  return (size_t)v < g_e_idx_cap && g_e_idx_epoch[v] == g_e_blk_epoch && g_e_blk_epoch != 0;
+}
+
+static Q2ValueId e_region_root(const Q2Func *fn, const Q2Insn *in);
+
+/* ---- Bounds checks proven once at loop entry ------------------------------
+   A counted loop whose header tests an induction variable against an invariant, and whose elements are indexed by an induction
+   variable that steps by one, touches indexes y0 .. y0 + T - 1, where T bounds the trips (from the header test). The check
+   `y0 >= 0 && y0 + T <= count` is made once on the edge into the loop (and at an OSR entry), and the accesses in the loop body
+   (not the header, which runs once more than the body) carry no bounds test. A loop whose entry check fails leaves for the
+   interpreter at its first instruction, with nothing of it run. Only for arrays whose base and count are already hoisted to the
+   loop entry (so nothing in the loop can change them). */
+typedef struct EBndChk {
+  Q2ValueId root, y;
+  int pk;
+} EBndChk;
+
+typedef struct EBnd {
+  int hdr, pre;
+  char trips[160]; /* a C expression of type int64_t: an upper bound of the body's executions */
+  EBndChk chk[6];
+  int nchk;
+} EBnd;
+
+static const Q2Func *g_e_bnd_fn;
+static uint8_t *g_e_bnd_skip;
+static EBnd *g_e_bnd;
+static int g_e_bnd_n;
+
+static int e_bnd_on(void) {
+  static int c = -1;
+  if (c < 0) c = getenv("QJS_AOT_NOBNDHOIST") == NULL;
+  return c;
+}
+
+static int e_bnd_skipped(const Q2Func *fn, const Q2Insn *in) {
+  return g_e_bnd_fn == fn && g_e_bnd_skip != NULL && g_e_bnd_skip[in - fn->insns];
+}
+
+static void e_bnd_free(void) {
+  free(g_e_bnd_skip);
+  free(g_e_bnd);
+  g_e_bnd_skip = NULL;
+  g_e_bnd = NULL;
+  g_e_bnd_n = 0;
+  g_e_bnd_fn = NULL;
+}
+
+/* The step of block parameter `p` (+1, -1, or 0 when unknown) along the back edge value `a`. */
+static int e_bnd_step(const Q2Func *fn, Q2ValueId p, Q2ValueId a) {
+  const Q2Insn *in;
+  if (a >= (Q2ValueId)fn->nvalues || fn->values[a].insn < 0) return 0;
+  in = &fn->insns[fn->values[a].insn];
+  if (in->nuse < 1 || in->use[0] != p) return 0;
+  if (in->rop == ROP_inc && in->def[0] == a) return 1;
+  if (in->rop == ROP_dec && in->def[0] == a) return -1;
+  if (in->rop == ROP_post_inc && in->ndef == 2 && in->def[1] == a) return 1;
+  if (in->rop == ROP_post_dec && in->ndef == 2 && in->def[1] == a) return -1;
+  return 0;
+}
+
+static void e_bnd_plan(const Q2Func *fn, const ETypes *t, const EFacts *fa) {
+  int li, cap = 0;
+  e_bnd_free();
+  if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd plan %s nloops=%d\n", fn->g->name, fa ? fa->nloops : -1);
+  if (!e_bnd_on() || fa == NULL || t == NULL || fa->nloops == 0 || fa->elemreg == NULL) return;
+  g_e_bnd_skip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  if (g_e_bnd_skip == NULL) return;
+  g_e_bnd_fn = fn;
+  for (li = 0; li < fa->nloops; li++) {
+    int h = fa->loop_hdr[li], pre = fa->loop_pre[li], bi, k, n, sin, nback = 0, lb = -1, ok = 1, hn;
+    const uint8_t *mem = fa->loop_mem[li];
+    const Q2Block *hb, *lbk;
+    const Q2Insn *br;
+    int sub, inv, base, cont_lt, cont_eq, step_x, xc = 0;
+    Q2ValueId a, b, xp = Q2_NO_VALUE;
+    int bn, bconst = 0;
+    EBnd cand;
+    uint8_t *skipv;
+    if (fa->loop_calls[li]) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 1\n", fn->g->name, li); continue; }
+    hb = &fn->blocks[h];
+    if (hb->nsucc != 2 || hb->ninsns < 1) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 2\n", fn->g->name, li); continue; }
+    br = &fn->insns[hb->first_insn + hb->ninsns - 1];
+    if (br->rop != ROP_branch_cmp_reg_reg && br->rop != ROP_branch_cmp_reg_reg_s) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 3\n", fn->g->name, li); continue; }
+    if (br->narg < 1 || br->arg[0].kind != 'b' || br->nuse < 2) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 4\n", fn->g->name, li); continue; }
+    sub = (int)br->arg[0].val;
+    inv = (sub & REG_CMP_INVERT) != 0;
+    base = sub & ~REG_CMP_INVERT;
+    if (base < REG_BIN_LT || base > REG_BIN_GTE) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 5\n", fn->g->name, li); continue; }
+    /* the successor inside the loop, and the other outside */
+    if (hb->succ_block[0] < 0 || hb->succ_block[1] < 0) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 6\n", fn->g->name, li); continue; }
+    {
+      int in0 = mem[hb->succ_block[0]], in1 = mem[hb->succ_block[1]];
+      if (in0 == in1) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 7\n", fn->g->name, li); continue; }
+      sin = in0 ? 0 : 1;
+    }
+    /* the loop body is a chain: one back edge, every other block has one successor */
+    for (bi = 0; bi < fn->nblocks && ok; bi++) {
+      if (!mem[bi] || bi == h) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 8\n", fn->g->name, li); continue; }
+      if (fn->blocks[bi].nsucc != 1 || fn->blocks[bi].succ_block[0] < 0) { ok = 0; break; }
+      if (!mem[fn->blocks[bi].succ_block[0]] && fn->blocks[bi].succ_block[0] != h) ok = 0;
+      if (fn->blocks[bi].succ_block[0] == h) { nback++; lb = bi; }
+    }
+    if (!ok || nback != 1) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 9\n", fn->g->name, li); continue; }
+    lbk = &fn->blocks[lb];
+    if (lbk->nedge_args[0] != hb->nparams) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 10\n", fn->g->name, li); continue; }
+    /* the continue condition as `a OP b` */
+    a = br->use[0];
+    b = br->use[1];
+    cont_lt = 0;
+    cont_eq = 0;
+    {
+      /* succ[0] is taken when (inv ? !(a base b) : (a base b)); the loop continues on the arm sin */
+      int neg = (sin == 0) ? inv : !inv; /* continue iff neg ? !(a base b) : (a base b) */
+      int op = base;
+      if (neg) {
+        op = op == REG_BIN_LT ? REG_BIN_GTE : op == REG_BIN_LTE ? REG_BIN_GT : op == REG_BIN_GT ? REG_BIN_LTE : REG_BIN_LT;
+      }
+      /* now: continue iff a op b */
+      if (op == REG_BIN_LT) { cont_lt = 1; cont_eq = 0; }
+      else if (op == REG_BIN_LTE) { cont_lt = 1; cont_eq = 1; }
+      else if (op == REG_BIN_GT) { cont_lt = 0; cont_eq = 0; }
+      else { cont_lt = 0; cont_eq = 1; }
+    }
+    if (a >= (Q2ValueId)t->nvalues || b >= (Q2ValueId)t->nvalues || t->lb[a] != E_LB_I32 || t->lb[b] != E_LB_I32) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 11\n", fn->g->name, li); continue; }
+    /* b: an integer constant, or a value defined outside the loop */
+    bn = 0;
+    bconst = 0;
+    if (fn->values[b].is_const && fn->values[b].con_kind == Q2_CON_INT) { bn = 1; bconst = (int32_t)fn->values[b].con; }
+    else if (fn->values[b].insn >= 0 && (fn->insns[fn->values[b].insn].rop == ROP_load_i8 || fn->insns[fn->values[b].insn].rop == ROP_load_i8_s ||
+                                         fn->insns[fn->values[b].insn].rop == ROP_load_i32) && fn->insns[fn->values[b].insn].narg >= 2) {
+      bn = 1;
+      bconst = (int32_t)fn->insns[fn->values[b].insn].arg[1].val;
+    }
+    else if (fn->values[b].block >= 0 && !mem[fn->values[b].block]) bn = 2;
+    else { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 12\n", fn->g->name, li); continue; }
+    /* a: a header parameter, or its direct increment/decrement defined in the header */
+    step_x = 0;
+    for (n = 0; n < hb->nparams; n++) {
+      Q2ValueId p = hb->param_val[n];
+      if (p >= (Q2ValueId)t->nvalues || t->lb[p] != E_LB_I32) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 13\n", fn->g->name, li); continue; }
+      if (a == p) { xp = p; xc = 0; }
+      else if (fn->values[a].insn >= 0 && fn->values[a].block == h) {
+        const Q2Insn *ai = &fn->insns[fn->values[a].insn];
+        if ((ai->rop == ROP_dec || ai->rop == ROP_inc) && ai->nuse >= 1 && ai->use[0] == p && ai->def[0] == a) {
+          xp = p;
+          xc = ai->rop == ROP_inc ? 1 : -1;
+        }
+      }
+      if (xp == p) {
+        step_x = e_bnd_step(fn, p, lbk->edge_arg[0][n]);
+        break;
+      }
+    }
+    if (xp == Q2_NO_VALUE || step_x == 0) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 14\n", fn->g->name, li); continue; }
+    /* trips: X_k = x0 + step * k, with x0 = p0 + xc. Counting up needs continue iff X < b (or <=); counting down iff X > b (or >=). */
+    memset(&cand, 0, sizeof cand);
+    cand.hdr = h;
+    cand.pre = pre;
+    {
+      char x0[48], bb[48];
+      snprintf(x0, sizeof x0, "((int64_t)i%u + (%d))", (unsigned)xp, xc);
+      if (bn == 1) snprintf(bb, sizeof bb, "((int64_t)%d)", bconst);
+      else snprintf(bb, sizeof bb, "((int64_t)i%u)", (unsigned)b);
+      if (step_x > 0 && cont_lt) snprintf(cand.trips, sizeof cand.trips, "(%s - %s + %d)", bb, x0, cont_eq ? 1 : 0);
+      else if (step_x < 0 && !cont_lt) snprintf(cand.trips, sizeof cand.trips, "(%s - %s + %d)", x0, bb, cont_eq ? 1 : 0);
+      else { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 15\n", fn->g->name, li); continue; }
+    }
+    /* the accesses of the body (not the header) indexed by a +1 induction variable, on a hoisted array */
+    skipv = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+    if (skipv == NULL) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 16\n", fn->g->name, li); continue; }
+    hn = 0;
+    for (bi = 0; bi < fn->nblocks; bi++) {
+      if (!mem[bi] || bi == h) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 17\n", fn->g->name, li); continue; }
+      for (k = 0; k < fn->blocks[bi].ninsns; k++) {
+        int idx = fn->blocks[bi].first_insn + k, q, found = 0, hoisted = 0, pk = 0;
+        const Q2Insn *in = &fn->insns[idx];
+        Q2ValueId y, root, yp = Q2_NO_VALUE;
+        if (!fa->elemreg[idx] || in->nuse < 2) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 18\n", fn->g->name, li); continue; }
+        if (e_ta_class(fn, in)) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 19\n", fn->g->name, li); continue; }
+        pk = e_pk_grp(fn, in, NULL) != 0;
+        y = in->use[1];
+        root = in->use[0];
+        if (y >= (Q2ValueId)t->nvalues || t->lb[y] != E_LB_I32 || root >= (Q2ValueId)fn->nvalues) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 20\n", fn->g->name, li); continue; }
+        if (fn->values[root].block < 0 || mem[fn->values[root].block]) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 21\n", fn->g->name, li); continue; }
+        /* y is a +1 parameter, or the old value of its post-increment */
+        for (n = 0; n < hb->nparams; n++) {
+          Q2ValueId p = hb->param_val[n];
+          if (p >= (Q2ValueId)t->nvalues || t->lb[p] != E_LB_I32) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 22\n", fn->g->name, li); continue; }
+          if (e_bnd_step(fn, p, lbk->edge_arg[0][n]) != 1) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 23\n", fn->g->name, li); continue; }
+          if (y == p) { yp = p; break; }
+          if (fn->values[y].insn >= 0) {
+            const Q2Insn *yi = &fn->insns[fn->values[y].insn];
+            if (yi->rop == ROP_post_inc && yi->ndef == 2 && yi->def[0] == y && yi->nuse >= 1 && yi->use[0] == p) { yp = p; break; }
+          }
+        }
+        if (yp == Q2_NO_VALUE) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 24\n", fn->g->name, li); continue; }
+        for (q = 0; q < fa->nhoist; q++)
+          if (fa->hoist_hdr[q] == h && fa->hoist_val[q] == (int)root &&
+              (fa->hoist_grp[q] == -2 || fa->hoist_grp[q] == E_GRP_PK_I32 || fa->hoist_grp[q] == E_GRP_PK_F64))
+            hoisted = 1;
+        if (!hoisted) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 25\n", fn->g->name, li); continue; }
+        {
+          Q2ValueId r2 = e_region_root(fn, in);
+          if (r2 != root) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 26\n", fn->g->name, li); continue; }
+        }
+        for (q = 0; q < cand.nchk; q++)
+          if (cand.chk[q].root == root && cand.chk[q].y == yp && cand.chk[q].pk == pk) found = 1;
+        if (!found) {
+          if (cand.nchk == 6) { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 27\n", fn->g->name, li); continue; }
+          cand.chk[cand.nchk].root = root;
+          cand.chk[cand.nchk].y = yp;
+          cand.chk[cand.nchk].pk = pk;
+          cand.nchk++;
+        }
+        skipv[idx] = 1;
+        hn++;
+      }
+    }
+    if (hn == 0) { free(skipv); { if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s loop %d: no 28\n", fn->g->name, li); continue; } }
+    {
+      int z;
+      for (z = 0; z < fn->ninsns; z++) if (skipv[z]) g_e_bnd_skip[z] = 1;
+    }
+    free(skipv);
+    if (g_e_bnd_n == cap) {
+      EBnd *nb;
+      cap = cap ? cap * 2 : 4;
+      nb = realloc(g_e_bnd, sizeof(EBnd) * (size_t)cap);
+      if (nb == NULL) abort();
+      g_e_bnd = nb;
+    }
+    g_e_bnd[g_e_bnd_n++] = cand;
+    if (getenv("QJS_AOT_DEBUG_BND")) fprintf(stderr, "bnd %s planned hdr %d trips %s nchk %d\n", fn->g->name, h, cand.trips, cand.nchk);
+  }
+}
+
+/* The entry check of the loop headed by block `h`, emitted on its entry edge: `fail` is the statement that leaves. */
+static void e_bnd_entry(FILE *f, int h, const char *fail) {
+  int q, c;
+  for (q = 0; q < g_e_bnd_n; q++) {
+    const EBnd *e = &g_e_bnd[q];
+    if (e->hdr != h) continue;
+    fprintf(f, "      { int64_t _tr = %s;\n        if (__builtin_expect(_tr > 0 && (0", e->trips);
+    for (c = 0; c < e->nchk; c++)
+      fprintf(f, " || i%u < 0 || (int64_t)i%u + _tr > (int64_t)%s%u", (unsigned)e->chk[c].y, (unsigned)e->chk[c].y,
+              e->chk[c].pk ? "pkn" : "an", (unsigned)e->chk[c].root);
+    fprintf(f, "), 0)) %s; }\n", fail);
+  }
+}
+
+/* The opening of an int32 add, subtract or multiply block: with the overflow exit the operation is the compiler's
+   overflow builtin (one flag test after the instruction), without it the 64-bit form whose truncation is the
+   wrapped result. A zero-product test, when wanted, reads `_t` either way. */
+static void e_arith_head(FILE *f, const char *a, const char *op, const char *b, int ovf, int pc) {
+  if (!ovf) {
+    fprintf(f, "    { int64_t _t = (int64_t)%s %s (int64_t)%s;\n", a, op, b);
+    return;
+  }
+  fprintf(f,
+          "    { int32_t _t; if (__builtin_expect(__builtin_%s_overflow((int32_t)%s, (int32_t)%s, &_t), 0)) E_GOTO(ox, %d);\n",
+          op[0] == '+' ? "add" : op[0] == '-' ? "sub" : "mul", a, b, pc);
+}
+
 /* The same for an owned result, which the register adopts. */
 static void e_sweep_guard_owned(FILE *f, int pc, int off) {
   char st[160];
@@ -2792,10 +3367,15 @@ static uint8_t *g_e_rooted;
    and the broken-bit rechecks guarantee it at every access) its property array is not moved,
    so every slot access loads nothing but the slot. */
 static uint8_t *g_e_pp;
+/* A contracted-layout receiver's property array pointer, loaded at its first access in a block, serves the
+   block's later accesses too: the block that defined it (plus one), per value. */
+static int *g_e_ppblk;
 static int e_pp_of(const char *recv) {
   unsigned n;
   if (recv[0] != 'v' || sscanf(recv + 1, "%u", &n) != 1) return -1;
-  return g_e_pp != NULL && (int)n < g_e_spill_nv && g_e_pp[n] ? (int)n : -1;
+  if (g_e_pp != NULL && (int)n < g_e_spill_nv && g_e_pp[n]) return (int)n;
+  if (g_e_ppblk != NULL && g_e_blk >= 0 && (int)n < g_e_spill_nv && g_e_ppblk[n] == g_e_blk + 1) return (int)n;
+  return -1;
 }
 
 static void e_compute_rooted(const Q2Func *fn) {
@@ -3111,8 +3691,11 @@ static void e_emit_group_recheck_at(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur, int exit_pc) {
   unsigned long long lm = g_e_facts != NULL ? (unsigned long long)g_e_facts->laymask[e_insn_idx(fn, in)] : 0;
   char lt[96] = "";
+  /* A body whose callees (transitively) are all inside the bundle and make no unknown call can not run JSON.parse: no lazy document appears
+     while it runs, and the entry tests the flag once. */
+  const int nolz = g_e_nolazy && !(g_e_fl && e_kon() && qjs_aot_bundle_fn_kok(fn->g));
   if (g_e_facts != NULL) lm |= (unsigned long long)g_e_facts->claimdeps;
-  if (!g_e_nolazy && !g_e_epoch_skip && lm == 0) return;
+  if (!nolz && !g_e_epoch_skip && lm == 0) return;
   /* An inline body's call whose result is the body's return value is followed by nothing that reads
      the facts; the caller tests them where the body returns. */
   if (g_e_inl && (in->rop == ROP_call || in->rop == ROP_call_method) && e_insn_idx(fn, in) + 1 < fn->ninsns) {
@@ -3135,10 +3718,11 @@ static void e_emit_group_recheck_at(
        whole activation. The tests that exercise it must fail under it. */
     const int ko = g_e_epoch_skip && getenv("QJS_AOT_KO_ENVRETEST") != NULL;
     const int ep = g_e_epoch_skip && !ko;
-    if (g_e_nolazy || ep || lt[0])
+    if (ep) fprintf(f, "    E_PC_TICK();\n");
+    if (nolz || ep || lt[0])
       fprintf(
-          f, "    if (__builtin_expect(%s%s%s%s%s, 0)) { %s goto dx_%d; }\n", g_e_nolazy ? "E_LAZY_SEEN(ctx)" : "",
-          g_e_nolazy && (ep || lt[0]) ? " || " : "", ep ? "Q2_EPOCH_MOVED(ctx)" : "", ep && lt[0] ? " || " : "", lt,
+          f, "    if (__builtin_expect(%s%s%s%s%s, 0)) { %s E_GOTO(dx, %d); }\n", nolz ? "E_LAZY_SEEN(ctx)" : "",
+          nolz && (ep || lt[0]) ? " || " : "", ep ? "Q2_EPOCH_MOVED(ctx)" : "", ep && lt[0] ? " || " : "", lt,
           g_e_dx_pre, exit_pc);
   }
   g_e_recheck_done = in->pc;
@@ -3245,7 +3829,7 @@ static void e_load_arg_to_local(
     case 'i':
       e_sweep_guard(f, "ax", pc);
       fprintf(
-          f, "    if (__builtin_expect(!Q2_I32_OK(q2_arg_buf(f)[%d], %s), 0)) goto ax_%d;\n", slot, dn, pc);
+          f, "    if (__builtin_expect(!Q2_I32_OK(q2_arg_buf(f)[%d], %s), 0)) E_GOTO(ax, %d);\n", slot, dn, pc);
       break;
     case 'd':
       e_sweep_guard(f, "ax", pc);
@@ -3253,7 +3837,7 @@ static void e_load_arg_to_local(
           f,
           "    if (__builtin_expect(JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) != "
           "JS_TAG_INT && JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) != "
-          "JS_TAG_FLOAT64, 0)) goto ax_%d;\n",
+          "JS_TAG_FLOAT64, 0)) E_GOTO(ax, %d);\n",
           slot, slot, pc);
       fprintf(
           f,
@@ -3267,7 +3851,7 @@ static void e_load_arg_to_local(
       fprintf(
           f,
           "    if (__builtin_expect(JS_VALUE_GET_TAG(q2_arg_buf(f)[%d]) != "
-          "JS_TAG_BOOL, 0)) goto ax_%d;\n",
+          "JS_TAG_BOOL, 0)) E_GOTO(ax, %d);\n",
           slot, pc);
       fprintf(f, "    %s = JS_VALUE_GET_BOOL(q2_arg_buf(f)[%d]);\n", dn, slot);
       break;
@@ -3282,6 +3866,7 @@ static void e_load_arg_to_local(
    same conversion the interpreter would perform on the frame. */
 static void e_copy_local(FILE *f, Q2ValueId d, Q2ValueId sv) {
   char dn[32], sn[32];
+  if ((unsigned)sv < sizeof(g_kval) && (unsigned)d < sizeof(g_kval) && g_kval[sv] > 0) g_kval[d] = g_kval[sv];
   const char *dp = e_rep_prefix(d), *sp = e_rep_prefix(sv);
   e_local_name(dn, sizeof(dn), d);
   e_local_name(sn, sizeof(sn), sv);
@@ -3352,27 +3937,21 @@ static int emit_typed_arith(
   if (t->lb[a] != E_LB_I32 || t->lb[b] != E_LB_I32) return 0;
   /* add/sub/mul in int64, then check the result fits: one widening op and one
      compare, and the compare is the exit condition the analysis recorded. */
-  fprintf(
-      f,
-      "    { int64_t _t = (int64_t)i%u %s (int64_t)i%u;\n",
-      (unsigned)in->use[0], op, (unsigned)in->use[1]);
   {
     int ovf = t->exits != NULL && (t->exits[d] & E_EX_OVF);
     int nz = t->exits != NULL && in->rop == ROP_mul && (t->exits[d] & E_EX_NEGZERO);
+    char an[24], bn[24];
+    snprintf(an, sizeof(an), "i%u", (unsigned)in->use[0]);
+    snprintf(bn, sizeof(bn), "i%u", (unsigned)in->use[1]);
+    if (ovf || nz) e_sweep_guard(f, "ox", in->pc);
+    e_arith_head(f, an, op, bn, ovf, in->pc);
     if (ovf || nz) {
-      e_sweep_guard(f, "ox", in->pc);
-      if (ovf)
-        fprintf(
-            f,
-            "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
-            "goto ox_%d;\n",
-            in->pc);
       /* a zero product with a negative operand is -0, which no int32 holds */
       if (nz)
         fprintf(
             f,
             "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) "
-            "goto ox_%d;\n",
+            "E_GOTO(ox, %d);\n",
             (unsigned)in->use[0], (unsigned)in->use[1], in->pc);
       e_note_stub(
           g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
@@ -3387,6 +3966,18 @@ static int emit_typed_arith(
 static int e_nosr_on(void) {
   static int cached = -1;
   if (cached < 0) cached = getenv("QJS_AOT_NOOSR") != NULL;
+  return cached;
+}
+
+/* The poll counts in a register per function body (QJS_AOT_POLLREG=0 keeps the shared counter's decrement on every back edge). */
+unsigned long long qjs_aot_prof_pc_count(const uint8_t dg[16], int pc);
+
+static int e_pollreg(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char *v = getenv("QJS_AOT_POLLREG");
+    cached = !(v != NULL && v[0] == '0');
+  }
   return cached;
 }
 
@@ -3526,8 +4117,10 @@ static void emit_trivial_own(
           e_fatal("internal inconsistency (see the message above)", NULL);
         }
         fprintf(f, "    }\n");
-      } else if (d != Q2_NO_VALUE && sv != Q2_NO_VALUE)
+      } else if (d != Q2_NO_VALUE && sv != Q2_NO_VALUE) {
         e_copy_local(f, d, sv);
+        if ((unsigned)sv < sizeof(g_kval) && (unsigned)d < sizeof(g_kval) && g_kval[sv] > 0) g_kval[d] = g_kval[sv];
+      }
       if (in->rop == ROP_move_xfer && sv != Q2_NO_VALUE) {
         int sr = g_e_fn->values[sv].reg;
         if (sr >= 0 && sr < g_e_fn->nregs && cur != NULL) cur[sr] = E_UNDEF;
@@ -3683,7 +4276,7 @@ static void e_exit_expr(char *buf, size_t n, Q2ValueId v);
    is called with the arguments it was going to get. */
 static int e_virt_expr(char *buf, size_t n, Q2ValueId v) {
   const Q2VWeb *vw;
-  char body[2400], one[240], cexp[120];
+  char body[4096], one[240], cexp[120];
   int j, len = 0;
   Q2ValueId cv;
   if (g_e_virt_fn == NULL || g_e_virt == NULL || v >= (Q2ValueId)g_e_virt_fn->nvalues || !g_e_virt[v] ||
@@ -3717,6 +4310,7 @@ static int e_virt_expr(char *buf, size_t n, Q2ValueId v) {
         "JS_FreeValue(ctx, t_); return JS_EXCEPTION; } ",
         vw->aoff[j], one);
     len += snprintf(body + len, sizeof(body) - (size_t)len, "%s", one2);
+    if ((size_t)len + 1 >= sizeof(body)) e_fatal("the fields of an object made at an exit do not fit their buffer", NULL);
   }
   snprintf(
       buf, n,
@@ -3727,6 +4321,7 @@ static int e_virt_expr(char *buf, size_t n, Q2ValueId v) {
       "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE) + QJS_AOT_OFF_FNBC_REGVM_CODE); "
       "%sqjs_aot_construct_done((JSObject *)JS_VALUE_GET_PTR(c_), t_); t_; })",
       cexp, body);
+  if (strlen(buf) + 1 >= n) e_fatal("the expression of an object made at an exit does not fit its buffer", NULL);
   return 1;
 }
 
@@ -3835,6 +4430,16 @@ static int e_t2_shape(const char hex[33], int fi, const char *stepfn, const XsCu
     return r->nshape++;
   }
 }
+/* The same expression for a value that goes into a frame slot RAW (the hand-over lists of a frameless exit or a resumed copy): an object made at the exit
+   is owned, and a frame register holds no count of its own, so the slot adopts it the way qjs_aot_set_reg_p does (the count drops, a zero parks). */
+static int g_e_xl_own;
+static void e_exit_expr_own(char *buf, size_t n, Q2ValueId v) {
+  char vx[4096];
+  if (e_virt_expr(vx, sizeof(vx), v)) {
+    if (snprintf(buf, n, "({ JSValue vo_ = %s; q2_free(ctx, vo_); vo_; })", vx) >= (int)n) e_fatal("the expression of an object made at an exit does not fit its buffer", NULL);
+  }
+  else e_exit_expr(buf, n, v);
+}
 static void e_exit_store(FILE *f, Q2ValueId v, int reg) {
   /* The register to write is the one being synced, NOT the one the value was
      defined in: an edge can move a value into another register's param, and
@@ -3842,7 +4447,7 @@ static void e_exit_store(FILE *f, Q2ValueId v, int reg) {
      generic body actually reads holding its previous contents. */
   int off = reg * 16;
   {
-    char vx[1600];
+    char vx[4096];
     if (e_virt_expr(vx, sizeof(vx), v)) {
       fprintf(f, "    qjs_aot_set_reg_p(ctx, fr, %d, %s);\n", off, vx);
       return;
@@ -3904,14 +4509,43 @@ static void e_exit_expr(char *buf, size_t n, Q2ValueId v) {
    line; a frameless one hands the kind and tag to its exit function through the
    exit record, so the body keeps no call of its own on the way out. */
 static char g_e_xk[16], g_e_xt[160];
+/* What the exit being emitted is for, in words: set by the code that emits the guard's stub and read (and cleared) by the exit, which
+   records it with the op at the pc in the unit statistics. */
+static const char *g_e_why;
+static const char *e_exit_reason(const char *kind) {
+  if (strcmp(kind, "ax") == 0) return "arg-tag";
+  if (strcmp(kind, "vx") == 0) return "value-guard";
+  if (strcmp(kind, "dx") == 0) return "result-tag";
+  if (strcmp(kind, "ox") == 0) return "overflow";
+  return kind;
+}
+/* The name of the op the exit at `pc` leaves at: the instruction the exit was emitted for when the caller says so, else the one that
+   starts at `pc` (outside a copy first). */
+static void e_exit_opname(const Q2Func *fn, int ins, int pc, char *buf, size_t n) {
+  int i;
+  if (ins < 0 || ins >= fn->ninsns) {
+    ins = -1;
+    for (i = 0; i < fn->ninsns && ins < 0; i++)
+      if (fn->insns[i].pc == pc && fn->insns[i].own == 0) ins = i;
+    for (i = 0; i < fn->ninsns && ins < 0; i++)
+      if (fn->insns[i].pc == pc) ins = i;
+  }
+  if (ins < 0)
+    snprintf(buf, n, "?");
+  else
+    e_rop_name(fn->insns[ins].rop, buf, n);
+}
 static void e_emit_exit_log(
-    FILE *f, char hex[33], const char *kind, int pc, const char *tagexpr) {
+    FILE *f, const Q2Func *fn, int ins, char hex[33], const char *kind, int pc, const char *tagexpr) {
+  char op[48];
+  g_e_why = e_exit_reason(kind);
   if (g_e_fl) {
     snprintf(g_e_xk, sizeof(g_e_xk), "\"%s\"", kind);
     snprintf(g_e_xt, sizeof(g_e_xt), "%s", tagexpr);
     return;
   }
-  fprintf(f, "    E_EXIT_LOG(\"%s\", \"%s\", %d, %s);\n", hex, kind, pc, tagexpr);
+  e_exit_opname(fn, ins, pc, op, sizeof(op));
+  fprintf(f, "    E_EXIT_LOGO(\"%s\", \"%s\", %d, %s, \"%s\");\n", hex, kind, pc, tagexpr, op);
 }
 
 /* The generic body entered at `pc` from the speculative body. In a framed body
@@ -3968,7 +4602,9 @@ static void e_emit_exit(
   /* Frameless: the values are collected, not stored. */
   int nlv = 0, ndefer = 0, defer[64];
   int *loff = NULL;
-  char (*lex)[1600] = NULL;
+  char (*lex)[4096] = NULL;
+  const char *why;
+  char opname[48];
 
   if (g_e_fl) {
     loff = malloc(sizeof(int) * (size_t)(fn->nregs > 0 ? fn->nregs : 1));
@@ -3986,6 +4622,9 @@ static void e_emit_exit(
     e_fatal("internal inconsistency (see the message above)", NULL);
   }
   g_e_exit_dirty = 0;
+  why = g_e_why != NULL ? g_e_why : handoff ? "unlowered-op" : "guard";
+  g_e_why = NULL;
+  e_exit_opname(fn, g_e_exit_ins, pc, opname, sizeof(opname));
   /* A resumable copy keeps no undo log, so the ONLY exit it may take is the resume exit: a replay of the call after one of its stores would
      apply the store twice. */
   if (g_e_exit_ins >= 0 && g_e_exit_ins < fn->ninsns && fn->insns[g_e_exit_ins].own > 0 && g_e_resume != NULL &&
@@ -3997,14 +4636,16 @@ static void e_emit_exit(
   g_e_stub_cur = cur;
   g_e_stub_pc = pc;
   if (g_e_inl) {
+    char opn[48];
     const char *ctl = getenv("QJS_AOT_INL_CONTROL");
+    e_exit_opname(fn, g_e_exit_ins, pc, opn, sizeof(opn));
     g_e_exit_dirty = g_e_dirty_ins != NULL && g_e_exit_ins >= 0 &&
-                      g_e_dirty_ins[g_e_exit_ins] &&
+                      (g_e_dirty_ins[g_e_exit_ins] || (g_e_dirty_loop != NULL && g_e_dirty_loop[g_e_exit_ins])) &&
                       !(ctl != NULL && strcmp(ctl, "clean") == 0);
     if (!g_e_exit_dirty) {
       /* Nothing has happened: the caller's native call does the whole call. */
       fprintf(
-          f, "    { E_EXIT_LOG(\"%s\", \"ix\", %d, -100); %s(%d); return 0; }\n", hex, pc,
+          f, "    { E_EXIT_LOGO(\"%s\", \"ix\", %d, -100, \"%s\"); %s(%d); return 0; }\n", hex, pc, opn,
           handoff ? "E_HANDOFF_NOTE" : "E_INL_EXIT_NOTE", fi);
       free(loff);
       free(lex);
@@ -4068,7 +4709,7 @@ static void e_emit_exit(
         }
         if (g_e_fl) {
           loff[nlv] = r * 16;
-          e_exit_expr(lex[nlv], sizeof(lex[0]), cur[r]);
+          e_exit_expr_own(lex[nlv], sizeof(lex[0]), cur[r]);
           /* vkit knock-out (QJS_AOT_XIT_STALE_FL=N): the exit of a frameless body hands the new frame a stale 0 for register N */
           { const char *sk_ = getenv("QJS_AOT_XIT_STALE_FL"); if (sk_ != NULL && atoi(sk_) == (int)r) snprintf(lex[nlv], sizeof(lex[0]), "JS_MKVAL(JS_TAG_INT, 0)"); }
           nlv++;
@@ -4078,7 +4719,7 @@ static void e_emit_exit(
           if (ndefer >= 64) { e_fatal("more than 64 deferred exit stores", NULL); ndefer = 0; }
           defer[ndefer++] = r;
         } else if (xs_on && xs.n < XS_MAX_VALS) {
-          char vx_[1600];
+          char vx_[4096];
           xs.off[xs.n] = r * 16; xs.vid[xs.n] = (unsigned)cur[r]; xs.reg[xs.n] = r;
           switch (e_rep_prefix(cur[r])[0]) {
             case 'i': xs.kind[xs.n] = 'I'; break;
@@ -4169,8 +4810,34 @@ static void e_emit_exit(
       return;
     }
   }
-  fprintf(
-      f, "    %s(%d);\n", handoff ? "E_HANDOFF_NOTE" : "E_EXIT_NOTE", fi);
+  if (!handoff && !g_e_inl && g_e_facts != NULL) {
+    /* the property site the exit's instruction reads, and the shape its group assumed */
+    int xi = g_e_exit_ins, a, xsite = -1, xg;
+    if (xi < 0 || xi >= fn->ninsns) {
+      xi = -1;
+      for (a = 0; a < fn->ninsns && xi < 0; a++)
+        if (fn->insns[a].pc == pc && fn->insns[a].own == 0) xi = a;
+    }
+    if (xi >= 0 && fn->insns[xi].own == 0)
+      for (a = 0; a < fn->insns[xi].narg && xsite < 0; a++)
+        if (fn->insns[xi].arg[a].kind == 's') xsite = (int)fn->insns[xi].arg[a].val;
+    if (xsite >= 0) {
+      xg = e_exit_group(fn, &fn->insns[xi], xsite);
+      if (xg >= 0 && (g_e_group_used == NULL || !g_e_group_used[xg] ||
+                      !(g_e_facts->groups[xg].own || !e_entry_skip(xg) || e_group_layout(xg) != 0)))
+        xg = -1;
+      if (xg >= 0)
+        fprintf(f, "    E_EXIT_WHY(\"%s\", %d, \"%s\", pic, %d, (int)q2_ns, gsh%d);\n", hex, pc, opname, xsite, xg);
+      else
+        fprintf(f, "    E_EXIT_WHY(\"%s\", %d, \"%s\", pic, %d, (int)q2_ns, NULL);\n", hex, pc, opname, xsite);
+    } else {
+      fprintf(f, "    E_EXIT_WHY(\"%s\", %d, \"%s\", NULL, -1, 0, NULL);\n", hex, pc, opname);
+    }
+  }
+  if (handoff)
+    fprintf(f, "    E_HANDOFF_NOTE_AT(%d, \"%s\", %d, \"%s\");\n", fi, hex, pc, opname);
+  else
+    fprintf(f, "    E_EXIT_NOTE_AT(%d, %d, \"%s\", \"%s\", \"%s\");\n", fi, pc, hex, opname, why);
   e_emit_generic_call(f, hex, pc, nlv, "    ");
   fprintf(f, "    }\n");
 }
@@ -4269,7 +4936,8 @@ static void e_resume_reg(char *buf, size_t n, const Q2Func *fn, const Q2ValueId 
     snprintf(buf, n, "AOT_REG(ifr_%d, %d)", k < fn->ninl ? k : 0, r * 16);
     return;
   }
-  e_exit_expr(buf, n, cur[r]);
+  if (g_e_xl_own) e_exit_expr_own(buf, n, cur[r]);
+  else e_exit_expr(buf, n, cur[r]);
 }
 
 /* The exit of an instruction of a resumable copy: the caller's live registers go to the frame, then each callee of the nest is resumed in
@@ -4315,7 +4983,7 @@ static void e_emit_resume_exit(
     const Q2Inl *iv = &fn->inl[chain[lvl]];
     const Q2Insn *gd = NULL, *at = NULL; /* this level's guard; the instruction it resumes at */
     uint64_t *lbl = lb;
-    char hexc[33], thisx[1700], avx[64];
+    char hexc[33], thisx[4096], avx[64];
     int nlv = 0, resume_pc, dst_prev = -1, ncallee = iv->g->reg_count, isroot = lvl == nch - 1, th, nw, rwin;
     static const char *const hx = "0123456789abcdef";
     for (q = 0; q < 16; q++) {
@@ -4355,7 +5023,7 @@ static void e_emit_resume_exit(
     for (w = 0; w < fn->lwords; w++) {
       uint64_t bits = lbl[w];
       while (bits != 0) {
-        char ex[1700];
+        char ex[4096];
         r = w * 64 + __builtin_ctzll(bits);
         bits &= bits - 1;
         if (r < iv->rbase || r >= iv->rbase + ncallee) continue;
@@ -4363,7 +5031,9 @@ static void e_emit_resume_exit(
           snprintf(ex, sizeof(ex), "AOT_REG(ifr_%d, %d)", chain[lvl], r * 16);
         } else {
           if (cur[r] == Q2_NO_VALUE) continue;
+          g_e_xl_own = 1;
           e_resume_reg(ex, sizeof(ex), fn, cur, r);
+          g_e_xl_own = 0;
         }
         /* vkit knock-out (QJS_AOT_XIT_STALE=N): the exit chain hands the callee's resume frame a stale 0 for the callee's register N, as a lost live value would */
         { const char *sk_ = getenv("QJS_AOT_XIT_STALE"); if (sk_ != NULL && atoi(sk_) == r - iv->rbase) snprintf(ex, sizeof(ex), "JS_MKVAL(JS_TAG_INT, 0)"); }
@@ -4394,16 +5064,17 @@ static void e_emit_resume_exit(
     } else {
       fprintf(f, "    JSValue av_[%d];\n", nw > 0 ? nw : 1);
       for (w = 0; w < nw; w++) {
-        char ex[1700];
+        char ex[4096];
         e_resume_reg(ex, sizeof(ex), fn, cur, rwin + w);
         fprintf(f, "    av_[%d] = %s;\n", w, ex);
       }
       snprintf(avx, sizeof(avx), "av_");
     }
-    if (lvl == 0) fprintf(f, "    E_EXIT_NOTE(%d);\n    E_CAP(f, %d);\n", fi, fn->inl[rootc].call_pc);
+    if (lvl == 0) fprintf(f, "    E_EXIT_NOTE_AT(%d, %d, \"%s\", \"call\", \"inlined-call-resume\");\n    E_CAP(f, %d);\n", fi, fn->inl[rootc].call_pc, hex, fn->inl[rootc].call_pc);
     fprintf(
         f, "    e_xs = (ENx){ %d, -100, \"mx\", %s, %s, %d, %d, NULL };\n", resume_pc, nlv > 0 ? "e_xl" : "NULL",
         nlv > 0 ? "offs" : "NULL", nlv, nw);
+    e_rat_stub_line(f, fn, hex, chain[lvl]);
     fprintf(f, "    rr_ = aot_rx_%s(ctx, f, nco_%d, %s, %s, &e_xs);\n", hexc, chain[lvl], thisx, avx);
     fprintf(f, "    if (__builtin_expect(JS_IsException(rr_), 0)) return JS_EXCEPTION;\n");
     if (!isroot) {
@@ -4440,6 +5111,7 @@ static void e_emit_resume_exit(
 static void e_emit_exit_at(
     FILE *f, const Q2Func *fn, int ins, int pc, char hex[33], int fi,
     const Q2ValueId *cur, int blkidx, int handoff) {
+  if (e_rat()) fprintf(f, "#line 1 \"NOFRAME\"\n");
   uint64_t *lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
   if (cur == NULL) {
     fprintf(
@@ -4449,6 +5121,7 @@ static void e_emit_exit_at(
   if (fn->insns[ins].own > 0 && g_e_resume != NULL && fn->insns[ins].own <= g_e_resume_n &&
       g_e_resume[fn->insns[ins].own - 1]) {
     free(lb);
+    g_e_why = NULL;
     e_emit_resume_exit(f, fn, ins, hex, fi, cur, blkidx);
     return;
   }
@@ -4611,6 +5284,7 @@ static void e_emit_arm(
       for (q = 0; q < g_e_facts->nhoist; q++) {
         Q2ValueId rv;
         if (g_e_facts->hoist_hdr[q] != sb || g_e_facts->hoist_pre[q] != b) continue;
+        if (g_e_facts->hoist_have != NULL && g_e_facts->hoist_have[q]) continue;
         if (g_e_facts->hoist_grp[q] <= -1000) {
           e_sweep_guard(f, "vx", hb->start_pc);
           e_cell_hoist_check(f, g_e_facts->hoist_val[q], -1000 - g_e_facts->hoist_grp[q], "vx", hb->start_pc);
@@ -4624,7 +5298,7 @@ static void e_emit_arm(
               f,
               "      { JSValue _th = %s;\n"
               "        if (__builtin_expect(JS_VALUE_GET_TAG(_th) != JS_TAG_OBJECT ||\n"
-              "            q2_shape_ne(_th, gsh%d), 0)) goto vx_%d; }\n",
+              "            q2_shape_ne(_th, gsh%d), 0)) E_GOTO(vx, %d); }\n",
               g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)",
               g_e_facts->hoist_grp[q], hb->start_pc);
           g_e_n_hoist++;
@@ -4635,17 +5309,22 @@ static void e_emit_arm(
             (g_e_facts->hoist_grp[q] == -2 || (g_e_facts->hoist_grp[q] <= -101 && g_e_facts->hoist_grp[q] >= -112) ||
              g_e_facts->hoist_grp[q] == E_GRP_PK_I32 || g_e_facts->hoist_grp[q] == E_GRP_PK_F64)) {
           char fl[32];
-          snprintf(fl, sizeof(fl), "goto vx_%d", hb->start_pc);
+          snprintf(fl, sizeof(fl), "E_GOTO(vx, %d)", hb->start_pc);
           e_arr_region_start_grp(f, rv, rv, fl, g_e_facts->hoist_grp[q]);
         } else if (g_e_types != NULL && rv < (Q2ValueId)g_e_types->nvalues &&
             g_e_types->lb[rv] == E_LB_TAG) {
           fprintf(
-              f, "      if (__builtin_expect(q2_shape_ne(v%u, gsh%d), 0)) goto vx_%d;\n",
+              f, "      if (__builtin_expect(q2_shape_ne(v%u, gsh%d), 0)) E_GOTO(vx, %d);\n",
               (unsigned)rv, g_e_facts->hoist_grp[q], hb->start_pc);
         } else {
-          fprintf(f, "      goto vx_%d;\n", hb->start_pc);
+          fprintf(f, "      E_GOTO(vx, %d);\n", hb->start_pc);
         }
         g_e_n_hoist++;
+      }
+      {
+        char fl[32];
+        snprintf(fl, sizeof(fl), "E_GOTO(vx, %d)", hb->start_pc);
+        e_bnd_entry(f, sb, fl);
       }
     }
   }
@@ -4670,9 +5349,25 @@ static void e_emit_arm(
   if (q2_is_back_edge(fn, b, sb) && !e_nopoll()) {
     const Q2Block *t = &fn->blocks[sb];
     int q;
-    fprintf(
-        f,
-        "      if (__builtin_expect(Q2_POLL_HIT(ctx), 0)) {\n");
+    /* a loop with no call and no safepoint is the one whose body the counter's store slows down; a loop that calls keeps the
+       shared counter, whose store its calls hide */
+    int leaf = 0;
+    if (e_pollreg() && g_e_facts != NULL) {
+      int ql;
+      for (ql = 0; ql < g_e_facts->nloops; ql++)
+        if (g_e_facts->loop_hdr[ql] == sb && !g_e_facts->loop_calls[ql]) leaf = 1;
+    }
+    /* ... and one that iterates many times per entry: the counter costs a register and an initialisation per call, which a loop
+       of a few iterations does not earn back */
+    if (leaf) {
+      unsigned long long hc = qjs_aot_prof_pc_count(fn->g->digest, fn->insns[t->first_insn].opc);
+      unsigned long long ec = qjs_aot_prof_pc_count(fn->g->digest, fn->insns[0].opc);
+      if (hc == 0 || hc < 32 * (ec ? ec : 1024)) leaf = 0;
+    }
+    if (leaf)
+      fprintf(f, "      if (__builtin_expect(Q2_POLL_HITB(ctx, pq_), 0)) {\n");
+    else
+      fprintf(f, "      if (__builtin_expect(Q2_POLL_HIT(ctx), 0)) {\n");
     /* The poll that fires may run an embedder's interrupt handler: what a loop-invariant run computed is recomputed after it
        (the hoists of shape checks assume the same: nothing in a loop changes what it read, the poll included). */
     if (g_e_facts != NULL && g_e_facts->nhv > 0) {
@@ -4685,6 +5380,8 @@ static void e_emit_arm(
         "          ++*(int *)((unsigned char *)ctx +\n"
         "              QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n");
     int unsafe_tag = 0;
+    int pnsp = 0;
+    Q2ValueId ppv[E_SPILL_MAX + 1];
     if (g_e_fl)
       for (q = 0; q < t->nlive_in; q++) {
         int rr = t->in_reg[q];
@@ -4714,8 +5411,27 @@ static void e_emit_arm(
           Q2ValueId vv = t->in_val[q];
           if (rr < 0 || rr >= fn->nregs || vv == Q2_NO_VALUE) continue;
           if (e_rep_prefix(vv)[0] == 'v'  &&
-              !(g_e_rooted != NULL && vv < (Q2ValueId)fn->nvalues && g_e_rooted[vv] == 1))
-            fprintf(f, "          ra_[%d] = v%u;\n", e_spill_slot(vv), (unsigned)vv);
+              !(g_e_rooted != NULL && vv < (Q2ValueId)fn->nvalues && g_e_rooted[vv] == 1)) {
+            int dup_ = 0, d_;
+            for (d_ = 0; d_ < pnsp; d_++) if (ppv[d_] == vv) dup_ = 1;
+            if (!dup_ && pnsp < E_SPILL_MAX) ppv[pnsp++] = vv;
+          }
+        }
+        {
+          char pb_[1024];
+          size_t pl_ = 0;
+          int d_;
+          pb_[0] = 0;
+          e_rt_note(pnsp + 1);
+          for (d_ = 0; d_ < pnsp && !e_scan(); d_++) {
+            if (g_e_compact)
+              pl_ += (size_t)snprintf(pb_ + pl_, sizeof(pb_) - pl_, "          ra_[%d] = v%u;\n", d_, (unsigned)ppv[d_]);
+            else
+              pl_ += (size_t)snprintf(pb_ + pl_, sizeof(pb_) - pl_, "          ra_[%d] = v%u;\n", e_spill_slot(ppv[d_]), (unsigned)ppv[d_]);
+          }
+          if (g_e_compact && !e_scan())
+            pl_ += (size_t)snprintf(pb_ + pl_, sizeof(pb_) - pl_, "          ra_[%d] = JS_UNDEFINED;\n", pnsp);
+          fputs(pb_, f);
         }
         g_e_fl_calls = 1;
         unsafe_tag = 0;
@@ -4725,6 +5441,11 @@ static void e_emit_arm(
       /* Every live TAG value is kept alive by the caller (an argument, the
          receiver): the poll may run an interrupt handler and the collector
          without a frame to scan. */
+      if (g_e_compact && !g_e_inl)
+        fprintf(
+            f, "%s          E_RANGE(rec_, %d);\n          if (qjs_aot_poll_fl(ctx) < 0) return JS_EXCEPTION;\n",
+            pnsp == 0 ? "          ra_[0] = JS_UNDEFINED;\n" : "", pnsp + 1);
+      else
       fprintf(
           f, g_e_inl ? "          if (qjs_aot_poll_fl(ctx) < 0) { *out = JS_EXCEPTION; return 1; }\n"
                       : "          E_RLINK(rec_);\n          if (qjs_aot_poll_fl(ctx) < 0) return JS_EXCEPTION;\n");
@@ -4732,7 +5453,7 @@ static void e_emit_arm(
       /* A borrowed value only this body holds: leave at the loop header, where
          the generic body has a frame, and let it poll at its own next back edge
          (this body is not re-entered, so the rest of the call runs there). */
-      char ex[1600];
+      char ex[4096];
       int nlv = 0;
       e_virt_compute(fn);
       g_e_stub_cur = cur;
@@ -4741,7 +5462,7 @@ static void e_emit_arm(
         int rr = t->in_reg[q];
         Q2ValueId vv = t->in_val[q];
         if (rr < 0 || rr >= fn->norig || vv == Q2_NO_VALUE) continue;
-        e_exit_expr(
+        e_exit_expr_own(
             ex, sizeof(ex), cur != NULL && cur[rr] != Q2_NO_VALUE ? cur[rr] : vv);
         fprintf(f, "              e_xl[%d] = %s;\n", nlv++, ex);
       }
@@ -4770,6 +5491,9 @@ static void e_emit_arm(
         if (cur != NULL && cur[rr] != Q2_NO_VALUE) e_exit_store(f, cur[rr], rr);
         else e_exit_store(f, vv, rr);
       }
+      if (g_e_compact && !g_e_inl)
+        fprintf(f, "          ra_[0] = JS_UNDEFINED;\n          E_RANGE(rec_, 1);\n          if (qjs_aot_poll_fl(ctx) < 0) return JS_EXCEPTION;\n");
+      else
       fprintf(f, "          E_RLINK(rec_);\n          if (qjs_aot_poll_fl(ctx) < 0) return JS_EXCEPTION;\n");
     }
     fprintf(f, "      }\n");
@@ -4825,7 +5549,7 @@ static int emit_typed_var_ref_load(
         f,
         "    { JSValue _c = qjs_aot_get_var_ref(f, %d);\n"
         "      if (__builtin_expect(!Q2_I32_OK(_c, i%u), 0)) "
-        "goto vx_%d; }\n",
+        "E_GOTO(vx, %d); }\n",
         slot, (unsigned)d, in->pc);
   } else if (t->lb[d] == E_LB_F64) {
     e_sweep_guard(f, "vx", in->pc);
@@ -4835,7 +5559,7 @@ static int emit_typed_var_ref_load(
         "      int _tg = JS_VALUE_GET_TAG(_c);\n"
         "      if (_tg == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_c);\n"
         "      else if (_tg == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_c);\n"
-        "      else goto vx_%d; }\n",
+        "      else E_GOTO(vx, %d); }\n",
         slot, (unsigned)d, (unsigned)d, in->pc);
   } else if (t->lb[d] == E_LB_BOOL) {
     e_sweep_guard(f, "vx", in->pc);
@@ -4843,7 +5567,7 @@ static int emit_typed_var_ref_load(
         f,
         "    { JSValue _c = qjs_aot_get_var_ref(f, %d);\n"
         "      if (__builtin_expect(JS_VALUE_GET_TAG(_c) != JS_TAG_BOOL, 0)) "
-        "goto vx_%d;\n"
+        "E_GOTO(vx, %d);\n"
         "      b%u = JS_VALUE_GET_BOOL(_c); }\n",
         slot, in->pc, (unsigned)d);
   } else {
@@ -5068,7 +5792,7 @@ static int emit_typed_opcall(
       fprintf(stderr, "  copy: %s at clone pc %d (orig %d) has no inline lowering: the copy leaves there\n", nm, in->pc, (int)in->opc);
     }
     e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
-    fprintf(f, "    goto vx_%d; /* a copied instruction with no inline lowering */\n", in->pc);
+    fprintf(f, "    E_GOTO(vx, %d); /* a copied instruction with no inline lowering */\n", in->pc);
     return 1;
   }
   /* The CALLER decides when to use this: a native spec emitter calls it on its
@@ -5097,7 +5821,7 @@ static int emit_typed_opcall(
        register array, exactly as after a wrapper. */
     e_note_stub(
         g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
-    fprintf(f, "        goto vx_%d;\n", in->pc);
+    fprintf(f, "        E_GOTO(vx, %d);\n", in->pc);
     return 1;
   }
 
@@ -5202,7 +5926,7 @@ static int emit_typed_opcall(
             f,
             "    { JSValue _r = AOT_REG(fr, %d);\n"
             "      if (__builtin_expect(!Q2_I32_OK(_r, i%u), 0)) "
-            "goto dx_%d; }\n",
+            "E_GOTO(dx, %d); }\n",
             reg * 16, (unsigned)v, in->next);
         any = 1;
         break;
@@ -5213,7 +5937,7 @@ static int emit_typed_opcall(
             "    { JSValue _r = AOT_REG(fr, %d); int _tg = JS_VALUE_GET_TAG(_r);\n"
             "      if (_tg == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_r);\n"
             "      else if (_tg == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_r);\n"
-            "      else goto dx_%d; }\n",
+            "      else E_GOTO(dx, %d); }\n",
             reg * 16, (unsigned)v, (unsigned)v, in->next);
         any = 1;
         break;
@@ -5223,7 +5947,7 @@ static int emit_typed_opcall(
             f,
             "    { JSValue _r = AOT_REG(fr, %d);\n"
             "      if (__builtin_expect(JS_VALUE_GET_TAG(_r) != JS_TAG_BOOL, 0)) "
-            "goto dx_%d;\n"
+            "E_GOTO(dx, %d);\n"
             "      b%u = JS_VALUE_GET_BOOL(_r); }\n",
             reg * 16, in->next, (unsigned)v);
         any = 1;
@@ -5549,7 +6273,7 @@ static int emit_typed_divmod(
     e_note_stub(g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
     fprintf(
         f,
-        "    if (__builtin_expect(i%u == 0 || i%u %% i%u != 0 || (i%u == 0 && i%u < 0) || (i%u == INT32_MIN && i%u == -1), 0)) goto ox_%d;\n"
+        "    if (__builtin_expect(i%u == 0 || i%u %% i%u != 0 || (i%u == 0 && i%u < 0) || (i%u == INT32_MIN && i%u == -1), 0)) E_GOTO(ox, %d);\n"
         "    i%u = i%u / i%u;\n",
         (unsigned)bv, (unsigned)av, (unsigned)bv, (unsigned)av, (unsigned)bv, (unsigned)av, (unsigned)bv, in->pc, (unsigned)dv, (unsigned)av,
         (unsigned)bv);
@@ -5698,10 +6422,12 @@ static int emit_typed_fused(
              converted (an lvalue cast is not C) */
           int ovf1 = t->exits == NULL || (t->exits[dv] & E_EX_OVF);
           int nz1 = t->exits == NULL || (t->exits[dv] & E_EX_NEGZERO);
+          char xs[24], ys[24];
+          snprintf(xs, sizeof(xs), "i%u", (unsigned)xv);
+          snprintf(ys, sizeof(ys), "i%u", (unsigned)yv);
           if (ovf1 || nz1) e_sweep_guard(f, "ox", in->pc);
-          fprintf(f, "    { int64_t _t = (int64_t)i%u * (int64_t)i%u;\n", (unsigned)xv, (unsigned)yv);
-          if (ovf1) fprintf(f, "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) goto ox_%d;\n", in->pc);
-          if (nz1) fprintf(f, "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) goto ox_%d;\n", (unsigned)xv, (unsigned)yv, in->pc);
+          e_arith_head(f, xs, "*", ys, ovf1, in->pc);
+          if (nz1) fprintf(f, "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) E_GOTO(ox, %d);\n", (unsigned)xv, (unsigned)yv, in->pc);
           fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)dv);
           if (ovf1 || nz1) e_note_stub(g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
         } else
@@ -5719,27 +6445,21 @@ static int emit_typed_fused(
         int ovf1 = t->exits == NULL || (t->exits[dv] & E_EX_OVF);
         int nz1 = t->exits == NULL || (t->exits[dv] & E_EX_NEGZERO);
         int ovf2 = t->exits == NULL || (t->exits[rv] & E_EX_OVF);
+        char xs[24], ys[24], as[24], bs[24];
+        snprintf(xs, sizeof(xs), "i%u", (unsigned)xv);
+        snprintf(ys, sizeof(ys), "i%u", (unsigned)yv);
         if (ovf1 || nz1 || ovf2) e_sweep_guard(f, "ox", in->pc);
-        fprintf(f, "    { int64_t _t = (int64_t)i%u * (int64_t)i%u;\n", (unsigned)xv, (unsigned)yv);
-        if (ovf1)
-          fprintf(
-              f,
-              "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) goto ox_%d;\n",
-              in->pc);
+        e_arith_head(f, xs, "*", ys, ovf1, in->pc);
         if (nz1)
           fprintf(
               f,
-              "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) goto ox_%d;\n",
+              "      if (__builtin_expect(_t == 0 && (i%u < 0 || i%u < 0), 0)) E_GOTO(ox, %d);\n",
               (unsigned)xv, (unsigned)yv, in->pc);
         fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)dv);
         /* Step 2: the sum or difference. */
-        fprintf(f, "    { int64_t _t = (int64_t)i%u %s (int64_t)i%u;\n",
-            (unsigned)(c_first ? cv : dv), is_add ? "+" : "-", (unsigned)(c_first ? dv : cv));
-        if (ovf2)
-          fprintf(
-              f,
-              "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) goto ox_%d;\n",
-              in->pc);
+        snprintf(as, sizeof(as), "i%u", (unsigned)(c_first ? cv : dv));
+        snprintf(bs, sizeof(bs), "i%u", (unsigned)(c_first ? dv : cv));
+        e_arith_head(f, as, is_add ? "+" : "-", bs, ovf2, in->pc);
         fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)rv);
         if (ovf1 || nz1 || ovf2)
           e_note_stub(g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
@@ -5848,7 +6568,7 @@ static int emit_typed_propkey(
       fprintf(
           f,
           "    if (__builtin_expect(JS_VALUE_GET_TAG(v%u) == JS_TAG_NULL || "
-          "JS_VALUE_GET_TAG(v%u) == JS_TAG_UNDEFINED, 0)) goto vx_%d;\n",
+          "JS_VALUE_GET_TAG(v%u) == JS_TAG_UNDEFINED, 0)) E_GOTO(vx, %d);\n",
           (unsigned)ov, (unsigned)ov, in->pc);
     }
   }
@@ -5896,7 +6616,7 @@ static int emit_typed_length(
      which the copy's own stub handles like any other miss. */
   if (in->own > 0) {
     e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
-    fprintf(f, "        goto vx_%d;\n", in->pc);
+    fprintf(f, "        E_GOTO(vx, %d);\n", in->pc);
   } else {
     if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
   }
@@ -6002,12 +6722,13 @@ static int emit_typed_elem_read(
     if (e_def_dead(in, dv)) {
       /* nothing reads it: no guard, no store */
     } else {
+      if (cur != NULL) e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
       e_sweep_guard_set(f, "dx", in->next, dreg * 16, "_e");
       if (t->lb[dv] == E_LB_I32)
         fprintf(
             f,
             "        if (__builtin_expect(!Q2_I32_OK(_e, i%u), "
-            "0)) { AOT_SET_B(ctx, fr, %d, _e); goto dx_%d; }\n",
+            "0)) { AOT_SET_B(ctx, fr, %d, _e); E_GOTO(dx, %d); }\n",
             (unsigned)dv, dreg * 16, in->next);
       else if (t->lb[dv] == E_LB_F64)
         fprintf(
@@ -6016,7 +6737,7 @@ static int emit_typed_elem_read(
             "(double)JS_VALUE_GET_INT(_e);\n"
             "        else if (JS_VALUE_GET_TAG(_e) == JS_TAG_FLOAT64) d%u = "
             "JS_VALUE_GET_FLOAT64(_e);\n"
-            "        else { AOT_SET_B(ctx, fr, %d, _e); goto dx_%d; }\n",
+            "        else { AOT_SET_B(ctx, fr, %d, _e); E_GOTO(dx, %d); }\n",
             (unsigned)dv, (unsigned)dv, dreg * 16, in->next);
     }
   }
@@ -6119,7 +6840,7 @@ static int emit_hit_result(
 static void e_toi32_expr(char *buf, size_t n, const ETypes *t, Q2ValueId a);
 /* The exit stubs (dx) that take the owned result of a call to compiled code, by pc, with
    the register offset it was written to. */
-static int g_e_dx_own_pc[1024], g_e_dx_own_off[1024], g_e_dx_own_n;
+static int g_e_dx_own_pc[1024], g_e_dx_own_off[1024], g_e_dx_own_k[1024], g_e_dx_own_n;
 
 /* Negative controls (never set in a real build): "off" lowers no intrinsic (the
    as-built baseline of a diff); "noident" drops the identity
@@ -6276,6 +6997,7 @@ int e_analyze(const Q2Func *fn, EFacts *facts, ETypes *types) {
   e_facts_poly_on = !g_e_fl && getenv("QJS_AOT_NOPOLY") == NULL;
   e_facts_pure_ok = !g_e_fl && !g_e_inl && getenv("QJS_AOT_NOPURE") == NULL;
   e_facts_pure_call = e_pure_call_site;
+  e_facts_pure_ctor = (g_e_fl || g_e_inl) && getenv("QJS_AOT_NOPURECTOR") == NULL ? e_pure_ctor_site : NULL;
   for (rounds = 0; rounds < 8; rounds++) {
     int changed = 0;
     g_e_intr_mask = mask;
@@ -6397,12 +7119,12 @@ static int emit_intrinsic_call(
   else
     fprintf(
         f,
-        "      if (__builtin_expect(!q2_is_intr(%s, %d, %d), 0)) goto vx_%d;\n",
+        "      if (__builtin_expect(!q2_is_intr(%s, %d, %d), 0)) E_GOTO(vx, %d);\n",
         cexp, id, magic, in->pc);
   if (is_str)
     fprintf(
         f,
-        "      if (__builtin_expect(!q2_intr_str(ctx, %d, %s, %s, &_o), 0)) goto vx_%d;\n",
+        "      if (__builtin_expect(!q2_intr_str(ctx, %d, %s, %s, &_o), 0)) E_GOTO(vx, %d);\n",
         id, rexp, a0, in->pc);
   else if (na == 3 && (id == QJS_AOT_INTR_MIN || id == QJS_AOT_INTR_MAX)) {
     /* min(a, b, c) is min(min(a, b), c), NaN and the sign of zero included. */
@@ -6411,12 +7133,12 @@ static int emit_intrinsic_call(
     fprintf(
         f,
         "      if (__builtin_expect(!q2_intr(%d, %s, %s, &_o) ||\n"
-        "          !q2_intr(%d, q2_numv(_o), %s, &_o), 0)) goto vx_%d;\n",
+        "          !q2_intr(%d, q2_numv(_o), %s, &_o), 0)) E_GOTO(vx, %d);\n",
         id, a0, a1, id, a2, in->pc);
   } else
     fprintf(
         f,
-        "      if (__builtin_expect(!q2_intr(%d, %s, %s, &_o), 0)) goto vx_%d;\n",
+        "      if (__builtin_expect(!q2_intr(%d, %s, %s, &_o), 0)) E_GOTO(vx, %d);\n",
         id, a0, a1, in->pc);
   if (t->lb[dv] == E_LB_BOT) {
     fprintf(f, "        AOT_SET_B(ctx, fr, %d, _o);\n", off);
@@ -6443,27 +7165,41 @@ static int emit_intrinsic_call(
    - from here on the body has an effect, so its exits build the callee's frame
      (aot_nx_) and finish in the generic body (g_e_inl_dirty). */
 /* Slot `idx` of the published window array, from register `wr`'s current value. */
+/* The index text of window slot `idx` at the current site. */
+static const char *e_wslot(int idx) {
+  static char b[4][24];
+  static int i;
+  i = (i + 1) & 3;
+  if (g_e_compact) snprintf(b[i], sizeof(b[i]), "%d", g_e_site_k + idx);
+  else snprintf(b[i], sizeof(b[i]), "SB_ + %d", idx);
+  return b[i];
+}
+/* QJS_AOT_NOCTORDIRECT=1: a construct in the stack-map form keeps storing its arguments to the window first. */
+static int e_ctor_direct(void) { return e_scan() && getenv("QJS_AOT_NOCTORDIRECT") == NULL; }
+/* The construct's arguments as a local array the fast arm reads (it stays in registers once q2_new_fz_try is inlined); the window is written
+   only by the slow arm. Fills `av` with the argument pointer text and `wst` with the window stores (empty when the window is stored up front). */
+static void e_ctor_av(FILE *f, const Q2Func *fn, const ETypes *t, const Q2ValueId *cur, const Q2Insn *in, int na, int fx, char *av, size_t avn, char *wst, size_t wstn);
 static void e_emit_fl_window_store(
     FILE *f, const Q2Func *fn, const ETypes *t, const Q2ValueId *cur, int wr, int idx) {
   Q2ValueId v;
   if (wr >= fn->nregs || (v = cur[wr]) == Q2_NO_VALUE || v == E_UNDEF) {
-    fprintf(f, "    ra_[SB_ + %d] = JS_UNDEFINED;\n", idx);
+    fprintf(f, "    ra_[%s] = JS_UNDEFINED;\n", e_wslot(idx));
     return;
   }
   if (v == E_INFRAME || v >= (Q2ValueId)t->nvalues) {
-    fprintf(f, "    ra_[SB_ + %d] = AOT_REG(fr, %d);\n", idx, wr * 16);
+    fprintf(f, "    ra_[%s] = AOT_REG(fr, %d);\n", e_wslot(idx), wr * 16);
     return;
   }
   if (t->lb[v] == E_LB_TAG)
-    fprintf(f, "    ra_[SB_ + %d] = v%u;\n", idx, (unsigned)v);
+    fprintf(f, "    ra_[%s] = v%u;\n", e_wslot(idx), (unsigned)v);
   else if (t->lb[v] == E_LB_I32)
-    fprintf(f, "    ra_[SB_ + %d] = JS_MKVAL(JS_TAG_INT, i%u);\n", idx, (unsigned)v);
+    fprintf(f, "    ra_[%s] = JS_MKVAL(JS_TAG_INT, i%u);\n", e_wslot(idx), (unsigned)v);
   else if (t->lb[v] == E_LB_F64)
-    fprintf(f, "    ra_[SB_ + %d] = E_BOX_F64(d%u);\n", idx, (unsigned)v);
+    fprintf(f, "    ra_[%s] = E_BOX_F64(d%u);\n", e_wslot(idx), (unsigned)v);
   else if (t->lb[v] == E_LB_BOOL)
-    fprintf(f, "    ra_[SB_ + %d] = JS_MKVAL(JS_TAG_BOOL, b%u);\n", idx, (unsigned)v);
+    fprintf(f, "    ra_[%s] = JS_MKVAL(JS_TAG_BOOL, b%u);\n", e_wslot(idx), (unsigned)v);
   else
-    fprintf(f, "    ra_[SB_ + %d] = AOT_REG(fr, %d);\n", idx, wr * 16);
+    fprintf(f, "    ra_[%s] = AOT_REG(fr, %d);\n", e_wslot(idx), wr * 16);
 }
 
 /* The boxed value of window register `wr` as a C expression (the form e_emit_fl_window_store stores). */
@@ -6482,6 +7218,26 @@ static void e_fl_window_expr(char *out, size_t n, const Q2Func *fn, const ETypes
   else if (t->lb[v] == E_LB_F64) snprintf(out, n, "E_BOX_F64(d%u)", (unsigned)v);
   else if (t->lb[v] == E_LB_BOOL) snprintf(out, n, "JS_MKVAL(JS_TAG_BOOL, b%u)", (unsigned)v);
   else snprintf(out, n, "AOT_REG(fr, %d)", wr * 16);
+}
+
+static void e_ctor_av(FILE *f, const Q2Func *fn, const ETypes *t, const Q2ValueId *cur, const Q2Insn *in, int na, int fx, char *av, size_t avn, char *wst, size_t wstn) {
+  int r;
+  size_t w = 0;
+  char ex[96];
+  av[0] = 0;
+  wst[0] = 0;
+  if (!e_ctor_direct()) {
+    snprintf(av, avn, "&ra_[SB_]");
+    return;
+  }
+  fprintf(f, "        JSValue av_%d_%d[%d] = {", in->pc, fx, na < 1 ? 1 : na);
+  for (r = 0; r < na; r++) {
+    e_fl_window_expr(ex, sizeof(ex), fn, t, cur, in->win_reg + r);
+    fprintf(f, "%s%s", r ? ", " : " ", ex);
+    w += (size_t)snprintf(wst + w, wstn - w, "                ra_[%s] = %s;\n", e_wslot(r), ex);
+  }
+  fprintf(f, " %s};\n", na < 1 ? "JS_UNDEFINED " : "");
+  snprintf(av, avn, "av_%d_%d", in->pc, fx);
 }
 
 /* The owned result of a nested call, put where the rest of the body reads it. */
@@ -6626,7 +7382,7 @@ static int emit_array_op(
   fprintf(
       f,
       "    { JSValue _o; int _r = 1; (void)_r;\n"
-      "      if (__builtin_expect(Q2_FORCE_MISS || !q2_array_%s(ctx, %s, %s%s, &_o), 0)) goto vx_%d;\n",
+      "      if (__builtin_expect(Q2_FORCE_MISS || !q2_array_%s(ctx, %s, %s%s, &_o), 0)) E_GOTO(vx, %d);\n",
       which == 1 ? "push1" : "pop0", cexp, rexp, ae, in->pc);
   /* the array has changed: from here an inline body's exits finish the call in the generic body */
   e_inl_store_mark(f);
@@ -6636,7 +7392,7 @@ static int emit_array_op(
           f,
           "      if (JS_VALUE_HAS_REF_COUNT(_o)) { JSValue _sc = JS_UNDEFINED; qjs_aot_set_reg_p(ctx, &_sc, 0, _o); }\n");
   } else if (which == 2) {
-    e_emit_nested_result(f, fn, in, t, dv, dreg, 0, resslot, "      ");
+    e_emit_nested_result(f, fn, in, t, dv, dreg, 0, g_e_compact && resslot >= 0 ? 0 : resslot, "      ");
   } else if (tagres) {
     /* the new length: an int, nothing to own */
     fprintf(f, "      v%u = _o;\n      AOT_SET_B(ctx, fr, %d, _o);\n", (unsigned)dv, off);
@@ -6669,9 +7425,10 @@ static int emit_inl_nested_call(
   int allleaf, cmc = -1;
   Q2ValueId cvv = Q2_NO_VALUE;
   const int pub = !g_e_inl || g_e_inl_r;
-  char nrx[32], nrxe[64], rax[48], rrx[48];
+  char nrx[32], nrxe[64], rax[64], rrx[48], rrset[96] = "";
+  int site_e = 0;
   int tlay = g_e_facts != NULL ? g_e_facts->thislay[e_insn_idx(fn, in)] : 0;
-  const char *popr = g_e_inl ? "        if (rr_) rr_->ifunc = NULL; else E_FL_TOP(ctx_in) = ir_.prev;\n" : "";
+  const char *popr = g_e_inl ? "        if (rr_) rr_->ifunc = NULL; else E_FL_POP(ctx_in, ir_);\n" : "";
 
   if (t == NULL || cur == NULL) return 0;
   th = call_this_off(in);
@@ -6705,7 +7462,7 @@ static int emit_inl_nested_call(
   if (g_e_inl_r)
     snprintf(nrx, sizeof(nrx), "%s", getenv("QJS_AOT_NOWINROOT") != NULL ? "0" : "SB_ + 0");
   if (g_e_inl_r && getenv("QJS_AOT_NOWINROOT") == NULL) snprintf(nrx, sizeof(nrx), "SB_ + %d", na);
-  if (g_e_inl_r )
+  if (g_e_inl_r && !e_scan())
     snprintf(nrxe, sizeof(nrxe), "ra_x_ ? 0 : (%s)", nrx);
   else
     snprintf(nrxe, sizeof(nrxe), "0");
@@ -6763,9 +7520,10 @@ static int emit_inl_nested_call(
     if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME ||
         v >= (Q2ValueId)t->nvalues || t->lb[v] != E_LB_TAG)
       continue;
-    if (g_e_rooted != NULL && g_e_rooted[v]) continue;
+    if ((g_e_rooted != NULL && g_e_rooted[v]) || e_kimmortal((unsigned)v)) continue;
     if (!pub) {
       if (r * 16 == cc || (th >= 0 && r * 16 == th)) continue;
+      if (e_scan() && getenv("QJS_AOT_SCAN_LIVE") != NULL) continue;
       free(lb);
       e_fl_block("a value live across a call is not rooted", in);
       return 0;
@@ -6801,6 +7559,22 @@ static int emit_inl_nested_call(
   }
 
   /* ---- output ---- */
+  if (pub) {
+    int srz = 0;
+    site_e = nsp + (in->win_n < 1 ? 1 : in->win_n);
+    for (k = 0; k < n && k < 4; k++)
+      if (NC_OK(k) && qjs_aot_inline_has(callee[k]) && qjs_aot_inline_rz(callee[k]) > srz) srz = qjs_aot_inline_rz(callee[k]);
+    e_rt_note(site_e + srz);
+    if (g_e_compact) {
+      g_e_site_k = nsp;
+      snprintf(winp, sizeof(winp), "&ra_[%d]", nsp);
+      snprintf(rax, sizeof(rax), g_e_inl ? "(ra_x_ ? ra_ + %d : NULL)" : "ra_ + %d", site_e);
+      snprintf(nrxe, sizeof(nrxe), "ra_x_ ? 0 : %d", site_e);
+      if (e_scan()) snprintf(nrxe, sizeof(nrxe), "0");
+      snprintf(rrset, sizeof(rrset), " E_RNG(rr_, (int)(ra_ - rr_->roots) + %d);", site_e);
+      if (resslot >= 0) resslot = nsp;
+    }
+  }
   if (g_e_inl) g_e_inl_safepoint = 1;
   e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
   e_note_tag('v', in->pc, cexp);
@@ -6815,6 +7589,7 @@ static int emit_inl_nested_call(
       return 0;
     }
     g_e_dx_own_pc[g_e_dx_own_n] = in->next;
+    g_e_dx_own_k[g_e_dx_own_n] = nsp;
     g_e_dx_own_off[g_e_dx_own_n++] = off;
   }
   /* the window, current in the body's own register array; a frameless body that is
@@ -6857,14 +7632,16 @@ static int emit_inl_nested_call(
   if (pub) {
     /* QJS_AOT_NOWINROOT=1 leaves the window unpublished: the negative control. */
     size_t sl = 0;
-    for (k = 0; k < nsp ; k++)
-      sl += (size_t)snprintf(
-          spl + sl, sizeof(spl) - sl, "    ra_[%d] = v%u;\n", e_spill_slot(spv[k]),
-          (unsigned)spv[k]);
     if (!g_e_inl) {
       g_e_fl_calls = 1;
-      snprintf(
-          spl + sl, sizeof(spl) - sl, "    E_RLINK(rec_);\n    rec_->pc = %d;\n", in->next - 1);
+      e_pub_text(spl, sizeof(spl), spv, nsp, in->win_n, in->next - 1, t->lb[dv] == E_LB_TAG && !dead, "    ");
+    } else {
+      for (k = 0; k < nsp && !e_scan(); k++)
+        sl += (size_t)snprintf(
+            spl + sl, sizeof(spl) - sl, "    ra_[%d] = v%u;\n", g_e_compact ? k : e_spill_slot(spv[k]),
+            (unsigned)spv[k]);
+      if (g_e_compact && in->win_n < 1 && !e_scan())
+        snprintf(spl + sl, sizeof(spl) - sl, "    ra_[%d] = JS_UNDEFINED;\n", nsp);
     }
     if (!allleaf) fputs(spl, f);
   }
@@ -6882,9 +7659,11 @@ static int emit_inl_nested_call(
       char x_[64];
       snprintf(x_, sizeof(x_), "%s", recv);
       snprintf(cexp, sizeof(cexp), "%s", x_);
-      if (pub) snprintf(recv, sizeof(recv), "ra_[SB_]");
+      if (pub && g_e_compact) snprintf(recv, sizeof(recv), "ra_[%d]", nsp);
+      else if (pub) snprintf(recv, sizeof(recv), "ra_[SB_]");
       else snprintf(recv, sizeof(recv), "AOT_REG(fr, %d)", w);
-      if (pub) snprintf(winp, sizeof(winp), "&ra_[SB_ + 1]");
+      if (pub && g_e_compact) snprintf(winp, sizeof(winp), "&ra_[%d]", nsp + 1);
+      else if (pub) snprintf(winp, sizeof(winp), "&ra_[SB_ + 1]");
       else snprintf(winp, sizeof(winp), "&AOT_REG(fr, %d)", w + 16);
       na = na0 - 1;
     }
@@ -6908,26 +7687,26 @@ static int emit_inl_nested_call(
             "mce%d == (const void *)aot_f_%s",
             cmc, callee[k]);
     } else if (thru) {
-      snprintf(idt, sizeof(idt), "q2_is_fn_call(%s) && %s%s, (const void *)aot_f_%s, %du)", cexp0, e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in));
+      snprintf(idt, sizeof(idt), "q2_is_fn_call(%s) && %s%s, (const void *)aot_f_%s, %du)", cexp0, e_cc_fnv(fn, in, cexp, callee[k]), cexp, callee[k], e_cc_ixv(fn, in, cexp, callee[k]));
     } else if (cmc >= 0)
       snprintf(idt, sizeof(idt), "mce%d == (const void *)aot_f_%s", cmc, callee[k]);
     else if (cvv != Q2_NO_VALUE && cvv != E_UNDEF && cvv != E_INFRAME && (unsigned)cvv < E_MC_VALS && g_e_pe_flag[cvv])
       snprintf(idt, sizeof(idt), "pe%u == (const void *)aot_f_%s", (unsigned)cvv, callee[k]);
     else
       snprintf(
-          idt, sizeof(idt), "%s%s, (const void *)aot_f_%s, %du)", e_cc_fn(fn, in), cexp,
-          callee[k], e_cc_ix(fn, in));
+          idt, sizeof(idt), "%s%s, (const void *)aot_f_%s, %du)", e_cc_fnv(fn, in, cexp, callee[k]), cexp,
+          callee[k], e_cc_ixv(fn, in, cexp, callee[k]));
     /* An inlined body has no frame; its record puts it in the backtrace. */
     if (g_e_inl)
       snprintf(
           pushr, sizeof(pushr),
           "        JSAotFlRec ir_;\n"
-          "        if (rr_) { rr_->ifunc = co; rr_->ipc = %d; }\n"
+          "        if (rr_) { rr_->ifunc = co; rr_->ipc = %d;%s }\n"
           "        else {\n"
-          "            ir_ = (JSAotFlRec){ E_FL_TOP(ctx_in), co, %d, %s, %s };\n"
-          "            E_FL_TOP(ctx_in) = &ir_;\n"
+          "            ir_ = (JSAotFlRec){ E_FL_PREV(ctx_in), co, %d, %s, %s };\n"
+          "            E_FL_PUSH(ctx_in, ir_);\n"
           "        }\n",
-          in->next - 1, in->next - 1, nrxe, (g_e_inl_r ) ? "ra_x_ ? NULL : ra_" : "NULL");
+          in->next - 1, rrset, in->next - 1, nrxe, (g_e_inl_r ) ? "ra_x_ ? NULL : ra_" : "NULL");
     else
       pushr[0] = 0;
     if (qjs_aot_inline_has(callee[k]) && qjs_aot_inline_rz(callee[k]) > g_e_child_max)
@@ -6962,7 +7741,7 @@ static int emit_inl_nested_call(
           "            if (__builtin_expect(_r != 2 && JS_IsException(_o), 0)) %s\n",
           idt, callee[k], callee[k], g_e_nolazy ? "_n" : "", cexp, recv, winp, na, rax,
           tlay != 0 && qjs_aot_inline_thislay(callee[k]) == tlay, rrx, excret);
-      e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "            ");
+      e_emit_nested_result(f, fn, in, t, dv, dreg, dead, g_e_compact && resslot >= 0 ? 0 : resslot, "            ");
       fprintf(f, "            goto cd_%d;\n        }\n#endif\n", in->pc);
       fprintf(
           f,
@@ -7045,12 +7824,12 @@ static int emit_inl_nested_call(
       snprintf(
           pushg, sizeof(pushg),
           "        JSAotFlRec ir_;\n"
-          "        if (rr_) { rr_->ifunc = co; rr_->ipc = %d; }\n"
+          "        if (rr_) { rr_->ifunc = co; rr_->ipc = %d;%s }\n"
           "        else {\n"
-          "            ir_ = (JSAotFlRec){ E_FL_TOP(ctx_in), co, %d, %s, %s };\n"
-          "            E_FL_TOP(ctx_in) = &ir_;\n"
+          "            ir_ = (JSAotFlRec){ E_FL_PREV(ctx_in), co, %d, %s, %s };\n"
+          "            E_FL_PUSH(ctx_in, ir_);\n"
           "        }\n",
-          in->next - 1, in->next - 1, nrxe, (g_e_inl_r ) ? "ra_x_ ? NULL : ra_" : "NULL");
+          in->next - 1, rrset, in->next - 1, nrxe, (g_e_inl_r ) ? "ra_x_ ? NULL : ra_" : "NULL");
       fprintf(
           f,
           "    if (JS_IsFunction(ctx, %s)) {\n"
@@ -7066,7 +7845,7 @@ static int emit_inl_nested_call(
     }
   }
   /* The call has not run: leave before it. */
-  fprintf(f, "    goto vx_%d;\n    cd_%d: ;\n", in->pc, in->pc);
+  fprintf(f, "    E_GOTO(vx, %d);\n    cd_%d: ;\n", in->pc, in->pc);
   g_e_inl_dirty = 1;
   cur[dreg] = dv;
   g_e_miss_exit_seen = 0;
@@ -7304,6 +8083,26 @@ static void e_ctor_alloc_text(char *buf, size_t n, const char *callee, const cha
   }
 }
 
+static int e_ctorspill_hex_ok(const char *hex) {
+  char pfx[5];
+  const char *e = getenv("QJS_AOT_CTORSPILL_HEX");
+  if (e == NULL) return 1;
+  memcpy(pfx, hex, 4);
+  pfx[4] = 0;
+  return strstr(e, pfx) != NULL;
+}
+
+/* The per-edge cost of inlining a callee that allocates with values live across the allocation: the copy spills them to the root
+   window and publishes a record on its miss arm, and a callee that was already a cheap frameless call gains nothing from that unless
+   a fact of the merged body pays for it. Measured on earleyboyer (eb-det, 9 candidate callees): rewrite_args alone is neutral (113.2G
+   instructions vs 111.8G, same cycles), the other eight cost +3G. Until a gain is found by the cross-body passes the edge is not
+   taken: QJS_AOT_CTORSPILL=1 admits every callee (QJS_AOT_CTORSPILL_HEX=<prefixes> a list), QJS_AOT_NOCTORSPILL=1 none. */
+static int e_ctorspill_edge_ok(const Q2Func *fn) {
+  (void)fn;
+  if (getenv("QJS_AOT_NOCTORSPILL") != NULL) return 0;
+  return getenv("QJS_AOT_CTORSPILL") != NULL;
+}
+
 static int emit_inl_construct(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     char hex[33]) {
@@ -7312,8 +8111,15 @@ static int emit_inl_construct(
   int kind[4], n = 0, k, r, nb = 0, cc, nt, off, na, w, dreg;
   Q2ValueId dv, cv, nv;
   char cexp[64], ntexp[64], ctext[1024], atext[512];
+  Q2ValueId ctor_spv[E_SPILL_MAX + 1];
+  int ctor_nsp = 0;
+  char ctor_spl[1200], ctor_push[600];
+  static const char ctor_pop[] = "if (rr_) rr_->ifunc = NULL; else E_FL_POP(ctx_in, ir_); ";
+  static const char ctor_pop2[] = "if (rr_) rr_->ifunc = NULL; else E_FL_POP(ctx_in, ir_);\n            ";
 
   (void)hex;
+  ctor_spl[0] = 0;
+  ctor_push[0] = 0;
   if (t == NULL || cur == NULL) return 0;
   if (in->rop != ROP_construct || in->ndef < 1 || in->narg < 5) return 0;
   if (e_roles[in->rop] == NULL || e_roles[in->rop]->control != E_CF_NONE) return 0;
@@ -7368,8 +8174,22 @@ static int emit_inl_construct(
       if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME ||
           v >= (Q2ValueId)t->nvalues || t->lb[v] != E_LB_TAG)
         continue;
-      if (g_e_rooted != NULL && g_e_rooted[v]) continue;
+      if ((g_e_rooted != NULL && g_e_rooted[v]) || e_kimmortal((unsigned)v)) continue;
       if (r * 16 == cc || r * 16 == nt) continue;
+      if (g_e_inl_r && e_ctorspill_edge_ok(fn) &&
+          (getenv("QJS_AOT_CTORSPILL_HEX") == NULL || e_ctorspill_hex_ok(hex))) {
+        int dup_ = 0, q_;
+        for (q_ = 0; q_ < ctor_nsp; q_++) if (ctor_spv[q_] == v) dup_ = 1;
+        if (dup_) continue;
+        if (ctor_nsp >= E_SPILL_MAX || e_spill_slot(v) < 0) {
+          free(lb);
+          e_fl_block("too many values live across a construct", in);
+          return 0;
+        }
+        ctor_spv[ctor_nsp++] = v;
+        continue;
+      }
+      if (e_scan() && getenv("QJS_AOT_SCAN_LIVE") != NULL) continue;
       free(lb);
       e_fl_block("a value live across a construct is not rooted", in);
       return 0;
@@ -7392,6 +8212,115 @@ static int emit_inl_construct(
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, E_BOX_F64(d%u));\n", wr * 16, (unsigned)v);
     else if (t->lb[v] == E_LB_BOOL)
       fprintf(f, "    AOT_SET_B(ctx, fr, %d, JS_MKVAL(JS_TAG_BOOL, b%u));\n", wr * 16, (unsigned)v);
+    else if (t->lb[v] == E_LB_TAG && getenv("QJS_AOT_NOCTORSYNC") == NULL)
+      fprintf(f, "    AOT_SET_B(ctx, fr, %d, v%u);\n", wr * 16, (unsigned)v);
+  }
+  if (ctor_nsp > 0) {
+    size_t sl_ = 0;
+    int q_;
+    e_rt_note(ctor_nsp);
+    for (q_ = 0; q_ < ctor_nsp && !e_scan(); q_++)
+      sl_ += (size_t)snprintf(ctor_spl + sl_, sizeof(ctor_spl) - sl_, "        ra_[%d] = v%u;\n",
+                              g_e_compact ? q_ : e_spill_slot(ctor_spv[q_]), (unsigned)ctor_spv[q_]);
+    {
+      char rs_[96] = "", ne_[24];
+      if (e_scan()) {
+        snprintf(ne_, sizeof(ne_), "0");
+      } else if (g_e_compact) {
+        snprintf(rs_, sizeof(rs_), " E_RNG(rr_, (int)(ra_ - rr_->roots) + %d);", ctor_nsp);
+        snprintf(ne_, sizeof(ne_), "%d", ctor_nsp);
+      } else
+        snprintf(ne_, sizeof(ne_), "SB_");
+      snprintf(ctor_push, sizeof(ctor_push), "%s"
+             "        JSAotFlRec ir_;\n"
+             "        if (rr_) { rr_->ifunc = co; rr_->ipc = %d;%s }\n"
+             "        else {\n"
+             "            ir_ = (JSAotFlRec){ E_FL_PREV(ctx_in), co, %d, ra_x_ ? 0 : %s, ra_x_ ? NULL : ra_ };\n"
+             "            E_FL_PUSH(ctx_in, ir_);\n"
+             "        }\n", ctor_spl, in->next - 1, rs_, in->next - 1, ne_);
+    }
+    g_e_inl_safepoint = 1;
+  }
+  /* A field-fill constructor is made by q2_new_fused (block from the cache, finished shape, fields stored from the window), as in
+     a frameless body, instead of the generic construct protocol. The window is published through the body's root window. */
+  if (g_e_inl_r && nb == 1 && n == 1 && na <= 8 && getenv("QJS_AOT_NOINLFUSED") == NULL) {
+    char fcal[33];
+    int nf_, ao_[8], ai_[8], q_, fx_;
+    char fmt_[400];
+    int ln_ = 0, okw = 1;
+    for (r = 0; r < na; r++) {
+      Q2ValueId v = in->win_reg + r < fn->nregs ? cur[in->win_reg + r] : Q2_NO_VALUE;
+      if (v == Q2_NO_VALUE || v == E_INFRAME) okw = 0;
+    }
+    if (okw && e_fused_info(fn, in, fcal, &nf_, ao_, ai_) && strcmp(fcal, callee[0]) == 0 &&
+        qjs_aot_unit_has(fcal)) {
+      static int fim_n;
+      fx_ = fim_n++;
+      ln_ += snprintf(fmt_ + ln_, sizeof(fmt_) - ln_, "%d", nf_);
+      for (q_ = 0; q_ < nf_; q_++) ln_ += snprintf(fmt_ + ln_, sizeof(fmt_) - ln_, ", %d, %d", ao_[q_], ai_[q_]);
+      e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
+      fprintf(f, "    static const uint32_t fm_%d_%d[] = { %s };\n", in->pc, fx_, fmt_);
+      fprintf(f, "    static Q2Fz fz_%d_%d;\n", in->pc, fx_);
+      g_e_site_k = ctor_nsp;
+      e_rt_note(ctor_nsp + (na < 1 ? 1 : na));
+      if (g_e_compact && na < 1) fprintf(f, "    ra_[%d] = JS_UNDEFINED;\n", ctor_nsp);
+      if (!e_ctor_direct())
+        for (r = 0; r < na; r++) e_emit_fl_window_store(f, fn, t, cur, in->win_reg + r, r);
+      e_sweep_guard(f, "vx", in->pc);
+      fprintf(f, "#ifdef Q2_NATIVE_%s\n", fcal);
+      fprintf(f,
+              "    if (__builtin_expect(q2_call_entry(%s, (const void *)aot_f_%s), 1) &&\n"
+              "        JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT &&\n"
+              "        JS_VALUE_GET_PTR(%s) == JS_VALUE_GET_PTR(%s)) {\n"
+              "        JSValue _o;\n",
+              cexp, fcal, ntexp, ntexp, cexp);
+      /* The fast arm allocates from the block cache and stores the fields: it runs no JS and cannot collect, so it is not a
+         safepoint. Only the slow arm (cache empty, limit near, shape not learned) spills the live values and publishes the
+         record. */
+      char rrc_[96];
+      snprintf(rrc_, sizeof(rrc_), " E_RNG(rr_, (int)(ra_ - rr_->roots) + %d);", ctor_nsp + (na < 1 ? 1 : na));
+      char avp_[48], wst_[1400];
+      if (e_ctor_direct()) e_ctor_av(f, fn, t, cur, in, na, fx_, avp_, sizeof(avp_), wst_, sizeof(wst_));
+      else {
+        if (g_e_compact) snprintf(avp_, sizeof(avp_), "&ra_[%d]", ctor_nsp);
+        else snprintf(avp_, sizeof(avp_), "&ra_[SB_]");
+        wst_[0] = 0;
+      }
+      fprintf(f,
+              e_wk("        _o = q2_new_fz_try(ctx, &fz_%d_%d, (JSObject *)JS_VALUE_GET_PTR(%s), %s, %d, fm_%d_%d, 0u);\n"
+              "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) == JS_TAG_UNINITIALIZED, 0)) {\n"
+              "%s%s"
+              "            JSAotFlRec ir_;\n"
+              "            if (rr_) { rr_->ifunc = co; rr_->ipc = %d;%s }\n"
+              "            else {\n"
+              "                ir_ = (JSAotFlRec){ E_FL_PREV(ctx_in), co, %d, ra_x_ ? 0 : (%s%d), ra_x_ ? NULL : ra_ };\n"
+              "                E_FL_PUSH(ctx_in, ir_);\n"
+              "            }\n"
+              "            _o = qjs_aot_new_fused(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &ra_[SB_], %d, fm_%d_%d, 0u);\n"
+              "            if (JS_VALUE_GET_TAG(_o) == JS_TAG_UNINITIALIZED) {\n"
+              "                JSValue _tt;\n"
+              "                if (qjs_aot_construct_this_cap(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_tt, 0) <= 0) {\n"
+              "                    %s E_GOTO(vx, %d);\n"
+              "                }\n"
+              "                _o = aot_n_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), _tt, &ra_[SB_], %d);\n"
+              "                if (__builtin_expect(JS_IsException(_o), 0)) { JS_FreeValue(ctx, _tt); %s*out = _o; return 1; }\n"
+              "                if (JS_VALUE_GET_TAG(_o) == JS_TAG_OBJECT) JS_FreeValue(ctx, _tt);\n"
+              "                else { if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o); _o = _tt; qjs_aot_fused_learn(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), _o, fm_%d_%d); }\n"
+              "            }\n"
+              "            %s"
+              "        }\n"
+              "        if (__builtin_expect(JS_IsException(_o), 0)) { *out = _o; return 1; }\n"
+              "        qjs_aot_set_reg_p(ctx, fr, %d, _o);\n", ctor_nsp),
+              in->pc, fx_, cexp, avp_, na, in->pc, fx_, wst_, ctor_nsp ? ctor_spl : "", in->next - 1,
+              g_e_compact ? rrc_ : "", in->next - 1, e_scan() ? "0 * " : g_e_compact ? "" : "SB_ + ", g_e_compact ? ctor_nsp + (na < 1 ? 1 : na) : na, cexp, na, in->pc, fx_, cexp, ctor_pop, in->pc, fcal, cexp, na,
+              ctor_pop, cexp, in->pc, fx_, ctor_pop, off);
+      if (t->lb[dv] == E_LB_TAG) fprintf(f, "        v%u = _o;\n", (unsigned)dv);
+      fprintf(f, "        goto cd_%d;\n    }\n#endif\n    E_GOTO(vx, %d);\n    cd_%d: ;\n", in->pc, in->pc, in->pc);
+      e_inl_store_mark(f);
+      g_e_miss_exit_seen = 1;
+      cur[dreg] = dv;
+      return 1;
+    }
   }
   for (k = 0; k < n && k < 4; k++) {
     if (kind[k] != 1 || !qjs_aot_unit_has(callee[k])) continue;
@@ -7409,11 +8338,14 @@ static int emit_inl_construct(
         "        JS_VALUE_GET_PTR(%s) == JS_VALUE_GET_PTR(%s)) {\n"
         "        JSValue _t, _o, _r;\n"
         "        int _nw = 0;\n"
+        "%s"
         "        int _rc = %s;\n"
-        "        if (__builtin_expect(_rc < 0, 0)) { *out = JS_EXCEPTION; return 1; }\n"
+        "        if (__builtin_expect(_rc < 0, 0)) { %s*out = JS_EXCEPTION; return 1; }\n"
+        "        if (_rc == 0) { %s}\n"
         "        if (_rc > 0) {\n"
         "            if (_nw) _o = JS_UNDEFINED;\n"
         "            else %s"
+        "            %s"
         "            if (__builtin_expect(JS_IsException(_o), 0)) {\n"
         "                JS_FreeValue(ctx, _t);\n"
         "                *out = _o; return 1;\n"
@@ -7430,14 +8362,14 @@ static int emit_inl_construct(
         "            /* The object goes into the frame slot, which AOT_SET_B below\n"
         "               writes with a duplicate: the construct path's own reference\n"
         "               is released here, or the object is never freed. */\n"
-        "            if (JS_VALUE_HAS_REF_COUNT(_r)) JS_FreeValue(ctx, _r);\n",
-        cexp, callee[k], ntexp, ntexp, cexp, atext, ctext, cexp);
+        "            qjs_aot_set_reg_p(ctx, fr, %d, _r);\n",
+        cexp, callee[k], ntexp, ntexp, cexp, ctor_push, atext, ctor_nsp ? ctor_pop : "", ctor_nsp ? ctor_pop : "", ctext, ctor_nsp ? ctor_pop2 : "", cexp, off);
     if (t->lb[dv] == E_LB_TAG) fprintf(f, "            v%u = _r;\n", (unsigned)dv);
     /* Neither guard held, or the object could not be made: the construct has not
        happened, so the whole copied body leaves for the call it was copied from,
        which does it. Falling through here would run the next instruction of the
        callee with the construct's result undefined. */
-    fprintf(f, "            goto cd_%d;\n        }\n    }\n    goto vx_%d;\n#endif\n",
+    fprintf(f, "            goto cd_%d;\n        }\n    }\n    E_GOTO(vx, %d);\n#endif\n",
             in->pc, in->pc);
   }
   /* No candidate was emitted (none in the unit, or its native entry macro is not defined in this translation unit): the construct has not
@@ -7445,7 +8377,7 @@ static int emit_inl_construct(
      still undefined (QJS_AOT_KO_CTORMISS=1 restores that). */
   if (getenv("QJS_AOT_KO_CTORMISS") == NULL) {
     e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
-    fprintf(f, "    goto vx_%d;\n", in->pc);
+    fprintf(f, "    E_GOTO(vx, %d);\n", in->pc);
   }
   fprintf(f, "    cd_%d: ;\n", in->pc);
   e_inl_store_mark(f);
@@ -7530,7 +8462,7 @@ static int emit_fl_construct(
     if (!((lb[r / 64] >> (r % 64)) & 1)) continue;
     v = cur[r];
     if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME || v >= (Q2ValueId)t->nvalues || t->lb[v] != E_LB_TAG) continue;
-    if (g_e_rooted != NULL && g_e_rooted[v]) continue;
+    if ((g_e_rooted != NULL && g_e_rooted[v]) || e_kimmortal((unsigned)v)) continue;
     if (e_spill_slot(v) < 0) {
       free(lb);
       e_fl_block("too many values live across a call", in);
@@ -7548,33 +8480,61 @@ static int emit_fl_construct(
   e_note_tag('v', in->pc, cexp);
   g_e_fl_calls = 1;
   fprintf(f, "    static const uint32_t fm_%d_%d[] = { %s };\n", in->pc, fx, fmt_);
-  for (r = 0; r < na; r++) e_emit_fl_window_store(f, fn, t, cur, in->win_reg + r, r);
+  fprintf(f, "    static Q2Fz fz_%d_%d;\n", in->pc, fx);
+  g_e_site_k = nsp;
+  if (g_e_compact && resslot >= 0) resslot = nsp;
+  if (!e_ctor_direct())
+    for (r = 0; r < na; r++) e_emit_fl_window_store(f, fn, t, cur, in->win_reg + r, r);
   e_sweep_guard(f, "vx", in->pc);
   fprintf(f, "#ifdef Q2_NATIVE_%s\n", callee);
   fprintf(f, "    if (__builtin_expect(%s%s, (const void *)aot_f_%s, %du) &&\n"
              "        JS_VALUE_GET_PTR(%s) == JS_VALUE_GET_PTR(%s), 1)) {\n"
              "        JSValue _o; int _r = 1;\n",
-          e_cc_fn(fn, in), cexp, callee, e_cc_ix(fn, in), ntexp, cexp);
-  for (q_ = 0; q_ < nsp ; q_++) fprintf(f, "        ra_[%d] = v%u;\n", e_spill_slot(spv[q_]), (unsigned)spv[q_]);
-  fprintf(f,
-          "        E_RLINK(rec_);\n        rec_->pc = %d;\n"
-          "        _o = q2_new_fused(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &ra_[SB_], %d, fm_%d_%d, 0u);\n"
+          e_cc_fnv(fn, in, cexp, callee), cexp, callee, e_cc_ixv(fn, in, cexp, callee), ntexp, cexp);
+  {
+    char pb_[1024];
+    e_pub_text(pb_, sizeof(pb_), spv, nsp, na, in->next - 1, t->lb[dv] == E_LB_TAG && !dead, "        ");
+    fputs(pb_, f);
+  }
+  if (e_ctor_direct()) {
+    char av_[48], wst_[1400];
+    e_ctor_av(f, fn, t, cur, in, na, fx, av_, sizeof(av_), wst_, sizeof(wst_));
+    fprintf(f, "        _o = q2_new_fz_try(ctx, &fz_%d_%d, (JSObject *)JS_VALUE_GET_PTR(%s), %s, %d, fm_%d_%d, 0u);\n"
+               "        if (JS_VALUE_GET_TAG(_o) == JS_TAG_UNINITIALIZED) {\n%s",
+            in->pc, fx, cexp, av_, na, in->pc, fx, wst_);
+    fprintf(f, e_wk("            _o = qjs_aot_new_fused(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &ra_[SB_], %d, fm_%d_%d, 0u);\n        }\n", nsp),
+            cexp, na, in->pc, fx);
+    fprintf(f,
+          e_wk(
           "        if (JS_VALUE_GET_TAG(_o) == JS_TAG_UNINITIALIZED) {\n"
           "            JSValue _tt;\n"
-          "            if (qjs_aot_construct_this_cap(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_tt, 0) <= 0) goto vx_%d;\n"
+          "            if (qjs_aot_construct_this_cap(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_tt, 0) <= 0) E_GOTO(vx, %d);\n"
           "            _o = aot_n_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), _tt, &ra_[SB_], %d);\n"
           "            if (__builtin_expect(JS_IsException(_o), 0)) { JS_FreeValue(ctx, _tt); return _o; }\n"
           "            if (JS_VALUE_GET_TAG(_o) == JS_TAG_OBJECT) { if (_r == 1) JS_FreeValue(ctx, _tt); }\n"
           "            else { if (JS_VALUE_HAS_REF_COUNT(_o) && _r == 1) JS_FreeValue(ctx, _o); _o = _tt; qjs_aot_fused_learn(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), _o, fm_%d_%d); }\n"
           "        }\n"
-          "        if (__builtin_expect(JS_IsException(_o), 0)) return _o;\n",
-          in->next - 1, cexp, na, in->pc, fx, cexp, in->pc, callee, cexp, na, cexp, in->pc, fx);
+          "        if (__builtin_expect(JS_IsException(_o), 0)) return _o;\n", nsp),
+          cexp, in->pc, callee, cexp, na, cexp, in->pc, fx);
+  } else
+  fprintf(f,
+          e_wk("        _o = q2_new_fz(ctx, &fz_%d_%d, (JSObject *)JS_VALUE_GET_PTR(%s), &ra_[SB_], %d, fm_%d_%d, 0u);\n"
+          "        if (JS_VALUE_GET_TAG(_o) == JS_TAG_UNINITIALIZED) {\n"
+          "            JSValue _tt;\n"
+          "            if (qjs_aot_construct_this_cap(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_tt, 0) <= 0) E_GOTO(vx, %d);\n"
+          "            _o = aot_n_%s(ctx, caller_f, (JSObject *)JS_VALUE_GET_PTR(%s), _tt, &ra_[SB_], %d);\n"
+          "            if (__builtin_expect(JS_IsException(_o), 0)) { JS_FreeValue(ctx, _tt); return _o; }\n"
+          "            if (JS_VALUE_GET_TAG(_o) == JS_TAG_OBJECT) { if (_r == 1) JS_FreeValue(ctx, _tt); }\n"
+          "            else { if (JS_VALUE_HAS_REF_COUNT(_o) && _r == 1) JS_FreeValue(ctx, _o); _o = _tt; qjs_aot_fused_learn(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), _o, fm_%d_%d); }\n"
+          "        }\n"
+          "        if (__builtin_expect(JS_IsException(_o), 0)) return _o;\n", nsp),
+          in->pc, fx, cexp, na, in->pc, fx, cexp, in->pc, callee, cexp, na, cexp, in->pc, fx);
   g_e_inl_dirty = 1;
   e_emit_nested_result(f, fn, in, t, dv, dreg, dead, resslot, "        ");
   if (g_e_epoch_skip || g_e_nolazy) e_store_typed_def(f, fn, in, t, dv);
   e_emit_group_recheck(f, fn, in, cur);
   fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
-  fprintf(f, "    goto vx_%d;\n    cd_%d: ;\n", in->pc, in->pc);
+  fprintf(f, "    E_GOTO(vx, %d);\n    cd_%d: ;\n", in->pc, in->pc);
   g_e_inl_dirty = 1;
   cur[dreg] = dv;
   g_e_miss_exit_seen = 0;
@@ -7687,6 +8647,7 @@ static int emit_typed_construct(
         ln_ += snprintf(fmt_ + ln_, sizeof(fmt_) - ln_, "%d", nf_);
         for (q_ = 0; q_ < nf_; q_++) ln_ += snprintf(fmt_ + ln_, sizeof(fmt_) - ln_, ", %d, %d", ao_[q_], ai_[q_]);
         fprintf(f, "    static const uint32_t fm_%d_%d[] = { %s };\n", in->pc, fx, fmt_);
+        fprintf(f, "    static Q2Fz fz_%d_%d;\n", in->pc, fx);
         maskx[0] = 0; clr[0] = 0; adx[0] = 0;
         if (pj >= 0) {
           snprintf(maskx, sizeof(maskx), "own%u ? %uu : 0u", (unsigned)pdv, 1u << pj);
@@ -7694,12 +8655,14 @@ static int emit_typed_construct(
           snprintf(adx, sizeof(adx), "(own%u ? (own%u = 0, (void)JS_FreeValue(ctx, v%u), 0) : 0), ", (unsigned)pdv, (unsigned)pdv, (unsigned)pdv);
           steal_used = 1;
         }
+        char fzarg_[40];
+        snprintf(fzarg_, sizeof(fzarg_), getenv("QJS_AOT_NOINLALLOC") == NULL ? " &fz_%d_%d," : "", in->pc, fx);
         snprintf(
             fused, sizeof(fused),
-            "({ _t = %s(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &AOT_REG(fr, %d), %d, fm_%d_%d, %s);\n"
+            "({ _t = %s(ctx,%s (JSObject *)JS_VALUE_GET_PTR(%s), &AOT_REG(fr, %d), %d, fm_%d_%d, %s);\n"
             "            JS_VALUE_GET_TAG(_t) != JS_TAG_UNINITIALIZED ? (_nw = JS_IsException(_t) ? -1 : (%s1))\n"
             "            : (%sqjs_aot_construct_this(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), &_t)); })",
-            getenv("QJS_AOT_NOINLALLOC") == NULL ? "q2_new_fused" : "qjs_aot_new_fused", cexp, w, na, in->pc, fx, maskx[0] ? maskx : "0u", clr, adx, cexp);
+            getenv("QJS_AOT_NOINLALLOC") == NULL ? "q2_new_fz" : "qjs_aot_new_fused", fzarg_, cexp, w, na, in->pc, fx, maskx[0] ? maskx : "0u", clr, adx, cexp);
         snprintf(atext, sizeof(atext), "%s", fused);
         snprintf(learn, sizeof(learn), " qjs_aot_fused_learn(ctx, (JSObject *)JS_VALUE_GET_PTR(%s), _r, fm_%d_%d);", cexp, in->pc, fx);
       }
@@ -7832,7 +8795,7 @@ static int emit_fl_put_global(
     if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME || v >= (Q2ValueId)t->nvalues ||
         t->lb[v] != E_LB_TAG)
       continue;
-    if (g_e_rooted != NULL && g_e_rooted[v]) continue;
+    if ((g_e_rooted != NULL && g_e_rooted[v]) || e_kimmortal((unsigned)v)) continue;
     if (e_spill_slot(v) < 0) {
       free(lb);
       e_fl_block("too many values live across a global store", in);
@@ -7862,15 +8825,17 @@ static int emit_fl_put_global(
         in->arg[0].off, vb);
   else
     fprintf(f, "    {\n");
-  for (k = 0; k < nsp ; k++)
-    fprintf(f, "    ra_[%d] = v%u;\n", e_spill_slot(spv[k]), (unsigned)spv[k]);
+  {
+    char pb_[1024];
+    e_pub_text(pb_, sizeof(pb_), spv, nsp, 0, in->next - 1, 0, "    ");
+    fputs(pb_, f);
+  }
   fprintf(
       f,
-      "    E_RLINK(rec_);\n    rec_->pc = %d;\n"
       "    if (__builtin_expect(qjs_aot_put_global(ctx, (void *)cb, (int)qjs_aot_ld_u32(*(const uint8_t *const *)(cb + "
       "QJS_AOT_OFF_FNBC_REGVM_CODE) + %d), %s, %d) < 0, 0)) return JS_EXCEPTION;\n"
       "    }\n",
-      in->next - 1, in->arg[0].off, vb, (int)in->arg[2].val);
+      in->arg[0].off, vb, (int)in->arg[2].val);
   g_e_inl_dirty = 1;
   for (k = 0; k < in->nredef; k++) {
     Q2ValueId rv = in->redef_val[k], src;
@@ -7882,6 +8847,7 @@ static int emit_fl_put_global(
       continue;
     e_local_name(nm, sizeof(nm), rv);
     fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
+    e_kcopy(rv, src);
     cur[rr] = rv;
   }
   /* The redefined registers are in their locals, not in the frame, so an exit here names the
@@ -8015,6 +8981,8 @@ static int emit_store_call(
           continue;
         e_local_name(nm, sizeof(nm), rv);
         fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
+        e_kcopy(rv, src);
+    e_kcopy(rv, src);
       }
       fprintf(f, "    }\n");
       return 1;
@@ -8147,7 +9115,7 @@ static int emit_fl_alloc_op(
     if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME ||
         v >= (Q2ValueId)t->nvalues || t->lb[v] != E_LB_TAG)
       continue;
-    if (g_e_rooted != NULL && g_e_rooted[v]) continue;
+    if ((g_e_rooted != NULL && g_e_rooted[v]) || e_kimmortal((unsigned)v)) continue;
     if (e_spill_slot(v) < 0) {
       free(lb);
       free(la);
@@ -8176,10 +9144,19 @@ static int emit_fl_alloc_op(
     fprintf(f, "        Q2_ADD_FILLED(ctx, v%u, fsh_);\n      } else {\n", (unsigned)ov);
     fused = 1;
   }
-  for (k = 0; k < nsp ; k++)
-    fprintf(f, "    ra_[%d] = v%u;\n", e_spill_slot(spv[k]), (unsigned)spv[k]);
+  g_e_site_k = nsp;
+  if (g_e_compact) {
+    char c2_[512];
+    snprintf(c2_, sizeof(c2_), "%s", e_wk(call, nsp));
+    snprintf(call, sizeof(call), "%s", c2_);
+    if (resslot >= 0) resslot = nsp;
+  }
   for (r = 0; r < na; r++) e_emit_fl_window_store(f, fn, t, cur, in->win_reg + r, r);
-  fprintf(f, "    E_RLINK(rec_);\n    rec_->pc = %d;\n", in->next - 1);
+  {
+    char pb_[1024];
+    e_pub_text(pb_, sizeof(pb_), spv, nsp, na, in->next - 1, !fill && t->lb[dv] == E_LB_TAG && !e_def_dead(in, dv), "    ");
+    fputs(pb_, f);
+  }
   fprintf(f, "    { JSValue _o; int _rc = %s;\n", call);
   fprintf(f, "      if (__builtin_expect(_rc < 0, 0)) return JS_EXCEPTION;\n");
   if (!fill) {
@@ -8210,6 +9187,7 @@ static int emit_fl_alloc_op(
       continue;
     e_local_name(nm, sizeof(nm), rv);
     fprintf(f, "    %s = %s;\n", nm, e_copy_expr(src, rv));
+    e_kcopy(rv, src);
     cur[rr] = rv;
   }
   e_emit_group_recheck(f, fn, in, cur);
@@ -8619,7 +9597,7 @@ static int emit_alloc_op(
   if (declines) {
     /* 0: operands that would run user code or throw. The copy leaves here, before the instruction. */
     e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
-    fprintf(f, "      if (_rc == 0) goto vx_%d;\n", in->pc);
+    fprintf(f, "      if (_rc == 0) E_GOTO(vx, %d);\n", in->pc);
   }
   fprintf(f, "      if (__builtin_expect(_rc < 0, 0)) return qjs_aot_throw_here(ctx, f, %d);\n", in->pc);
   fprintf(f, "      if (%s) {\n", okc);
@@ -8651,14 +9629,14 @@ static int emit_alloc_op(
     e_sweep_guard(f, "dx", in->next);
     fprintf(
         f,
-        "        if (__builtin_expect(!Q2_I32_OK(_o, i%u), 0)) goto dx_%d;\n",
+        "        if (__builtin_expect(!Q2_I32_OK(_o, i%u), 0)) E_GOTO(dx, %d);\n",
         (unsigned)dv, in->next);
   } else if (t->lb[dv] == E_LB_BOOL) {
     e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
     e_sweep_guard(f, "dx", in->next);
     fprintf(
         f,
-        "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_BOOL, 0)) goto dx_%d;\n"
+        "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_BOOL, 0)) E_GOTO(dx, %d);\n"
         "        b%u = JS_VALUE_GET_BOOL(_o);\n",
         in->next, (unsigned)dv);
   } else {
@@ -8668,7 +9646,7 @@ static int emit_alloc_op(
         f,
         "        if (JS_VALUE_GET_TAG(_o) == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_o);\n"
         "        else if (JS_VALUE_GET_TAG(_o) == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_o);\n"
-        "        else goto dx_%d;\n",
+        "        else E_GOTO(dx, %d);\n",
         (unsigned)dv, (unsigned)dv, in->next);
   }
   fprintf(f, "        goto cd_%d;\n      }\n    }\n", in->pc);
@@ -8715,6 +9693,12 @@ static int pure_inline_is(const char *hex) {
   for (i = 0; i < g_pure_inl_n; i++)
     if (strcmp(g_pure_inl[i], hex) == 0) return 1;
   return 0;
+}
+
+static int e_pure_ctor_site(const Q2Func *fn, const Q2Insn *in) {
+  char callee[33];
+  int nf, ao[8], ai[8];
+  return in->rop == ROP_construct && in->win_n <= 8 && e_fused_info(fn, in, callee, &nf, ao, ai);
 }
 
 static int e_pure_call_site(const Q2Func *fn, const Q2Insn *in) {
@@ -8781,7 +9765,7 @@ static int emit_inl_guard(
       snprintf(tce, sizeof(tce), "v%u", (unsigned)tcv);
     else
       snprintf(tce, sizeof(tce), "AOT_REG(fr, %d)", tc * 16);
-    fprintf(f, "    if (__builtin_expect(!q2_is_fn_call(%s), 0)) goto vx_%d;\n", tce, in->pc);
+    fprintf(f, "    if (__builtin_expect(!q2_is_fn_call(%s), 0)) E_GOTO(vx, %d);\n", tce, in->pc);
   }
   /* THE COPY'S FUNCTION OBJECT. Recorded HERE, where the guard has just proved
      `cexp` is the callee whose bound entry it compared, because a copied
@@ -8820,9 +9804,9 @@ static int emit_inl_guard(
           f,
           "#ifdef Q2_SEL_%s\n"
           "    if (__builtin_expect(!(%smce%d == (const void *)aot_f_%s), 0)) "
-          "goto vx_%d;\n"
+          "E_GOTO(vx, %d);\n"
           "#else\n"
-          "    goto vx_%d;\n"
+          "    E_GOTO(vx, %d);\n"
           "#endif\n",
           callee, oldpre, cmc, callee, in->pc, in->pc);
     } else {
@@ -8852,11 +9836,11 @@ static int emit_inl_guard(
           "        { const char *ns_ = JS_ToCString(ctx, %s); fprintf(stderr, \"   src=%%.70s\\n\", ns_ ? ns_ : \"?\"); if (ns_) JS_FreeCString(ctx, ns_); }\n"
           "        if (JS_VALUE_GET_TAG(%s) == JS_TAG_OBJECT) fprintf(stderr, \"   class=%%d same_as_recv=%%d\\n\", (int)*(const uint16_t *)((const unsigned char *)JS_VALUE_GET_PTR(%s) + QJS_AOT_OFF_JSOBJECT_CLASS_ID), JS_VALUE_GET_PTR(%s) == JS_VALUE_GET_PTR(%s)); }\n"
           "#endif\n"
-          "      goto vx_%d; }\n"
+          "      E_GOTO(vx, %d); }\n"
           "#else\n"
-          "    goto vx_%d;\n"
+          "    E_GOTO(vx, %d);\n"
           "#endif\n",
-          callee, pmpre, e_cc_fn(fn, in), cexp, callee, e_cc_ix(fn, in), codeid, ")", in->pc, cexp, callee, cexp, cexp, cexp, cexp, cexp, cexp, rexp, in->pc,
+          callee, pmpre, e_cc_fnv(fn, in, cexp, callee), cexp, callee, e_cc_ixv(fn, in, cexp, callee), codeid, ")", in->pc, cexp, callee, cexp, cexp, cexp, cexp, cexp, cexp, rexp, in->pc,
           in->pc);
     }
   }
@@ -8864,7 +9848,7 @@ static int emit_inl_guard(
   if (iv->uses_this && !(tv != Q2_NO_VALUE && tv != E_UNDEF && tv != E_INFRAME && tv < (Q2ValueId)fn->nvalues &&
                          g_e_virt != NULL && g_e_virt[tv]))
     fprintf(
-        f, "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT, 0)) goto vx_%d;\n", rexp,
+        f, "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_OBJECT, 0)) E_GOTO(vx, %d);\n", rexp,
         in->pc);
   if (iv->g->pic_count > 0) {
     /* the callee's cache tables, shifted so its site numbers (above ours) index them */
@@ -8891,7 +9875,7 @@ static int emit_inl_guard(
         "    { const uint8_t *cbk_ = *(const uint8_t *const *)((const uint8_t *)JS_VALUE_GET_PTR(%s) + "
         "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
         "      const uint8_t *pr_ = *(const uint8_t *const *)(cbk_ + QJS_AOT_OFF_FNBC_REGVM_PIC);\n"
-        "      if (__builtin_expect(pr_ == NULL, 0)) goto vx_%d;\n"
+        "      if (__builtin_expect(pr_ == NULL, 0)) E_GOTO(vx, %d);\n"
         "      ipic_%d = pr_ - (size_t)%d * QJS_AOT_SIZEOF_JSREGPIC;\n"
         "      iholders_%d = *(void *const *const *)(cbk_ + QJS_AOT_OFF_FNBC_REGVM_PIC_HOLDER) - %d;\n"
         "      ins_%d = (uint32_t)*(const uint16_t *)(cbk_ + QJS_AOT_OFF_FNBC_PIC_COUNT);\n"
@@ -8920,7 +9904,7 @@ static int emit_inl_guard(
         fprintf(
             f, "    if (__builtin_expect(gsh%d != E_NO_SHAPE && Q2_ENTERS_LAYOUT((const unsigned char *)gsh%d)", gi, gi);
         if (cl_ != 0) fprintf(f, " && gsh%d != (const void *)q2_layout_shape[%d]", gi, cl_ - 1);
-        fprintf(f, ", 0)) goto vx_%d;\n", in->pc);
+        fprintf(f, ", 0)) E_GOTO(vx, %d);\n", in->pc);
       }
       for (qq = 0; qq < gr->nsites; qq++)
         if (e_facts_site_proto(g_e_facts, gr->sites[qq]) == 2)
@@ -8941,10 +9925,10 @@ static int emit_inl_guard(
         const Q2Insn *gz = &fn->insns[zi];
         if (gz->own != ik + 1 || !e_gfold_val(fn, gz, &gv)) continue;
         fprintf(
-            f, "      if (__builtin_expect(!qjs_aot_global_fold(ctx, (int)qjs_aot_ld_u32(icd_ + %d), %d), 0)) goto vx_%d;\n",
+            f, "      if (__builtin_expect(!qjs_aot_global_fold(ctx, (int)qjs_aot_ld_u32(icd_ + %d), %d), 0)) E_GOTO(vx, %d);\n",
             gz->arg[1].off, (int)gv, in->pc);
       }
-      fprintf(f, "      if (__builtin_expect(Q2_EPOCH_MOVED(ctx), 0)) goto vx_%d;\n      e_gfc%d = 1;\n    }\n", in->pc, ik);
+      fprintf(f, "      if (__builtin_expect(Q2_EPOCH_MOVED(ctx), 0)) E_GOTO(vx, %d);\n      e_gfc%d = 1;\n    }\n", in->pc, ik);
     }
   }
   /* The receiver's shape for this arm: the first entry in a cache epoch records the shape of `this` and resolves the slot of every field the
@@ -8985,7 +9969,7 @@ static int emit_inl_guard(
       fprintf(
           f,
           "      const void *sh_ = q2_shape_of(%s);\n"
-          "      if (sh_ == NULL) goto vx_%d;\n"
+          "      if (sh_ == NULL) E_GOTO(vx, %d);\n"
           "      if (ash_%d == NULL || aep_%d != q2_ep || asf_%d != %s || ash_%d != sh_) {\n",
           rexp, in->pc, ik, ik, ik, sfe, ik);
       for (ri = 0; ri < nseen; ri++) {
@@ -8999,13 +9983,13 @@ static int emit_inl_guard(
         if (rd->rop == ROP_get_field2) {
           fprintf(
               f,
-              "      { JSValue mv_; if (!qjs_aot_shape_method(sh_, qjs_aot_ld_u32(icode_%d + %d), &mv_)) goto vx_%d;\n"
+              "      { JSValue mv_; if (!qjs_aot_shape_method(sh_, qjs_aot_ld_u32(icode_%d + %d), &mv_)) E_GOTO(vx, %d);\n"
               "        amv_%d_%d = mv_; ame_%d_%d = q2_entry_of(mv_); }\n",
               ik, rd->arg[2].off, in->pc, ik, seen[ri], ik, seen[ri]);
           continue;
         }
         fprintf(
-            f, "      if (!qjs_aot_shape_slot(sh_, qjs_aot_ld_u32(icode_%d + %d), &aoff_%d_%d)) {\n#ifdef Q2_MXDEBUG\n        fprintf(stderr, \"armslot k=%d site=%d atom=%%u failed\\n\", qjs_aot_ld_u32(icode_%d + %d));\n#endif\n        goto vx_%d; }\n", ik, rd->arg[2].off, ik,
+            f, "      if (!qjs_aot_shape_slot(sh_, qjs_aot_ld_u32(icode_%d + %d), &aoff_%d_%d)) {\n#ifdef Q2_MXDEBUG\n        fprintf(stderr, \"armslot k=%d site=%d atom=%%u failed\\n\", qjs_aot_ld_u32(icode_%d + %d));\n#endif\n        E_GOTO(vx, %d); }\n", ik, rd->arg[2].off, ik,
             seen[ri], ik, seen[ri], ik, rd->arg[2].off, in->pc);
       }
       fprintf(f, "      ash_%d = sh_; aep_%d = q2_ep; asf_%d = %s;\n      }\n", ik, ik, ik, sfe);
@@ -9066,9 +10050,9 @@ static int emit_virt_def(
   fprintf(
       f,
       "#ifdef Q2_SEL_%s\n"
-      "    if (__builtin_expect(!%s%s, (const void *)aot_f_%s, %du), 0)) goto vx_%d;\n"
+      "    if (__builtin_expect(!%s%s, (const void *)aot_f_%s, %du), 0)) E_GOTO(vx, %d);\n"
       "    { static const uint16_t sites_[%d] = {",
-      callee, e_cc_fn(fn, in), cexp, callee, e_cc_ix(fn, in), in->pc, vw->nfields);
+      callee, e_cc_fnv(fn, in, cexp, callee), cexp, callee, e_cc_ixv(fn, in, cexp, callee), in->pc, vw->nfields);
   for (q = 0; q < vw->nfields; q++) fprintf(f, "%s%d", q ? ", " : "", vw->site[q]);
   fprintf(
       f,
@@ -9082,11 +10066,11 @@ static int emit_virt_def(
       "                              QJS_AOT_OFF_RT_SHAPE_FREE_EPOCH) != cc_.sfe ||\n"
       "          JS_VALUE_GET_PTR(*(const JSValue *)(*(const unsigned char *const *)(co_ + QJS_AOT_OFF_JSOBJECT_PROP) +\n"
       "                                              (size_t)cc_.slot * QJS_AOT_SIZEOF_JSPROPERTY)) != cc_.proto, 0))\n"
-      "        if (!qjs_aot_ctor_replayable(ctx, (JSObject *)co_, sites_, %d, &cc_)) goto vx_%d;\n"
-      "      if (__builtin_expect(vsh%d != NULL && vsh%d != cc_.final_shape, 0)) goto vx_%d;\n"
+      "        if (!qjs_aot_ctor_replayable(ctx, (JSObject *)co_, sites_, %d, &cc_)) E_GOTO(vx, %d);\n"
+      "      if (__builtin_expect(vsh%d != NULL && vsh%d != cc_.final_shape, 0)) E_GOTO(vx, %d);\n"
       "      vsh%d = cc_.final_shape; }\n"
       "#else\n"
-      "    goto vx_%d;\n"
+      "    E_GOTO(vx, %d);\n"
       "#endif\n"
       "    v%u = JS_UNDEFINED;\n",
       cexp, vw->nfields, in->pc, in->vweb, in->vweb, in->pc, in->vweb, in->pc, (unsigned)dv);
@@ -9120,11 +10104,11 @@ static int emit_virt_proto(
   fprintf(
       f,
       "      if (__builtin_expect(vsh%d != gsh%d || q2_cell_raw(pic, %s) != gsh%d || "
-      "q2_holder_bad_sh(vsh%d, holders, %d), 0)) goto vx_%d;\n",
+      "q2_holder_bad_sh(vsh%d, holders, %d), 0)) E_GOTO(vx, %d);\n",
       in->vweb, g, e_cellidx(cib, sizeof(cib), site), g, in->vweb, site, in->pc);
   fprintf(f, "      _f = *q2_hslotp_sh(vsh%d, q2_cell_off(pic, %s));\n", in->vweb, cib);
   if (!g_e_nolazy)
-    fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
+    fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n", in->pc);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
     fprintf(stderr, "qjsaot: virtual prototype read at pc %d: no guard for its def\n", in->pc);
     e_fatal("internal inconsistency (see the message above)", NULL);
@@ -9178,6 +10162,18 @@ static int emit_pure_call(
   e_note_tag('v', in->pc, cexp);
   if (t->lb[dv] != E_LB_TAG)
     e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
+  /* The arms are compiled in only for callees that have a body in the unit, and a site whose every arm is compiled out leaves at
+     every entry: selection must keep the callees (or drop this body) whenever this body is selected. */
+  if (getenv("QJS_AOT_NOPUREDEP") == NULL) {
+    char fhex[33];
+    static const char *const hx = "0123456789abcdef";
+    for (k = 0; k < 16; k++) {
+      fhex[2 * k] = hx[fn->g->digest[k] >> 4];
+      fhex[2 * k + 1] = hx[fn->g->digest[k] & 15];
+    }
+    fhex[32] = 0;
+    for (k = 0; k < n; k++) qjs_aot_region_dep(fhex, callee[k]);
+  }
   /* The argument window is built from the locals into an array of this scope, and the receiver
      and callee are passed as values: the inline body reads them in place, nothing is stored to
      the frame, and nothing here can collect. */
@@ -9220,7 +10216,7 @@ static int emit_pure_call(
         "        JSValue _o; int _r;\n"
         "        E_CAP(f, %d);\n"
         "        if (!(_r = ei_%s%s(ctx, f, (JSObject *)JS_VALUE_GET_PTR(%s), %s,\n"
-        "                    args_, %d, &_o, NULL, 0, NULL))) goto vx_%d;\n",
+        "                    args_, %d, &_o, NULL, 0, NULL))) E_GOTO(vx, %d);\n",
         "q2_call_entry_c(ctx, ", cexp, callee[k], ccx, in->next - 1, callee[k], g_e_nolazy ? "_n" : "", cexp, recv, na, in->pc);
     /* A result that needs a guard reaches the frame only when the guard misses. */
     if (t->lb[dv] == E_LB_TAG) {
@@ -9239,7 +10235,7 @@ static int emit_pure_call(
     } else {
       const char *fl =
           "{ if (_r == 1 && JS_VALUE_HAS_REF_COUNT(_o)) qjs_aot_set_reg_p(ctx, fr, %d, _o); "
-          "else AOT_SET_B(ctx, fr, %d, _o); goto dx_%d; }";
+          "else AOT_SET_B(ctx, fr, %d, _o); E_GOTO(dx, %d); }";
       char miss[200];
       snprintf(miss, sizeof(miss), fl, off, off, in->next);
       e_sweep_guard_owned(f, in->next, off);
@@ -9264,7 +10260,7 @@ static int emit_pure_call(
     }
     fprintf(f, "        goto cd_%d;\n    }\n#endif\n", in->pc);
   }
-  fprintf(f, "    goto vx_%d;\n    }\n    cd_%d: ;\n", in->pc, in->pc);
+  fprintf(f, "    E_GOTO(vx, %d);\n    }\n    cd_%d: ;\n", in->pc, in->pc);
   cur[dreg] = dv;
   g_e_miss_exit_seen = 1;
   return 1;
@@ -9291,14 +10287,14 @@ static void e_builtin_call_tail(
     fprintf(
         f,
         "        if (__builtin_expect(!Q2_I32_OK(_o, i%u), 0)) "
-        "goto dx_%d;\n",
+        "E_GOTO(dx, %d);\n",
         (unsigned)dv, in->next);
   } else if (t->lb[dv] == E_LB_BOOL) {
     e_sweep_guard(f, "dx", in->next);
     fprintf(
         f,
         "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_BOOL, 0)) "
-        "goto dx_%d;\n"
+        "E_GOTO(dx, %d);\n"
         "        b%u = JS_VALUE_GET_BOOL(_o);\n",
         in->next, (unsigned)dv);
   } else {
@@ -9309,7 +10305,7 @@ static void e_builtin_call_tail(
         "(double)JS_VALUE_GET_INT(_o);\n"
         "        else if (JS_VALUE_GET_TAG(_o) == JS_TAG_FLOAT64) d%u = "
         "JS_VALUE_GET_FLOAT64(_o);\n"
-        "        else goto dx_%d;\n",
+        "        else E_GOTO(dx, %d);\n",
         (unsigned)dv, (unsigned)dv, in->next);
   }
   fprintf(f, "        goto cd_%d;\n", in->pc);
@@ -9453,7 +10449,7 @@ static int emit_copy_real_call(
     if (!((la[r / 64] >> (r % 64)) & 1) || r == dreg) continue;
     v = cur[r];
     if (v == Q2_NO_VALUE || v == E_UNDEF || v == E_INFRAME || v >= (Q2ValueId)t->nvalues || t->lb[v] != E_LB_TAG) continue;
-    if (g_e_rooted != NULL && g_e_rooted[v]) continue;
+    if ((g_e_rooted != NULL && g_e_rooted[v]) || e_kimmortal((unsigned)v)) continue;
     fprintf(f, "      AOT_SET_B(ctx, rfr_, %d, v%u);\n", r * 16, (unsigned)v);
   }
   free(la);
@@ -9522,7 +10518,7 @@ static int emit_typed_call(
     e_reg_box(cx, sizeof(cx), fn, t, cur, call_callee_off(in) / 16);
     e_reg_box(rx, sizeof(rx), fn, t, cur, call_this_off(in) / 16);
     e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
-    fprintf(f, "    { JSValue _o;\n      if (__builtin_expect(Q2_FORCE_MISS || !q2_array_pop0(ctx, %s, %s, &_o), 0)) goto vx_%d;\n", cx, rx, in->pc);
+    fprintf(f, "    { JSValue _o;\n      if (__builtin_expect(Q2_FORCE_MISS || !q2_array_pop0(ctx, %s, %s, &_o), 0)) E_GOTO(vx, %d);\n", cx, rx, in->pc);
     if (e_def_dead(in, dv0)) {
       fprintf(f, "      if (JS_VALUE_HAS_REF_COUNT(_o)) JS_FreeValue(ctx, _o);\n");
     } else {
@@ -9542,7 +10538,7 @@ static int emit_typed_call(
     e_reg_box(rx, sizeof(rx), fn, t, cur, call_this_off(in) / 16);
     e_reg_box(ax, sizeof(ax), fn, t, cur, in->win_reg);
     e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
-    fprintf(f, "    { JSValue _o;\n      if (__builtin_expect(Q2_FORCE_MISS || !q2_array_push1(ctx, %s, %s, %s, &_o), 0)) goto vx_%d;\n", cx, rx, ax, in->pc);
+    fprintf(f, "    { JSValue _o;\n      if (__builtin_expect(Q2_FORCE_MISS || !q2_array_push1(ctx, %s, %s, %s, &_o), 0)) E_GOTO(vx, %d);\n", cx, rx, ax, in->pc);
     if (!e_def_dead(in, dv0)) {
       if (t->lb[dv0] == E_LB_TAG) fprintf(f, "      v%u = _o;\n", (unsigned)dv0);
       else fprintf(f, "      i%u = JS_VALUE_GET_INT(_o);\n", (unsigned)dv0);
@@ -9710,13 +10706,13 @@ static int emit_typed_call(
             f,
             "    if (__builtin_expect(pme%u != NULL ? pme%u == (const void *)aot_f_%s :\n"
             "        %s%s, (const void *)aot_f_%s, %du), 1)) {\n",
-            cvid, cvid, callee[k], e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in));
+            cvid, cvid, callee[k], e_cc_fnv(fn, in, cexp, callee[k]), cexp, callee[k], e_cc_ixv(fn, in, cexp, callee[k]));
       else
         fprintf(
             f,
             "    if (__builtin_expect(%s%s, "
             "(const void *)aot_f_%s, %du), 1)) {\n",
-            e_cc_fn(fn, in), cexp, callee[k], e_cc_ix(fn, in));
+            e_cc_fnv(fn, in, cexp, callee[k]), cexp, callee[k], e_cc_ixv(fn, in, cexp, callee[k]));
     }
     fprintf(f, "        JSValue _o; int _r = 1;\n");
     /* The callee's inline body first: it runs the callee in place when every
@@ -9779,7 +10775,7 @@ static int emit_typed_call(
       fprintf(
           f,
           "        if (__builtin_expect(!Q2_I32_OK(_o, i%u), 0)) "
-          "goto dx_%d;\n",
+          "E_GOTO(dx, %d);\n",
           (unsigned)dv, in->next);
     } else if (t->lb[dv] == E_LB_BOOL) {
       e_sweep_guard(f, "dx", in->next);
@@ -9787,7 +10783,7 @@ static int emit_typed_call(
           f,
           "        if (__builtin_expect(JS_VALUE_GET_TAG(_o) != JS_TAG_BOOL, "
           "0)) "
-          "goto dx_%d;\n"
+          "E_GOTO(dx, %d);\n"
           "        b%u = JS_VALUE_GET_BOOL(_o);\n",
           in->next, (unsigned)dv);
     } else {
@@ -9798,7 +10794,7 @@ static int emit_typed_call(
           "(double)JS_VALUE_GET_INT(_o);\n"
           "        else if (JS_VALUE_GET_TAG(_o) == JS_TAG_FLOAT64) d%u = "
           "JS_VALUE_GET_FLOAT64(_o);\n"
-          "        else goto dx_%d;\n",
+          "        else E_GOTO(dx, %d);\n",
           (unsigned)dv, (unsigned)dv, in->next);
     }
     fprintf(f, "        goto cd_%d;\n", in->pc);
@@ -9994,6 +10990,22 @@ static int e_gcse_keep(uint16_t rop) {
   }
 }
 
+/* The slot of a get_global that reads a constant global in the frameless body being emitted, or -1. */
+static const Q2Func *g_kfn_cur;
+static int e_kuse(const Q2Insn *in) {
+  char gn[64];
+  if (g_kfn_cur == NULL || !qjs_aot_bundle_fn_kok(g_kfn_cur->g)) return -1;
+  if (!e_kon() || !g_e_fl || g_e_inl || in->own != 0 || in->rop != ROP_get_global || in->narg < 2 || in->arg[1].kind != 'a') return -1;
+  if (!qjs_aot_bundle_atom_name((uint32_t)in->arg[1].val, gn, sizeof(gn))) return -1;
+  return e_kslot_of(gn);
+}
+static void e_kscan(const Q2Func *fn, int fi) {
+  int i, k;
+  g_kfn_cur = fn;
+  for (i = 0; i < fn->ninsns; i++)
+    if ((k = e_kuse(&fn->insns[i])) >= 0) e_kmark(fi, k);
+}
+
 /* A speculative-body GLOBAL READ: `get_global` ("rabs": dest, atom offset, throw
    flag, site). `q2_global_hit` is the same inline test the generic body uses; a
    miss goes to the wrapper, which performs the real lookup (that path can run a
@@ -10022,6 +11034,19 @@ static int emit_typed_global_read(
       t->lb[dv] != E_LB_F64)
     return 0;
 
+  if (t->lb[dv] == E_LB_TAG && in->xpc < 0) {
+    int kk;
+    g_kfn_cur = fn;
+    kk = e_kuse(in);
+    if (kk >= 0 && qjs_aot_k_used(fi, kk)) {
+      fprintf(f, "    v%u = q2_kv[%d]; /* %s */\n", (unsigned)dv, kk, g_kslot[kk].name);
+      if ((unsigned)dv < sizeof(g_kval)) g_kval[dv] = (signed char)(kk + 1);
+      if (cur != NULL) cur[dreg] = dv;
+      g_e_miss_exit_seen = 1; /* nothing here can miss */
+      return 1;
+    }
+  }
+
   {
     int32_t gv;
     if (t->lb[dv] == E_LB_I32 && g_e_epoch_skip && e_gfold_val(fn, in, &gv)) {
@@ -10043,28 +11068,28 @@ static int emit_typed_global_read(
           f,
           "      if (__builtin_expect(Q2_FORCE_MISS || !q2_global_hit(ctx, pic, %d, &_g), 0)) {\n"
           "        if (Q2_FORCE_MISS || !qjs_aot_global_warm(ctx, f, %d, (int)qjs_aot_ld_u32(q2_code(f) + %d)) ||\n"
-          "            !q2_global_hit(ctx, pic, %d, &_g)) goto vx_%d;\n"
+          "            !q2_global_hit(ctx, pic, %d, &_g)) E_GOTO(vx, %d);\n"
           "      }\n",
           site, site, in->arg[1].off, site, in->pc);
     else
       fprintf(
           f,
           "      if (__builtin_expect(Q2_FORCE_MISS || !q2_global_hit(ctx, pic, %d, &_g), 0)) "
-          "goto vx_%d;\n",
+          "E_GOTO(vx, %d);\n",
           site, in->pc);
     if (t->lb[dv] == E_LB_TAG)
       fprintf(f, "      v%u = _g;\n", (unsigned)dv);
     else if (t->lb[dv] == E_LB_I32)
       fprintf(
           f,
-          "      if (__builtin_expect(!Q2_I32_OK(_g, i%u), 0)) goto vx_%d;\n",
+          "      if (__builtin_expect(!Q2_I32_OK(_g, i%u), 0)) E_GOTO(vx, %d);\n",
           (unsigned)dv, in->pc);
     else
       fprintf(
           f,
           "      if (JS_VALUE_GET_TAG(_g) == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_g);\n"
           "      else if (JS_VALUE_GET_TAG(_g) == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_g);\n"
-          "      else goto vx_%d;\n",
+          "      else E_GOTO(vx, %d);\n",
           (unsigned)dv, (unsigned)dv, in->pc);
     fprintf(f, "    }\n");
     if (cur != NULL) cur[dreg] = dv;
@@ -10116,7 +11141,7 @@ static int emit_typed_global_read(
       fprintf(
           f,
           "        if (__builtin_expect(!Q2_I32_OK(_g, i%u), 0)) "
-          "{ AOT_SET_B(ctx, fr, %d, _g); goto dx_%d; }\n",
+          "{ AOT_SET_B(ctx, fr, %d, _g); E_GOTO(dx, %d); }\n",
           (unsigned)dv, dreg * 16, in->next);
     else if (t->lb[dv] == E_LB_F64)
       fprintf(
@@ -10125,7 +11150,7 @@ static int emit_typed_global_read(
           "(double)JS_VALUE_GET_INT(_g);\n"
           "        else if (JS_VALUE_GET_TAG(_g) == JS_TAG_FLOAT64) d%u = "
           "JS_VALUE_GET_FLOAT64(_g);\n"
-          "        else { AOT_SET_B(ctx, fr, %d, _g); goto dx_%d; }\n",
+          "        else { AOT_SET_B(ctx, fr, %d, _g); E_GOTO(dx, %d); }\n",
           (unsigned)dv, (unsigned)dv, dreg * 16, in->next);
   }
   fprintf(f, "      } else {\n");
@@ -10133,7 +11158,7 @@ static int emit_typed_global_read(
     /* The cache cell does not hold: the generic body does the lookup. */
     e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
     e_sweep_guard(f, "vx", in->pc);
-    fprintf(f, "        goto vx_%d;\n", in->pc);
+    fprintf(f, "        E_GOTO(vx, %d);\n", in->pc);
     g_e_miss_exit_seen = 1;
   } else {
     /* A global's cache hit holds until a global changes: not a systematic miss. */
@@ -10183,7 +11208,7 @@ static int emit_typed_load_this(
     fprintf(
         f,
         "    if (__builtin_expect(JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT, "
-        "0)) goto vx_%d;\n"
+        "0)) E_GOTO(vx, %d);\n"
         "    v%u = this_obj;\n"
         "    AOT_SET_B(ctx, fr, %d, this_obj);\n",
         in->pc, (unsigned)dv, ld * 16);
@@ -10415,18 +11440,18 @@ static int emit_group_this_read(
     fprintf(
         f,
         "    { JSValue _t = %s, _f;\n"
-        "      if (__builtin_expect(%sJS_VALUE_GET_TAG(_t) != JS_TAG_OBJECT, 0)) goto vx_%d;\n"
-        "      if (__builtin_expect(%s%s, 0)) goto vx_%d;\n"
+        "      if (__builtin_expect(%sJS_VALUE_GET_TAG(_t) != JS_TAG_OBJECT, 0)) E_GOTO(vx, %d);\n"
+        "      if (__builtin_expect(%s%s, 0)) E_GOTO(vx, %d);\n"
         "      _f = *%s(_t, %s);\n",
         g_e_fl ? "this_obj" : "*(JSValue *)((uint8_t *)f + QJS_AOT_OFF_REGRUN_THIS_OBJ)",
         okt ? "!this_ok_ && " : "", in->pc, okt ? "!this_ok_ && " : "", test, in->pc,
         e_slotfn(site), off);
   }
   if (!g_e_nolazy)
-    fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
+    fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n", in->pc);
   fprintf(f, "      v%u = _t;\n", (unsigned)rv);
   if (g_e_fl && e_group_layout(g) != 0 && fn->nrpo > 0 && g_e_blk == fn->rpo[0] && (int)rv < g_e_spill_nv) {
-    fprintf(f, "      pp%u = q2_propp(_t);\n", (unsigned)rv);
+    fprintf(f, "      pp%u = %s(_t);\n", (unsigned)rv, e_direct() ? "q2_propd" : "q2_propp");
     g_e_pp[rv] = 1;
   }
   if (!emit_hit_result(f, fn, in, t, fv, freg, "_f")) {
@@ -10528,7 +11553,7 @@ static int emit_typed_this_field(
     fprintf(
         f,
         "    if (__builtin_expect(JS_VALUE_GET_TAG(this_obj) != JS_TAG_OBJECT, "
-        "0)) goto vx_%d;\n"
+        "0)) E_GOTO(vx, %d);\n"
         "    { JSValue _t = this_obj, _v;\n"
         "      v%u = _t;\n"
         "      AOT_SET_B(ctx, fr, %d, _t);\n",
@@ -10547,7 +11572,7 @@ static int emit_typed_this_field(
           "        if (q2_lmt_hit(ctx, &lmt_%d, _t, qjs_aot_ld_u32(ecb + %d), &_v%s)) {\n",
           in->pc, in->pc, in->arg[2].off, tl_pme ? (snprintf(tlbuf, sizeof(tlbuf), ", &pme%u", (unsigned)fv), tlbuf) : ", &(const void *){NULL}");
       if (!emit_hit_result(f, fn, in, t, fv, freg, "_v")) return 0;
-      fprintf(f, "        } else goto vx_%d;\n      }\n    }\n", in->pc);
+      fprintf(f, "        } else E_GOTO(vx, %d);\n      }\n    }\n", in->pc);
     } else {
       if (!emit_typed_opcall(f, fn, in, t, cur, NULL, hex, fi, b)) return 0;
       fprintf(f, "      }\n    }\n");
@@ -10778,7 +11803,18 @@ static int emit_typed_field_write(
     else
       snprintf(boxed, sizeof(boxed), "v%u", (unsigned)vv);
     {
-      int g = e_exit_group(fn, in, site);
+      int g;
+      /* A store the cache never serves (it ran a setter, or its shapes thrash the cache dead) leaves an inline or frameless body on every
+         execution: the body is left to the framed form. */
+      if (g_e_inl || g_e_fl) {
+        int osite_;
+        const uint8_t *dg_ = e_site_dg(fn, site, &osite_);
+        if (qjs_aot_prof_store_uncached(dg_, osite_, in->pc)) {
+          if (g_e_fl) e_fl_block("a store the cache never serves", in);
+          return 0;
+        }
+      }
+      g = e_exit_group(fn, in, site);
       /* No reference counting inline: a store of a TAG value (an object, null)
          over what is usually a reference leaves on nearly every execution. */
       if (g >= 0) return emit_group_write(f, fn, in, cur, g, site, rv, boxed);
@@ -10883,7 +11919,7 @@ static int emit_hit_result(
     fprintf(
         f,
         "        if (__builtin_expect(!Q2_I32_OK(%s, i%u), 0)) "
-        "{ AOT_SET_B(ctx, fr, %d, %s); goto dx_%d; }\n",
+        "{ AOT_SET_B(ctx, fr, %d, %s); E_GOTO(dx, %d); }\n",
         raw, (unsigned)dv, dreg * 16, raw, in->next);
   else if (t->lb[dv] == E_LB_F64)
     fprintf(
@@ -10892,13 +11928,13 @@ static int emit_hit_result(
         "(double)JS_VALUE_GET_INT(%s);\n"
         "        else if (JS_VALUE_GET_TAG(%s) == JS_TAG_FLOAT64) d%u = "
         "JS_VALUE_GET_FLOAT64(%s);\n"
-        "        else { AOT_SET_B(ctx, fr, %d, %s); goto dx_%d; }\n",
+        "        else { AOT_SET_B(ctx, fr, %d, %s); E_GOTO(dx, %d); }\n",
         raw, (unsigned)dv, raw, raw, (unsigned)dv, raw, dreg * 16, raw, in->next);
   else if (t->lb[dv] == E_LB_BOOL)
     fprintf(
         f,
         "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_BOOL, 0)) "
-        "{ AOT_SET_B(ctx, fr, %d, %s); goto dx_%d; }\n"
+        "{ AOT_SET_B(ctx, fr, %d, %s); E_GOTO(dx, %d); }\n"
         "        b%u = JS_VALUE_GET_BOOL(%s);\n",
         raw, dreg * 16, raw, in->next, (unsigned)dv, raw);
   else
@@ -10946,10 +11982,18 @@ static Q2ValueId e_region_root(const Q2Func *fn, const Q2Insn *in) {
    leaves. */
 /* Whether the function stores to any array element: a region in a function that only reads needs no hole test at its start, since every read tests the
    element it loads for the hole marker, and an array with holes that the program never reads a hole of (a preallocated, then filled one) is fine. */
-static int e_fn_elem_stores(const Q2Func *fn) {
+static __attribute__((unused)) int e_fn_elem_stores(const Q2Func *fn) {
   int i;
   for (i = 0; i < fn->ninsns; i++)
     if (fn->insns[i].rop == ROP_put_element || fn->insns[i].rop == ROP_put_element_xfer) return 1;
+  return 0;
+}
+/* ... and the narrower question a read region needs: whether any element store goes through the same region root. A store through another value that
+   aliases the array starts its own region with the full hole test, which fails on an array with holes. */
+static int e_root_elem_stores(const Q2Func *fn, Q2ValueId root) {
+  int i;
+  for (i = 0; i < fn->ninsns; i++)
+    if ((fn->insns[i].rop == ROP_put_element || fn->insns[i].rop == ROP_put_element_xfer) && e_region_root(fn, &fn->insns[i]) == root) return 1;
   return 0;
 }
 static int g_e_region_ro;
@@ -11030,7 +12074,7 @@ static void e_arr_region_start_grp(FILE *f, Q2ValueId av, Q2ValueId root, const 
   else if (grp == E_GRP_PK_F64)
     e_arr_region_start_pk(f, av, root, fail, 2);
   else {
-    g_e_region_ro = g_e_glay_fn != NULL && !e_fn_elem_stores(g_e_glay_fn) && getenv("QJS_AOT_REGION_HOLECHK") == NULL;
+    g_e_region_ro = g_e_glay_fn != NULL && !e_root_elem_stores(g_e_glay_fn, root) && getenv("QJS_AOT_REGION_HOLECHK") == NULL;
     e_arr_region_start(f, av, root, fail);
     g_e_region_ro = 0;
   }
@@ -11053,7 +12097,7 @@ static void e_cell_hoist_check(FILE *f, int site, int group, const char *kind, i
         wr ? "q2_cell_wshape" : "q2_cell_shape", site, group);
   else
     fprintf(
-        f, "      if (__builtin_expect(%s(pic, %d) != gsh%d, 0)) goto vx_%d;\n",
+        f, "      if (__builtin_expect(%s(pic, %d) != gsh%d, 0)) E_GOTO(vx, %d);\n",
         wr ? "q2_cell_wshape" : "q2_cell_shape", site, group, pc);
 }
 
@@ -11067,7 +12111,7 @@ static int e_region_index(
   if (t->lb[kv] == E_LB_TAG) {
     fprintf(
         f,
-        "      if (__builtin_expect(JS_VALUE_GET_TAG(v%u) != JS_TAG_INT, 0)) goto vx_%d;\n"
+        "      if (__builtin_expect(JS_VALUE_GET_TAG(v%u) != JS_TAG_INT, 0)) E_GOTO(vx, %d);\n"
         "      uint32_t _i = (uint32_t)JS_VALUE_GET_INT(v%u);\n",
         (unsigned)kv, pc, (unsigned)kv);
     return 1;
@@ -11117,37 +12161,34 @@ static int emit_ta_region_read(
   dreg = fn->values[dv].reg;
   if (dreg < 0 || dreg >= fn->nregs) return 0;
   root = e_region_root(fn, in);
-  snprintf(fail, sizeof(fail), "goto vx_%d", in->pc);
+  snprintf(fail, sizeof(fail), "E_GOTO(vx, %d)", in->pc);
   e_group_exit_stub(f, in, cur, av);
   e_sweep_guard(f, "vx", in->pc);
   fprintf(f, "    {\n");
   if (!g_e_facts->arrskip[idx]) e_arr_region_start_cls(f, av, root, fail, cls);
   e_region_index(f, t, kv, in->pc);
-  fprintf(
-      f,
-      "      if (__builtin_expect(_i >= an%u, 0)) goto vx_%d;\n"
-      "      %s _x = ((const %s *)ap%u)[_i];\n",
-      (unsigned)root, in->pc, ti.ctype, ti.ctype, (unsigned)root);
+  if (!g_e_facts->bndskip[idx]) fprintf(f, "      if (__builtin_expect(_i >= an%u, 0)) E_GOTO(vx, %d);\n", (unsigned)root, in->pc);
+  fprintf(f, "      %s _x = ((const %s *)ap%u)[_i];\n", ti.ctype, ti.ctype, (unsigned)root);
   if (t->lb[dv] == E_LB_I32) {
     if (ti.is_float)
       fprintf(
           f,
           "      { double _d = (double)_x; int32_t _y;\n"
-          "        if (__builtin_expect(!(_d >= -2147483648.0 && _d <= 2147483647.0), 0)) goto vx_%d;\n"
+          "        if (__builtin_expect(!(_d >= -2147483648.0 && _d <= 2147483647.0), 0)) E_GOTO(vx, %d);\n"
           "        _y = (int32_t)_d;\n"
-          "        if (__builtin_expect(!(_y == _d && !(_y == 0 && signbit(_d))), 0)) goto vx_%d;\n"
+          "        if (__builtin_expect(!(_y == _d && !(_y == 0 && signbit(_d))), 0)) E_GOTO(vx, %d);\n"
           "        i%u = _y; }\n",
           in->pc, in->pc, (unsigned)dv);
     else if (ti.is_u32)
       fprintf(
-          f, "      if (__builtin_expect(_x > 2147483647u, 0)) goto vx_%d;\n      i%u = (int32_t)_x;\n", in->pc,
+          f, "      if (__builtin_expect(_x > 2147483647u, 0)) E_GOTO(vx, %d);\n      i%u = (int32_t)_x;\n", in->pc,
           (unsigned)dv);
     else
       fprintf(f, "      i%u = (int32_t)_x;\n", (unsigned)dv);
   } else if (t->lb[dv] == E_LB_F64) {
     fprintf(f, "      d%u = (double)_x;\n", (unsigned)dv);
   } else if (t->lb[dv] == E_LB_BOOL) {
-    fprintf(f, "      goto vx_%d;\n", in->pc);
+    fprintf(f, "      E_GOTO(vx, %d);\n", in->pc);
   } else if (ti.is_float) {
     fprintf(f, "      v%u = E_TA_F64((double)_x);\n", (unsigned)dv);
   } else if (ti.is_u32) {
@@ -11177,13 +12218,13 @@ static int emit_ta_region_write(
     return 0;
   if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG) return 0;
   root = e_region_root(fn, in);
-  snprintf(fail, sizeof(fail), "goto vx_%d", in->pc);
+  snprintf(fail, sizeof(fail), "E_GOTO(vx, %d)", in->pc);
   e_group_exit_stub(f, in, cur, av);
   e_sweep_guard(f, "vx", in->pc);
   fprintf(f, "    {\n");
   if (!g_e_facts->arrskip[idx]) e_arr_region_start_cls(f, av, root, fail, cls);
   e_region_index(f, t, kv, in->pc);
-  fprintf(f, "      if (__builtin_expect(_i >= an%u, 0)) goto vx_%d;\n", (unsigned)root, in->pc);
+  if (!g_e_facts->bndskip[idx]) fprintf(f, "      if (__builtin_expect(_i >= an%u, 0)) E_GOTO(vx, %d);\n", (unsigned)root, in->pc);
   if (t->lb[vv] == E_LB_I32) {
     snprintf(ex, sizeof(ex), "i%u", (unsigned)vv);
     e_ta_store_stmt(f, &ti, (unsigned)root, 0, ex);
@@ -11200,7 +12241,7 @@ static int emit_ta_region_write(
     fprintf(f, "      } else if (JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64) {\n", (unsigned)vv);
     fprintf(f, "        double _xd = JS_VALUE_GET_FLOAT64(v%u);\n", (unsigned)vv);
     e_ta_store_stmt(f, &ti, (unsigned)root, 1, "_xd");
-    fprintf(f, "      } else goto vx_%d;\n", in->pc);
+    fprintf(f, "      } else E_GOTO(vx, %d);\n", in->pc);
   } else {
     return 0;
   }
@@ -11230,13 +12271,14 @@ static int emit_pk_region_read(
   dreg = fn->values[dv].reg;
   if (dreg < 0 || dreg >= fn->nregs) return 0;
   root = e_region_root(fn, in);
-  snprintf(fail, sizeof(fail), "goto vx_%d", in->pc);
+  snprintf(fail, sizeof(fail), "E_GOTO(vx, %d)", in->pc);
   e_group_exit_stub(f, in, cur, av);
   e_sweep_guard(f, "vx", in->pc);
   fprintf(f, "    {\n");
   if (!g_e_facts->arrskip[idx]) e_arr_region_start_pk(f, av, root, fail, kind);
   e_region_index(f, t, kv, in->pc);
-  fprintf(f, "      if (__builtin_expect(_i >= pkn%u, 0)) goto vx_%d;\n", (unsigned)root, in->pc);
+  if (!g_e_facts->bndskip[idx] && !e_bnd_skipped(fn, in)) fprintf(f, "      if (__builtin_expect(_i >= pkn%u, 0)) E_GOTO(vx, %d);\n", (unsigned)root, in->pc);
+  else if (e_bnd_skipped(fn, in)) fprintf(f, "      __builtin_assume((int32_t)_i >= 0);\n");
   if (kind == 1) {
     /* the element is an int32: every result representation can hold it */
     fprintf(f, "      { int32_t _x = ((const int32_t *)pkp%u)[_i];\n", (unsigned)root);
@@ -11245,7 +12287,7 @@ static int emit_pk_region_read(
     else if (t->lb[dv] == E_LB_F64)
       fprintf(f, "        d%u = (double)_x; }\n", (unsigned)dv);
     else if (t->lb[dv] == E_LB_BOOL)
-      fprintf(f, "        goto vx_%d; }\n", in->pc);
+      fprintf(f, "        E_GOTO(vx, %d); }\n", in->pc);
     else
       fprintf(f, "        v%u = JS_MKVAL(JS_TAG_INT, _x); }\n", (unsigned)dv);
   } else {
@@ -11256,18 +12298,19 @@ static int emit_pk_region_read(
       fprintf(
           f,
           "        int32_t _y = (int32_t)_x;\n"
-          "        if (__builtin_expect(!(_y == _x && !(_y == 0 && signbit(_x))), 0)) goto vx_%d;\n"
+          "        if (__builtin_expect(!(_y == _x && !(_y == 0 && signbit(_x))), 0)) E_GOTO(vx, %d);\n"
           "        i%u = _y; }\n",
           in->pc, (unsigned)dv);
     else if (t->lb[dv] == E_LB_F64)
       fprintf(f, "        d%u = _x; }\n", (unsigned)dv);
     else if (t->lb[dv] == E_LB_BOOL)
-      fprintf(f, "        goto vx_%d; }\n", in->pc);
+      fprintf(f, "        E_GOTO(vx, %d); }\n", in->pc);
     else
       fprintf(f, "        v%u = E_BOX_F64(_x); }\n", (unsigned)dv);
   }
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
+  if (t->lb[kv] == E_LB_I32) e_idx_mark(kv);
   g_e_miss_exit_seen = 1;
   return 1;
 }
@@ -11292,50 +12335,49 @@ static int emit_elem_region_read(
   dreg = fn->values[dv].reg;
   if (dreg < 0 || dreg >= fn->nregs) return 0;
   root = e_region_root(fn, in);
-  snprintf(fail, sizeof(fail), "goto vx_%d", in->pc);
+  snprintf(fail, sizeof(fail), "E_GOTO(vx, %d)", in->pc);
   e_group_exit_stub(f, in, cur, av);
   e_sweep_guard(f, "vx", in->pc);
   fprintf(f, "    {\n");
   if (!g_e_facts->arrskip[idx]) {
-    g_e_region_ro = !e_fn_elem_stores(fn) && getenv("QJS_AOT_REGION_HOLECHK") == NULL;
+    g_e_region_ro = !e_root_elem_stores(fn, root) && getenv("QJS_AOT_REGION_HOLECHK") == NULL;
     e_arr_region_start(f, av, root, fail);
     g_e_region_ro = 0;
   }
   e_region_index(f, t, kv, in->pc);
-  fprintf(
-      f,
-      "      if (__builtin_expect(_i >= an%u, 0)) goto vx_%d;\n"
-      "      JSValue _e = ap%u[_i];\n",
-      (unsigned)root, in->pc, (unsigned)root);
+  if (!g_e_facts->bndskip[idx] && !e_bnd_skipped(fn, in)) fprintf(f, "      if (__builtin_expect(_i >= an%u, 0)) E_GOTO(vx, %d);\n", (unsigned)root, in->pc);
+  else if (e_bnd_skipped(fn, in)) fprintf(f, "      __builtin_assume((int32_t)_i >= 0);\n");
+  fprintf(f, "      JSValue _e = ap%u[_i];\n", (unsigned)root);
   if (t->lb[dv] == E_LB_I32)
     fprintf(
         f,
-        "      if (__builtin_expect(!Q2_I32_OK(_e, i%u), 0)) goto vx_%d;\n",
+        "      if (__builtin_expect(!Q2_I32_OK(_e, i%u), 0)) E_GOTO(vx, %d);\n",
         (unsigned)dv, in->pc);
   else if (t->lb[dv] == E_LB_F64)
     fprintf(
         f,
         "      if (JS_VALUE_GET_TAG(_e) == JS_TAG_INT) d%u = (double)JS_VALUE_GET_INT(_e);\n"
         "      else if (JS_VALUE_GET_TAG(_e) == JS_TAG_FLOAT64) d%u = JS_VALUE_GET_FLOAT64(_e);\n"
-        "      else goto vx_%d;\n",
+        "      else E_GOTO(vx, %d);\n",
         (unsigned)dv, (unsigned)dv, in->pc);
   else if (t->lb[dv] == E_LB_BOOL)
     fprintf(
         f,
-        "      if (__builtin_expect(JS_VALUE_GET_TAG(_e) != JS_TAG_BOOL, 0)) goto vx_%d;\n"
+        "      if (__builtin_expect(JS_VALUE_GET_TAG(_e) != JS_TAG_BOOL, 0)) E_GOTO(vx, %d);\n"
         "      b%u = JS_VALUE_GET_BOOL(_e);\n",
         in->pc, (unsigned)dv);
   else {
     /* Any element but a hole (and a lazy marker while one can exist). */
     fprintf(
         f,
-        "      if (__builtin_expect(JS_VALUE_GET_TAG(_e) == JS_TAG_UNINITIALIZED%s, 0)) goto vx_%d;\n"
+        "      if (__builtin_expect(JS_VALUE_GET_TAG(_e) == JS_TAG_UNINITIALIZED%s, 0)) E_GOTO(vx, %d);\n"
         "      v%u = _e;\n",
         g_e_nolazy ? "" : " || JS_VALUE_GET_TAG(_e) == QJS_AOT_TAG_LAZY_JSON", in->pc,
         (unsigned)dv);
   }
   fprintf(f, "    }\n");
   if (cur != NULL) cur[dreg] = dv;
+  if (t->lb[kv] == E_LB_I32) e_idx_mark(kv);
   g_e_miss_exit_seen = 1;
   return 1;
 }
@@ -11354,13 +12396,14 @@ static int emit_pk_region_write(
     return 0;
   if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG) return 0;
   root = e_region_root(fn, in);
-  snprintf(fail, sizeof(fail), "goto vx_%d", in->pc);
+  snprintf(fail, sizeof(fail), "E_GOTO(vx, %d)", in->pc);
   e_group_exit_stub(f, in, cur, av);
   e_sweep_guard(f, "vx", in->pc);
   fprintf(f, "    {\n");
   if (!g_e_facts->arrskip[idx]) e_arr_region_start_pk(f, av, root, fail, kind);
   e_region_index(f, t, kv, in->pc);
-  fprintf(f, "      if (__builtin_expect(_i >= pkn%u, 0)) goto vx_%d;\n", (unsigned)root, in->pc);
+  if (!g_e_facts->bndskip[idx] && !e_bnd_skipped(fn, in)) fprintf(f, "      if (__builtin_expect(_i >= pkn%u, 0)) E_GOTO(vx, %d);\n", (unsigned)root, in->pc);
+  else if (e_bnd_skipped(fn, in)) fprintf(f, "      __builtin_assume((int32_t)_i >= 0);\n");
   if (kind == 1) {
     if (t->lb[vv] == E_LB_I32)
       fprintf(f, "      ((int32_t *)pkp%u)[_i] = i%u;\n", (unsigned)root, (unsigned)vv);
@@ -11372,15 +12415,15 @@ static int emit_pk_region_write(
       fprintf(
           f,
           "      { double _d = d%u; int32_t _y;\n"
-          "        if (__builtin_expect(!(_d >= -2147483648.0 && _d <= 2147483647.0), 0)) goto vx_%d;\n"
+          "        if (__builtin_expect(!(_d >= -2147483648.0 && _d <= 2147483647.0), 0)) E_GOTO(vx, %d);\n"
           "        _y = (int32_t)_d;\n"
-          "        if (__builtin_expect(!(_y == _d && !(_y == 0 && signbit(_d))), 0)) goto vx_%d;\n"
+          "        if (__builtin_expect(!(_y == _d && !(_y == 0 && signbit(_d))), 0)) E_GOTO(vx, %d);\n"
           "        ((int32_t *)pkp%u)[_i] = _y; }\n",
           (unsigned)vv, in->pc, in->pc, (unsigned)root);
     else if (t->lb[vv] == E_LB_TAG)
       fprintf(
           f,
-          "      if (__builtin_expect(JS_VALUE_GET_TAG(v%u) != JS_TAG_INT, 0)) goto vx_%d;\n"
+          "      if (__builtin_expect(JS_VALUE_GET_TAG(v%u) != JS_TAG_INT, 0)) E_GOTO(vx, %d);\n"
           "      ((int32_t *)pkp%u)[_i] = JS_VALUE_GET_INT(v%u);\n",
           (unsigned)vv, in->pc, (unsigned)root, (unsigned)vv);
     else
@@ -11397,13 +12440,14 @@ static int emit_pk_region_write(
           f,
           "      if (__builtin_expect(JS_VALUE_GET_TAG(v%u) == JS_TAG_INT, 0)) ((double *)pkp%u)[_i] = (double)JS_VALUE_GET_INT(v%u);\n"
           "      else if (JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64) ((double *)pkp%u)[_i] = JS_VALUE_GET_FLOAT64(v%u);\n"
-          "      else goto vx_%d;\n",
+          "      else E_GOTO(vx, %d);\n",
           (unsigned)vv, (unsigned)root, (unsigned)vv, (unsigned)vv, (unsigned)root, (unsigned)vv, in->pc);
     else
       return 0;
   }
   fprintf(f, "    }\n");
   e_inl_store_mark(f);
+  if (t->lb[kv] == E_LB_I32) e_idx_mark(kv);
   g_e_miss_exit_seen = 1;
   return 1;
 }
@@ -11434,32 +12478,52 @@ static int emit_elem_region_write(
   else
     return 0;
   root = e_region_root(fn, in);
-  snprintf(fail, sizeof(fail), "goto vx_%d", in->pc);
+  snprintf(fail, sizeof(fail), "E_GOTO(vx, %d)", in->pc);
   e_group_exit_stub(f, in, cur, av);
   e_sweep_guard(f, "vx", in->pc);
   fprintf(f, "    {\n");
   if (!g_e_facts->arrskip[idx]) e_arr_region_start(f, av, root, fail);
   e_region_index(f, t, kv, in->pc);
-  fprintf(
-      f,
-      "      if (__builtin_expect(_i >= an%u, 0)) goto vx_%d;\n"
-      "      JSValue *_s = &ap%u[_i];\n"
-      "      if (__builtin_expect((JS_VALUE_GET_TAG(*_s) & ~(int)(JS_TAG_FLOAT64 | JS_TAG_BOOL)) != 0, 0)) goto vx_%d;\n"
-      "      { JSValue _nv = %s;\n",
-      (unsigned)root, in->pc, (unsigned)root, in->pc, vb);
+  if (!g_e_facts->bndskip[idx] && !e_bnd_skipped(fn, in)) fprintf(f, "      if (__builtin_expect(_i >= an%u, 0)) E_GOTO(vx, %d);\n", (unsigned)root, in->pc);
+  else if (e_bnd_skipped(fn, in)) fprintf(f, "      __builtin_assume((int32_t)_i >= 0);\n");
+  fprintf(f, "      JSValue *_s = &ap%u[_i];\n", (unsigned)root);
+  /* The slot being overwritten is known to hold a number or boolean when an earlier load or store of this very element in the region put one there. */
+  {
+    int ow = g_e_facts->oldelem[idx] - 1;
+    int known = ow >= 0 && ow < t->nvalues && (t->lb[ow] == E_LB_I32 || t->lb[ow] == E_LB_F64 || t->lb[ow] == E_LB_BOOL);
+    if (!known)
+      fprintf(f, "      if (__builtin_expect((JS_VALUE_GET_TAG(*_s) & ~(int)(JS_TAG_FLOAT64 | JS_TAG_BOOL)) != 0, 0)) E_GOTO(vx, %d);\n", in->pc);
+  }
+  fprintf(f, "      { JSValue _nv = %s;\n", vb);
   if (t->lb[vv] == E_LB_TAG)
-    fprintf(f, "        if (__builtin_expect(JS_VALUE_GET_TAG(_nv) < 0, 0)) goto vx_%d;\n", in->pc);
+    fprintf(f, "        if (__builtin_expect(JS_VALUE_GET_TAG(_nv) < 0, 0)) E_GOTO(vx, %d);\n", in->pc);
   fprintf(f, "        *_s = _nv; }\n    }\n");
   e_inl_store_mark(f);
+  if (t->lb[kv] == E_LB_I32) e_idx_mark(kv);
   g_e_miss_exit_seen = 1;
   return 1;
 }
 
 /* The slot accessor of a grouped read: the receiver's own slots, or the holder's for a
    prototype read. */
+/* Direct field addressing: the slots of a contracted layout's object are at a fixed offset from the object, with no test (the engine keeps the promise:
+   an object that enters the layout's shape with its properties elsewhere breaks the layout, and a body that relied on it is left at its entry). Off by default: it
+   needs an engine built with QJS_AOT_DIRECT_FIELDS (the enter hook that keeps the promise), and QJS_AOT_FIELDS_DIRECT=1 turns it on. */
+static int e_direct(void) {
+  static int d = -1;
+  if (d < 0) d = getenv("QJS_AOT_FIELDS_DIRECT") != NULL && getenv("QJS_AOT_NODIRECT") == NULL;
+  return d;
+}
+static const char *e_gslot(int g) { return e_direct() && e_group_layout(g) != 0 ? "q2_slotd" : "q2_slotp"; }
+static int e_site_direct(int site) {
+  int g;
+  if (!e_direct() || g_e_facts == NULL) return 0;
+  g = e_facts_site_group(g_e_facts, site);
+  return g >= 0 && e_group_layout(g) != 0;
+}
 static const char *e_slotfn(int site) {
   int pr = g_e_facts != NULL ? e_facts_site_proto(g_e_facts, site) : 0;
-  return pr == 2 ? "q2_hslot2p" : pr == 1 ? "q2_hslotp" : "q2_slotp";
+  return pr == 2 ? "q2_hslot2p" : pr == 1 ? "q2_hslotp" : e_site_direct(site) ? "q2_slotd" : "q2_slotp";
 }
 /* The cache entry index of a site's cell: the site itself, or for a holder two prototypes up
    the way the entry was found in at entry. */
@@ -11646,6 +12710,16 @@ static void e_group_test(
     g_e_n_shape++;
 }
 
+/* The first slot access of a contracted-layout receiver in a block loads its property array pointer into `pp<N>`;
+   the block's later accesses of the receiver use it. */
+static void e_pp_block_define(FILE *f, int g, const char *recv) {
+  unsigned n;
+  if (g_e_ppblk == NULL || g_e_blk < 0 || e_group_layout(g) == 0 || e_pp_of(recv) >= 0) return;
+  if (recv[0] != 'v' || sscanf(recv + 1, "%u", &n) != 1 || (int)n >= g_e_spill_nv) return;
+  fprintf(f, "      pp%u = %s(%s);\n", n, e_direct() ? "q2_propd" : "q2_propp", recv);
+  g_e_ppblk[n] = g_e_blk + 1;
+}
+
 /* A grouped field READ: tag and shape test (unless implied), the slot load at
    the group's offset, the lazy-JSON test; every failure exits before the
    instruction. */
@@ -11663,23 +12737,25 @@ static int emit_group_read(
   if (!skip && (g_e_facts->claimskip[e_insn_idx(fn, in)] & 1)) skip = 2;
   e_group_test(test, sizeof(test), skip, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g, site, 0);
   fprintf(f, "    { JSValue _f;\n");
-  fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
+  fprintf(f, "      if (__builtin_expect(%s, 0)) E_GOTO(vx, %d);\n", test, in->pc);
   {
     char off[96];
     e_slot_off(off, sizeof(off), g, site);
     if (e_mc_index(site) >= 0)
       fprintf(f, "      _f = mcv%d;\n", e_mc_index(site));
-    else
+    else {
+      if (e_facts_site_proto(g_e_facts, site) == 0) e_pp_block_define(f, g, recv);
       if (e_pp_of(recv) >= 0)
         fprintf(f, "      _f = *q2_slotpp(pp%d, %s);\n", e_pp_of(recv), off);
       else
         fprintf(f, "      _f = *%s(%s, %s);\n", e_slotfn(site), recv, off);
+    }
   }
   if (!g_e_nolazy)
     fprintf(
       f,
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == "
-      "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
+      "QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n",
       in->pc);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
     fprintf(
@@ -11714,7 +12790,7 @@ static int emit_group_chain(
   } else {
     char off[96];
     e_group_test(test, sizeof(test), (g_e_facts->skip[e_insn_idx(fn, in)] & 1) ? 1 : (g_e_facts->claimskip[e_insn_idx(fn, in)] & 1) ? 2 : 0, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g1, s1, 0);
-    fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
+    fprintf(f, "      if (__builtin_expect(%s, 0)) E_GOTO(vx, %d);\n", test, in->pc);
     e_slot_off(off, sizeof(off), g1, s1);
     fprintf(f, "      _c0 = *%s(%s, %s);\n", e_slotfn(s1), recv, off);
   }
@@ -11722,10 +12798,10 @@ static int emit_group_chain(
     fprintf(
       f,
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_c0) == "
-      "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
+      "QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n",
       in->pc);
   e_group_test(test, sizeof(test), ((g_e_facts->skip[e_insn_idx(fn, in)] >> 1) & 1) ? 1 : ((g_e_facts->claimskip[e_insn_idx(fn, in)] >> 1) & 1) ? 2 : 0, (g_e_facts->cellskip[e_insn_idx(fn, in)] >> 1) & 1, "_c0", g2, s2, 0);
-  fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
+  fprintf(f, "      if (__builtin_expect(%s, 0)) E_GOTO(vx, %d);\n", test, in->pc);
   {
     char off[96];
     e_slot_off(off, sizeof(off), g2, s2);
@@ -11738,7 +12814,7 @@ static int emit_group_chain(
     fprintf(
       f,
       "      if (__builtin_expect(JS_VALUE_GET_TAG(_c1) == "
-      "QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n",
+      "QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n",
       in->pc);
   fprintf(f, "      v%u = _c0;\n", (unsigned)d0v);
   if (e_mc_index(s2) >= 0 && t->lb[d1v] == E_LB_TAG) e_mc_def(d1v, e_mc_index(s2));
@@ -11859,7 +12935,7 @@ static int e_claim_store_check(
     if (qjs_aot_layout_site(dg, osite, &l, &sl)) {
       int c = qjs_aot_layout_claim_of(l, sl);
       if (c != 0)
-        fprintf(f, "      if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) goto vx_%d;\n", c, pc);
+        fprintf(f, "      if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) E_GOTO(vx, %d);\n", c, pc);
       return c;
     }
   }
@@ -11873,7 +12949,7 @@ static int e_claim_store_check(
     if (ks >= 0) {
       int c = qjs_aot_layout_claim_of(e_group_ret(g), ks);
       if (c != 0)
-        fprintf(f, "      if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) goto vx_%d;\n", c, pc);
+        fprintf(f, "      if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) E_GOTO(vx, %d);\n", c, pc);
       return c;
     }
   }
@@ -11884,7 +12960,7 @@ static int e_claim_store_check(
       if (qjs_aot_layout_site(dg3, osite, &l, &sl) && l == l3) {
         int c = qjs_aot_layout_claim_of(l, sl);
         if (c != 0)
-          fprintf(f, "      if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) goto vx_%d;\n", c, pc);
+          fprintf(f, "      if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) E_GOTO(vx, %d);\n", c, pc);
         return c;
       }
     } else {
@@ -11893,12 +12969,13 @@ static int e_claim_store_check(
   } else if (e_group_claim_refused(g)) {
     return 0;
   }
-  fprintf(f, "      if (__builtin_expect(Q2_CLAIM_BAD(%s, %s, _nv), 0)) goto vx_%d;\n", recv, off, pc);
+  fprintf(f, "      if (__builtin_expect(Q2_CLAIM_BAD(%s, %s, _nv), 0)) E_GOTO(vx, %d);\n", recv, off, pc);
   return 0;
 }
 
 /* A grouped field WRITE: the same tests, plus the prototype flag, then the
    engine's own store order (duplicate the new value, store, free the old one). */
+int qjs_aot_store_xfer(const uint8_t dg[16], int site);
 static int emit_group_write(
     FILE *f, const Q2Func *fn, const Q2Insn *in, Q2ValueId *cur, int g,
     int site, Q2ValueId rv, const char *boxed) {
@@ -11914,25 +12991,40 @@ static int emit_group_write(
   e_group_exit_stub(f, in, cur, rv);
   if (!skip && (g_e_facts->claimskip[e_insn_idx(fn, in)] & 1)) skip = 2;
   e_group_test(test, sizeof(test), skip, g_e_facts->cellskip[e_insn_idx(fn, in)] & 1, recv, g, site, 1);
+  /* A transition store (QJS_AOT_ADDXFER=1): a receiver that does not have the group's shape takes the cached add replay (which runs the
+     layout claim check when the new shape enters a layout), and leaves only when that does not hold either. The store is then not a fact
+     about the receiver's shape (see the facts), and a store of a copy with an undo log is not one (an add cannot be put back). */
+  {
+    int osite_;
+    const uint8_t *dg_ = e_site_dg(fn, site, &osite_);
+    int undo_ = in->own > 0 && g_e_undo_id != NULL && g_e_undo_id[e_insn_idx(fn, in)] >= 0;
+    if (!skip && !undo_ && e_group_layout(g) != 0 && strcmp(test, "0") != 0 && qjs_aot_store_xfer(dg_, osite_)) {
+      fprintf(f, "    if (__builtin_expect(%s, 0)) {\n", test);
+      fprintf(f, "      JSValue _xv = %s;\n", boxed);
+      fprintf(f, "      if (__builtin_expect(Q2_FORCE_MISS || !q2_put_add(ctx, pic, holders, q2_ns, %s, %d, _xv), 0)) E_GOTO(vx, %d);\n", recv, site, in->pc);
+      fprintf(f, "    } else\n");
+    }
+  }
   fprintf(f, "    {\n");
   /* A store into a contracted layout tests that the layout has no prototype object once on a path,
      by its bit; the test the engine's prototype flag would give is then redundant. */
   if (np == 1 && e_layterm_epoch()) {
     /* every safepoint of the body is followed by an epoch comparison, which a layout break moves */
     g_e_layterm_dropped++;
-    fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
+    fprintf(f, "      if (__builtin_expect(%s, 0)) E_GOTO(vx, %d);\n", test, in->pc);
   } else if (np == 1) {
     g_e_layterm_kept++;
     fprintf(
-        f, "      if (__builtin_expect(%s || (Q2_LAYOUT_BROKEN(ctx) & 0x%llxull), 0)) goto vx_%d;\n",
+        f, "      if (__builtin_expect(%s || (Q2_LAYOUT_BROKEN(ctx) & 0x%llxull), 0)) E_GOTO(vx, %d);\n",
         test, 1ULL << (e_group_layout(g) - 1), in->pc);
   }
   else if (np == 2)
-    fprintf(f, "      if (__builtin_expect(%s, 0)) goto vx_%d;\n", test, in->pc);
+    fprintf(f, "      if (__builtin_expect(%s, 0)) E_GOTO(vx, %d);\n", test, in->pc);
   else
     fprintf(
-        f, "      if (__builtin_expect(%s || q2_is_proto(%s), 0)) goto vx_%d;\n",
+        f, "      if (__builtin_expect(%s || q2_is_proto(%s), 0)) E_GOTO(vx, %d);\n",
         test, recv, in->pc);
+  e_pp_block_define(f, g, recv);
   if (in->own > 0 && g_e_undo_id != NULL && g_e_undo_id[e_insn_idx(fn, in)] >= 0) {
     /* a store of a copied callee: kept so that a way out of the copy can put it back */
     int id = g_e_undo_id[e_insn_idx(fn, in)];
@@ -11940,13 +13032,13 @@ static int emit_group_write(
     (void)e_claim_store_check(f, fn, g, site, recv, woff, in->pc);
     fprintf(
         f,
-        "      JSValue *_sp = q2_slotp(%s, %s);\n"
+        "      JSValue *_sp = %s(%s, %s);\n"
         "      uo%d = *_sp;\n"
         "      us%d = _sp;\n"
         "      q2_dup(_nv);\n"
         "      *_sp = _nv;\n"
         "      un%d = _nv;\n",
-        recv, woff, id, id, id);
+        e_gslot(g), recv, woff, id, id, id);
     fprintf(f, "    }\n");
     if (g_e_undo_seq_n < 256) {
       g_e_undo_seq[g_e_undo_seq_n] = id;
@@ -11968,7 +13060,7 @@ static int emit_group_write(
     if (e_pp_of(recv) >= 0)
       fprintf(f, "      *q2_slotpp(pp%d, %s) = _nv;\n", e_pp_of(recv), woff);
     else
-      fprintf(f, "      *q2_slotp(%s, %s) = _nv;\n", recv, woff);
+      fprintf(f, "      *%s(%s, %s) = _nv;\n", e_gslot(g), recv, woff);
     fprintf(f, "    }\n");
     e_inl_store_mark(f);
     g_e_miss_exit_seen = 1;
@@ -11980,7 +13072,7 @@ static int emit_group_write(
     const int ov = g_e_facts->oldval[e_insn_idx(fn, in)] - 1;
     if (ov >= 0 && g_e_types != NULL && (unsigned)ov < (unsigned)g_e_types->nvalues &&
         (g_e_types->lb[ov] == E_LB_I32 || g_e_types->lb[ov] == E_LB_F64 || g_e_types->lb[ov] == E_LB_BOOL)) {
-      fprintf(f, "      *q2_slotp(%s, %s) = _nv;\n", recv, woff);
+      fprintf(f, "      *%s(%s, %s) = _nv;\n", e_gslot(g), recv, woff);
       fprintf(f, "    }\n");
       e_inl_store_mark(f);
       g_e_miss_exit_seen = 1;
@@ -11988,12 +13080,12 @@ static int emit_group_write(
     }
     fprintf(
         f,
-        "      JSValue *_sp = q2_slotp(%s, %s);\n"
+        "      JSValue *_sp = %s(%s, %s);\n"
         "      JSValue _old = *_sp;\n"
         "      *_sp = _nv;\n"
         "      if (__builtin_expect(Q2_HRC(_old), 0)) "
         "JS_FreeValue(ctx, _old);\n",
-        recv, woff);
+        e_gslot(g), recv, woff);
   } else {
     int ov = g_e_facts->oldval[e_insn_idx(fn, in)] - 1;
     int oid = g_e_own_id != NULL ? g_e_own_id[e_insn_idx(fn, in)] : -1;
@@ -12040,7 +13132,7 @@ static void e_poly_chain(FILE *f, const char *recv, int site, int atom_off, int 
       f,
       "      const void *_pe = q2_poly(f, %d), *_psh = q2_shape_of(%s);\n"
       "      uint32_t _po = 0;\n"
-      "      if (__builtin_expect(_psh == NULL, 0)) goto vx_%d;\n"
+      "      if (__builtin_expect(_psh == NULL, 0)) E_GOTO(vx, %d);\n"
       "      if (_pe != NULL && (\n",
       site, recv, pc);
   for (k = 0; k < 4; k++) {
@@ -12065,7 +13157,7 @@ static void e_poly_chain(FILE *f, const char *recv, int site, int atom_off, int 
       "          )) { }\n"
       "      else if (__builtin_expect(!qjs_aot_poly_fill(ctx, f, %d, %s,\n"
       "                   (int)qjs_aot_ld_u32(q2_code(f) + %d), %d, &_po), 0))\n"
-      "          goto vx_%d;\n",
+      "          E_GOTO(vx, %d);\n",
       site, recv, atom_off, write, pc);
 }
 
@@ -12085,7 +13177,7 @@ static int emit_poly_read(
   fprintf(
         f,
         "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) "
-        "goto vx_%d;\n",
+        "E_GOTO(vx, %d);\n",
         in->pc);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
     fprintf(stderr, "qjsaot: polymorphic read at pc %d: no guard for its def\n", in->pc);
@@ -12107,11 +13199,11 @@ static int emit_poly_write(
   fprintf(f, "    {\n");
   e_poly_chain(f, recv, site, in->arg[1].off, 1, in->pc);
   fprintf(
-      f, "      if (__builtin_expect(q2_is_proto(%s), 0)) goto vx_%d;\n", recv,
+      f, "      if (__builtin_expect(q2_is_proto(%s), 0)) E_GOTO(vx, %d);\n", recv,
       in->pc);
   fprintf(f, "      { JSValue _nv = %s;\n", boxed);
   if (qjs_aot_layout_claims_any())
-    fprintf(f, "        if (__builtin_expect(Q2_CLAIM_BAD(%s, _po, _nv), 0)) goto vx_%d;\n", recv, in->pc);
+    fprintf(f, "        if (__builtin_expect(Q2_CLAIM_BAD(%s, _po, _nv), 0)) E_GOTO(vx, %d);\n", recv, in->pc);
   if (boxed[0] != 'v') {
     fprintf(
         f,
@@ -12175,9 +13267,9 @@ static int emit_inl_field_write(
         fprintf(f, "      } else ");
         goto lean_done;
       }
-      fprintf(f, "        if (__builtin_expect(q2_is_proto(%s), 0)) goto vx_%d;\n", recv, in->pc);
+      fprintf(f, "        if (__builtin_expect(q2_is_proto(%s), 0)) E_GOTO(vx, %d);\n", recv, in->pc);
       if (c != 0)
-        fprintf(f, "        if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) goto vx_%d;\n", c, in->pc);
+        fprintf(f, "        if (__builtin_expect(!q2_claim_val_ok(%du, _nv), 0)) E_GOTO(vx, %d);\n", c, in->pc);
       if (c == 0x80)
         fprintf(f, "        *q2_slotp(%s, %uu * QJS_AOT_SIZEOF_JSPROPERTY) = _nv;\n", recv, (unsigned)sl);
       else
@@ -12197,7 +13289,7 @@ static int emit_inl_field_write(
              "holders, q2_ns, %s, %d, _nv), 0)) {\n",
           recv, site);
   fprintf(f, "      } else {\n");
-  fprintf(f, "        goto vx_%d;\n", in->pc);
+  fprintf(f, "        E_GOTO(vx, %d);\n", in->pc);
   fprintf(f, "      }\n");
   fprintf(f, "    }\n");
   e_inl_store_mark(f);
@@ -12310,7 +13402,7 @@ static int emit_typed_field_read(
     } else {
       fprintf(f, "    { JSValue _f = *q2_slotp(v%u, aoff_%d_%d);\n", (unsigned)rv, in->own - 1, site);
       if (!g_e_nolazy)
-        fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
+        fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n", in->pc);
     }
     if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
       fprintf(stderr, "qjsaot: arm read at pc %d: no guard for its def\n", in->pc);
@@ -12343,7 +13435,7 @@ static int emit_typed_field_read(
       fprintf(
           f,
           "      static Q2Lmt clmt_%d;\n"
-          "      if (__builtin_expect(Q2_FORCE_MISS || !q2_lmt_hit(ctx, &clmt_%d, v%u, qjs_aot_ld_u32(icode_%d + %d), &_f%s), 0)) goto vx_%d;\n",
+          "      if (__builtin_expect(Q2_FORCE_MISS || !q2_lmt_hit(ctx, &clmt_%d, v%u, qjs_aot_ld_u32(icode_%d + %d), &_f%s), 0)) E_GOTO(vx, %d);\n",
           in->pc, in->pc, (unsigned)rv, ik, in->arg[2].off, pmset, in->pc);
     } else {
       if (in->rop == ROP_get_field) {
@@ -12351,23 +13443,23 @@ static int emit_typed_field_read(
         fprintf(
             f,
             "      static Q2Slt cslt_%d; static Q2Lmt clmt_%d; uint32_t _o; const void *_pe;\n"
-            "      if (Q2_FORCE_MISS) goto vx_%d;\n"
+            "      if (Q2_FORCE_MISS) E_GOTO(vx, %d);\n"
             "      if (__builtin_expect(q2_slt_off(ctx, &cslt_%d, v%u, qjs_aot_ld_u32(icode_%d + %d), &_o), 1)) {\n"
             "        _f = *q2_slotp(v%u, _o);\n",
             in->pc, in->pc, in->pc, in->pc, (unsigned)rv, ik, in->arg[2].off, (unsigned)rv);
-        if (!g_e_nolazy) fprintf(f, "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
+        if (!g_e_nolazy) fprintf(f, "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n", in->pc);
         fprintf(
             f,
-            "      } else if (!q2_lmt_hit(ctx, &clmt_%d, v%u, qjs_aot_ld_u32(icode_%d + %d), &_f, &_pe)) goto vx_%d;\n",
+            "      } else if (!q2_lmt_hit(ctx, &clmt_%d, v%u, qjs_aot_ld_u32(icode_%d + %d), &_f, &_pe)) E_GOTO(vx, %d);\n",
             in->pc, (unsigned)rv, ik, in->arg[2].off, in->pc);
       } else {
         fprintf(
             f,
             "      static Q2Slt cslt_%d; uint32_t _o;\n"
-            "      if (__builtin_expect(Q2_FORCE_MISS || !q2_slt_off(ctx, &cslt_%d, v%u, qjs_aot_ld_u32(icode_%d + %d), &_o), 0)) goto vx_%d;\n"
+            "      if (__builtin_expect(Q2_FORCE_MISS || !q2_slt_off(ctx, &cslt_%d, v%u, qjs_aot_ld_u32(icode_%d + %d), &_o), 0)) E_GOTO(vx, %d);\n"
             "      _f = *q2_slotp(v%u, _o);\n",
             in->pc, in->pc, (unsigned)rv, ik, in->arg[2].off, in->pc, (unsigned)rv);
-        if (!g_e_nolazy) fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) goto vx_%d;\n", in->pc);
+        if (!g_e_nolazy) fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n", in->pc);
       }
     }
     if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
@@ -12449,7 +13541,7 @@ static int emit_typed_field_read(
   if (g_e_facts->pmexit[e_insn_idx(fn, in)]) {
     /* the facts took this load for no safepoint because its miss leaves */
     e_group_exit_stub(f, in, cur, rv);
-    fprintf(f, "        goto vx_%d;\n", in->pc);
+    fprintf(f, "        E_GOTO(vx, %d);\n", in->pc);
     g_e_miss_exit_seen = 1;
   } else if (g_e_fl && lmt_on) {
     /* a frameless body leaves when neither the site's cells nor the learned table serve the read */
@@ -12463,7 +13555,7 @@ static int emit_typed_field_read(
         "        if (q2_lmt_hit(ctx, &lmt_%d, v%u, qjs_aot_ld_u32(ecb + %d), &_f%s)) {\n",
         in->pc, in->pc, (unsigned)rv, in->arg[2].off, pmset);
     if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) return 0;
-    fprintf(f, "        } else goto vx_%d;\n", in->pc);
+    fprintf(f, "        } else E_GOTO(vx, %d);\n", in->pc);
   } else if (!g_e_fl && !g_e_quiet && in->arg[2].kind == 'a' && in->arg[2].off >= 0) {
     int lmt = lmt_on;
     if (lmt) {
@@ -12567,17 +13659,17 @@ static int emit_typed_arith_cpool(
     /* a zero product with a negative operand is -0, which no int32 holds */
     if (sub == REG_BIN_MUL)
       snprintf(nz, sizeof(nz),
-               "      if (__builtin_expect(_t == 0 && (i%u < 0 || %d < 0), 0)) goto ox_%d;\n",
+               "      if (__builtin_expect(_t == 0 && (i%u < 0 || %d < 0), 0)) E_GOTO(ox, %d);\n",
                (unsigned)a, ic, in->pc);
     e_sweep_guard(f, "ox", in->pc);
-    fprintf(
-        f,
-        "    { int64_t _t = (int64_t)i%u %s (int64_t)%d;\n"
-        "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
-        "goto ox_%d;\n"
-        "%s"
-        "      i%u = (int32_t)_t; }\n",
-        (unsigned)a, op, ic, in->pc, nz, (unsigned)d);
+    {
+      char an[24], cn[24];
+      snprintf(an, sizeof(an), "i%u", (unsigned)a);
+      snprintf(cn, sizeof(cn), "%d", ic);
+      if (sub == REG_BIN_DIV) fprintf(f, "    { int64_t _t = (int64_t)%s / (int64_t)%s;\n      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) E_GOTO(ox, %d);\n", an, cn, in->pc);
+      else e_arith_head(f, an, op, cn, 1, in->pc);
+    }
+    fprintf(f, "%s      i%u = (int32_t)_t; }\n", nz, (unsigned)d);
     e_note_stub(
         g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
     if (cur != NULL && ld >= 0 && ld < fn->nregs) cur[ld] = d;
@@ -12728,7 +13820,7 @@ static int emit_typed_bitwise(
       fprintf(
           f,
           "    { uint32_t _u = (uint32_t)%s >> ((uint32_t)%s & 31);\n"
-          "      if (__builtin_expect(_u > (uint32_t)INT32_MAX, 0)) goto ox_%d;\n"
+          "      if (__builtin_expect(_u > (uint32_t)INT32_MAX, 0)) E_GOTO(ox, %d);\n"
           "      i%u = (int32_t)_u; }\n",
           an, bn, in->pc, (unsigned)d);
       e_note_stub(g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
@@ -12785,7 +13877,7 @@ static int emit_typed_add_imm_branch(
       f,
       "    { int32_t _s;\n"
       "      if (__builtin_expect(__builtin_add_overflow(i%u, (int32_t)%d, &_s), 0))\n"
-      "        goto ox_%d;\n"
+      "        E_GOTO(ox, %d);\n"
       "      i%u = _s; }\n",
       (unsigned)a, imm, in->pc, (unsigned)d);
   e_note_stub(
@@ -12891,7 +13983,7 @@ static int emit_typed_inc_branch(
   {
     uint64_t *lb = calloc((size_t)(fn->lwords > 0 ? fn->lwords : 1), 8);
     if (lb != NULL) q2_live_before(fn, blk->first_insn + blk->ninsns - 1, lb);
-    fprintf(f, "      goto ox_%d;\n", in->pc);
+    fprintf(f, "      E_GOTO(ox, %d);\n", in->pc);
     free(lb);
   }
   fprintf(f, "    }\n");
@@ -13017,6 +14109,9 @@ static int emit_typed_arith_imm(
       } else if (t->lb[a] == E_LB_F64) {
         e_toi32_expr(xn, sizeof(xn), t, a);
         xrep = 'd';
+      } else if (t->lb[a] == E_LB_BOOL && (in->rop == ROP_binary_imm || in->rop == ROP_binary_imm_s)) {
+        snprintf(xn, sizeof(xn), "(int32_t)b%u", (unsigned)a);
+        xrep = 'i';
       } else {
         return 0;
       }
@@ -13050,7 +14145,7 @@ static int emit_typed_arith_imm(
                 f,
                 "    { uint32_t _u = (uint32_t)%s >> (%d & 31);\n"
                 "      if (__builtin_expect(_u > (uint32_t)INT32_MAX, 0)) "
-                "goto ox_%d;\n"
+                "E_GOTO(ox, %d);\n"
                 "      i%u = (int32_t)_u; }\n",
                 xn, imm, in->pc, (unsigned)d);
             e_note_stub(
@@ -13109,22 +14204,17 @@ static int emit_typed_arith_imm(
   if (t->lb[a] != E_LB_I32) return 0;
   op = sub == REG_BIN_ADD ? "+" : (sub == REG_BIN_SUB ? "-" : "*");
   ld = fn->values[d].reg;
-  fprintf(
-      f, "    { int64_t _t = (int64_t)i%u %s (int64_t)%d;\n", (unsigned)a, op,
-      imm);
   {
     int ovf = t->exits == NULL || (t->exits[d] & E_EX_OVF);
     int nz = sub == REG_BIN_MUL && (t->exits == NULL || (t->exits[d] & E_EX_NEGZERO));
+    char an[24], cn[24];
+    snprintf(an, sizeof(an), "i%u", (unsigned)a);
+    snprintf(cn, sizeof(cn), "%d", imm);
     if (ovf || nz) e_sweep_guard(f, "ox", in->pc);
-    if (ovf)
-      fprintf(
-          f,
-          "      if (__builtin_expect(_t < INT32_MIN || _t > INT32_MAX, 0)) "
-          "goto ox_%d;\n",
-          in->pc);
+    e_arith_head(f, an, op, cn, ovf, in->pc);
     if (nz)
       fprintf(
-          f, "      if (__builtin_expect(_t == 0 && (i%u < 0 || %d < 0), 0)) goto ox_%d;\n",
+          f, "      if (__builtin_expect(_t == 0 && (i%u < 0 || %d < 0), 0)) E_GOTO(ox, %d);\n",
           (unsigned)a, imm, in->pc);
   }
   fprintf(f, "      i%u = (int32_t)_t; }\n", (unsigned)d);
@@ -13346,7 +14436,7 @@ static int emit_tag_post(
       fprintf(
           f,
           "        if (__builtin_expect(!Q2_I32_OK(%s, i%u), 0)) "
-          "goto dx_%d;\n",
+          "E_GOTO(dx, %d);\n",
           raw, (unsigned)dv, in->next);
     else if (t->lb[dv] == E_LB_F64)
       fprintf(
@@ -13355,13 +14445,13 @@ static int emit_tag_post(
           "(double)JS_VALUE_GET_INT(%s);\n"
           "        else if (JS_VALUE_GET_TAG(%s) == JS_TAG_FLOAT64) d%u = "
           "JS_VALUE_GET_FLOAT64(%s);\n"
-          "        else goto dx_%d;\n",
+          "        else E_GOTO(dx, %d);\n",
           raw, (unsigned)dv, raw, raw, (unsigned)dv, raw, in->next);
     else
       fprintf(
           f,
           "        if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_BOOL, 0)) "
-          "goto dx_%d;\n"
+          "E_GOTO(dx, %d);\n"
           "        b%u = JS_VALUE_GET_BOOL(%s);\n",
           raw, in->next, (unsigned)dv, raw);
   }
@@ -13455,7 +14545,9 @@ static int emit_tag_numeric(
    undefined (int, bool, null, undefined) are `payload != 0`; a float64 is
    `d != 0 && d == d`; the rest -- an object (the one HTMLDDA bit), a string, a
    symbol -- is the engine's `qjs_aot_to_bool`, which cannot fail and runs no JS,
-   so there is no miss path and no hand-off. */
+   so there is no miss path and no hand-off. An object (true unless it is the HTMLDDA
+   object) and a string (true unless its length is zero) are decided inline, as
+   `regvm_to_bool` does; the call is left for symbols and BigInts. */
 static int emit_tag_branch_truthy(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, int b,
     Q2ValueId *cur, int have_types, char hex[33]) {
@@ -13481,9 +14573,14 @@ static int emit_tag_branch_truthy(
           "    else if (JS_VALUE_GET_TAG(v%u) == JS_TAG_FLOAT64)\n"
           "        c_ = JS_VALUE_GET_FLOAT64(v%u) != 0 && "
           "JS_VALUE_GET_FLOAT64(v%u) == JS_VALUE_GET_FLOAT64(v%u);\n"
+          "    else if (JS_VALUE_GET_TAG(v%u) == JS_TAG_OBJECT)\n"
+          "        c_ = !q2_nullish_obj(v%u);\n"
+          "    else if (JS_VALUE_GET_TAG(v%u) == JS_TAG_STRING)\n"
+          "        c_ = (*(const uint32_t *)((const unsigned char *)JS_VALUE_GET_PTR(v%u) +\n"
+          "              QJS_AOT_OFF_JSSTRING_LEN_BITS) & 0x7fffffffu) != 0;\n"
           "    else c_ = qjs_aot_to_bool(ctx, v%u) != 0;\n",
           (unsigned)a, (unsigned)a, (unsigned)a, (unsigned)a, (unsigned)a,
-          (unsigned)a, (unsigned)a);
+          (unsigned)a, (unsigned)a, (unsigned)a, (unsigned)a, (unsigned)a, (unsigned)a);
       break;
     case E_LB_I32:
       fprintf(f, "    c_ = i%u != 0;\n", (unsigned)a);
@@ -13869,6 +14966,19 @@ static int emit_typed_branch(
            other right side is the operator itself. */
         if (getenv("QJS_AOT_NOINSTINL") == NULL) {
           static int ic_n;
+          int kl = 0;
+          if ((unsigned)bv < sizeof(g_kval) && g_kval[bv] > 0) {
+            kl = qjs_aot_layout_of_ctor(g_kslot[g_kval[bv] - 1].hex);
+            if (kl > 0) g_kslot[g_kval[bv] - 1].layout = kl;
+          }
+          if (kl > 0)
+            /* a constant constructor whose instances share one contracted shape: the shape answers, anything else is the full test */
+            fprintf(f,
+                    "    { static void *ic_%d[2];\n    int c_ = JS_VALUE_GET_TAG(v%u) != JS_TAG_OBJECT ? 0 :\n"
+                    "        *(const void *const *)((const unsigned char *)JS_VALUE_GET_PTR(v%u) + QJS_AOT_OFF_JSOBJECT_SHAPE) == q2_layout_shape[%d] ? 1 :\n"
+                    "        q2_instanceof(ctx, v%u, v%u, ic_%d);\n",
+                    ic_n, (unsigned)av, (unsigned)av, kl - 1, (unsigned)av, (unsigned)bv, ic_n);
+          else
           fprintf(f, "    { static void *ic_%d[2];\n    int c_ = q2_instanceof(ctx, v%u, v%u, ic_%d);\n", ic_n, (unsigned)av, (unsigned)bv, ic_n);
           ic_n++;
         } else
@@ -14056,7 +15166,7 @@ static int emit_typed_unary(
         /* a boxed operand: an int32 is the speculated case; anything else (a double, a string, a BigInt) leaves before the instruction */
         e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
         e_sweep_guard(f, "vx", in->pc);
-        fprintf(f, "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_INT, 0)) goto vx_%d;\n    %s = ~JS_VALUE_GET_INT(%s);\n", an, in->pc, dn, an);
+        fprintf(f, "    if (__builtin_expect(JS_VALUE_GET_TAG(%s) != JS_TAG_INT, 0)) E_GOTO(vx, %d);\n    %s = ~JS_VALUE_GET_INT(%s);\n", an, in->pc, dn, an);
       } else {
         return 0;
       }
@@ -14094,7 +15204,7 @@ static int emit_typed_unary(
           f,
           "    { int32_t _s;\n"
           "      if (__builtin_expect(__builtin_add_overflow(%s, (int32_t)%d, &_s), 0))\n"
-          "        goto ox_%d;\n"
+          "        E_GOTO(ox, %d);\n"
           "      %s = _s; }\n",
           an, in->rop == ROP_add_imm_self_s ? k : -k, in->pc, dn);
       e_note_stub(
@@ -14113,7 +15223,7 @@ static int emit_typed_unary(
           f,
           "    if (__builtin_expect(%s != %s, 1)) { %s = %s %s 1; }\n", an,
           is_inc ? "INT32_MAX" : "INT32_MIN", dn, an, is_inc ? "+" : "-");
-      fprintf(f, "    else { goto ox_%d; }\n", in->pc);
+      fprintf(f, "    else { E_GOTO(ox, %d); }\n", in->pc);
       e_note_stub(
           g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
       if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
@@ -14134,7 +15244,7 @@ static int emit_typed_unary(
           "    if (__builtin_expect(%s != INT32_MIN && %s != 0, 1)) "
           "{ %s = -%s; }\n",
           an, an, dn, an);
-      fprintf(f, "    else { goto ox_%d; }\n", in->pc);
+      fprintf(f, "    else { E_GOTO(ox, %d); }\n", in->pc);
       e_note_stub(
           g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
       if (cur && ld >= 0 && ld < fn->nregs) cur[ld] = d;
@@ -14155,6 +15265,148 @@ static int emit_typed_unary(
 /* `ROP_unary` "rbr" with the tag-test sub-ops (`v === undefined`, `v === null`, `v == null`): the engine's
    handler is a comparison of the value's tag, so it needs no exit and no helper whatever the operand's
    representation: an int32, a double or a bool is neither, a boxed value is tested by tag. The result is a bool. */
+/* ---- typeof compared with a string constant ----
+   `typeof x === "number"` is `unary typeof` into a register and, in the next instruction, `binary_cpool` (equality) against a pool string. When the
+   string is "number", "string" or "boolean", the comparison is a test of the operand's tag, and the typeof result has no other use, so the pair
+   becomes the test and the typeof builds nothing. Only those three: "object" and "function" depend on the object's class (callable, HTMLDDA) and
+   "undefined" is already a fused unary. The pool table reads "" for anything that is not a short plain string, so an empty entry is never folded. */
+const char *qjs_aot_pool_str(const struct JSAotGenFunc *g, uint32_t idx);
+enum { E_TYPEOF_NONE = 0, E_TYPEOF_NUMBER, E_TYPEOF_STRING, E_TYPEOF_BOOLEAN };
+
+/* The text of a predefined atom (ids below JS_ATOM_END, the engine's own table), or NULL for an id outside it. */
+static const char *e_builtin_atom_str(uint32_t id) {
+  static const char *const tab[] = {
+      NULL,
+#define DEF(name, str) str,
+#include "quickjs-atom.h"
+#undef DEF
+  };
+  if (id == 0 || id >= sizeof(tab) / sizeof(tab[0])) return NULL;
+  return tab[id];
+}
+
+/* The kind and sense of the comparison in `cmp` (a binary_cpool), or E_TYPEOF_NONE. `*neg` is 1 for an inequality. */
+static int e_typeof_cmp_kind(const Q2Func *fn, const Q2Insn *cmp, int *neg) {
+  const char *s;
+  int sub;
+  if (cmp->rop != ROP_binary_cpool || cmp->narg < 5 || cmp->ndef < 1 || cmp->nuse < 1 || cmp->own != 0) return E_TYPEOF_NONE;
+  sub = (int)cmp->arg[1].val;
+  if (sub != REG_BIN_EQ && sub != REG_BIN_NEQ && sub != REG_BIN_STRICT_EQ && sub != REG_BIN_STRICT_NEQ) return E_TYPEOF_NONE;
+  /* the string is a pool entry or an atom; the typeof names are predefined atoms, whose ids are the same in every runtime */
+  if ((uint32_t)cmp->arg[3].val == (uint32_t)REG_CONST_CPOOL)
+    s = qjs_aot_pool_str(fn->g, (uint32_t)cmp->arg[4].val);
+  else if ((uint32_t)cmp->arg[3].val == (uint32_t)REG_CONST_ATOM)
+    s = e_builtin_atom_str((uint32_t)cmp->arg[4].val);
+  else
+    s = NULL;
+  if (s == NULL || s[0] == 0) return E_TYPEOF_NONE;
+  *neg = sub == REG_BIN_NEQ || sub == REG_BIN_STRICT_NEQ;
+  if (strcmp(s, "number") == 0) return E_TYPEOF_NUMBER;
+  if (strcmp(s, "string") == 0) return E_TYPEOF_STRING;
+  if (strcmp(s, "boolean") == 0) return E_TYPEOF_BOOLEAN;
+  return E_TYPEOF_NONE;
+}
+
+/* `in` is a typeof (unary) that the next instruction compares with a foldable string, and nothing else reads its result. Returns the index of
+   the comparison, or -1. */
+static int e_typeof_fusable(const Q2Func *fn, const Q2Insn *in) {
+  int i, neg;
+  const Q2Insn *cmp;
+  if (in->rop != ROP_unary || in->narg < 3 || (int)in->arg[1].val != (int)REG_UN_TYPEOF || in->ndef != 1 || in->nuse != 1 || in->own != 0 ||
+      in->vk != 0 || in->inlg != 0)
+    return -1;
+  i = (int)(in - fn->insns);
+  if (i + 1 >= fn->ninsns) return -1;
+  cmp = &fn->insns[i + 1];
+  if (cmp->own != 0 || cmp->vk != 0 || cmp->inlg != 0 || cmp->pc != in->next || cmp->use[0] != in->def[0]) return -1;
+  if (e_typeof_cmp_kind(fn, cmp, &neg) == E_TYPEOF_NONE) return -1;
+  /* the comparison is the only reader: its operand argval names the typeof value, so it is excused by index */
+  {
+    int k, uses = 0;
+    for (k = 0; k < cmp->nuse; k++)
+      if (cmp->use[k] == in->def[0]) uses++;
+    if (uses != 1) return -1;
+  }
+  {
+    int j, k, b, e;
+    for (j = 0; j < fn->ninsns; j++) {
+      const Q2Insn *x = &fn->insns[j];
+      if (j == i + 1) continue;
+      for (k = 0; k < x->nuse; k++)
+        if (x->use[k] == in->def[0]) return -1;
+      for (k = 0; k < x->win_n && x->win_val != NULL; k++)
+        if (x->win_val[k] == in->def[0]) return -1;
+    }
+    for (b = 0; b < fn->nblocks; b++)
+      for (e = 0; e < fn->blocks[b].nsucc; e++)
+        for (k = 0; k < fn->blocks[b].nedge_args[e]; k++)
+          if (fn->blocks[b].edge_arg != NULL && fn->blocks[b].edge_arg[e] != NULL && fn->blocks[b].edge_arg[e][k] == in->def[0]) return -1;
+  }
+  return i + 1;
+}
+
+/* Whether the comparison `cmp` of a fusable typeof can be emitted as the tag test: the operand and the destination have a representation the
+   test is written for. The typeof skips its own emission only when this holds. */
+static int emit_typeof_cmp_viable(const Q2Func *fn, const Q2Insn *cmp, const ETypes *t) {
+  const Q2Insn *ty;
+  Q2ValueId d, a;
+  int neg, dreg;
+  if (e_typeof_cmp_kind(fn, cmp, &neg) == E_TYPEOF_NONE || (int)(cmp - fn->insns) < 1) return 0;
+  ty = cmp - 1;
+  d = cmp->def[0];
+  a = ty->use[0];
+  if (d >= (Q2ValueId)t->nvalues || a >= (Q2ValueId)t->nvalues) return 0;
+  dreg = fn->values[d].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  if (t->lb[a] != E_LB_TAG && t->lb[a] != E_LB_I32 && t->lb[a] != E_LB_F64 && t->lb[a] != E_LB_BOOL) return 0;
+  return t->lb[d] == E_LB_BOOL || t->lb[d] == E_LB_TAG;
+}
+
+/* The comparison of a fusable typeof: the test of the typeof operand's tag, into the comparison's destination. */
+static int emit_typeof_cmp(FILE *f, const Q2Func *fn, const Q2Insn *cmp, const ETypes *t, Q2ValueId *cur, int have_types) {
+  int neg = 0, kind, i, ti, dreg;
+  const Q2Insn *ty;
+  Q2ValueId d, a;
+  char expr[256];
+  if (!have_types || t == NULL || cur == NULL) return 0;
+  kind = e_typeof_cmp_kind(fn, cmp, &neg);
+  if (kind == E_TYPEOF_NONE) return 0;
+  i = (int)(cmp - fn->insns);
+  if (i < 1) return 0;
+  ti = i - 1;
+  ty = &fn->insns[ti];
+  if (e_typeof_fusable(fn, ty) != i || !emit_typeof_cmp_viable(fn, cmp, t)) return 0;
+  d = cmp->def[0];
+  a = ty->use[0];
+  if (d >= (Q2ValueId)t->nvalues || a >= (Q2ValueId)t->nvalues) return 0;
+  dreg = fn->values[d].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  if (t->lb[a] == E_LB_TAG) {
+    char an[32];
+    e_local_name(an, sizeof(an), a);
+    if (kind == E_TYPEOF_NUMBER)
+      snprintf(expr, sizeof(expr), "(JS_VALUE_GET_TAG(%s) == JS_TAG_INT || JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(%s)))", an, an);
+    else if (kind == E_TYPEOF_STRING)
+      snprintf(expr, sizeof(expr), "(JS_VALUE_GET_TAG(%s) == JS_TAG_STRING || JS_VALUE_GET_TAG(%s) == JS_TAG_STRING_ROPE)", an, an);
+    else
+      snprintf(expr, sizeof(expr), "(JS_VALUE_GET_TAG(%s) == JS_TAG_BOOL)", an);
+  } else if (t->lb[a] == E_LB_I32 || t->lb[a] == E_LB_F64) {
+    snprintf(expr, sizeof(expr), "%d", kind == E_TYPEOF_NUMBER);
+  } else if (t->lb[a] == E_LB_BOOL) {
+    snprintf(expr, sizeof(expr), "%d", kind == E_TYPEOF_BOOLEAN);
+  } else {
+    return 0;
+  }
+  if (t->lb[d] == E_LB_BOOL)
+    fprintf(f, "    b%u = %s%s;\n", (unsigned)d, neg ? "!" : "", expr);
+  else if (t->lb[d] == E_LB_TAG)
+    fprintf(f, "    v%u = JS_MKVAL(JS_TAG_BOOL, %s%s);\n", (unsigned)d, neg ? "!" : "", expr);
+  else
+    return 0;
+  cur[dreg] = d;
+  return 1;
+}
+
 static int emit_typed_tag_test(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur,
     int have_types) {
@@ -14186,6 +15438,32 @@ static int emit_typed_tag_test(
   return 1;
 }
 
+/* `special_object` ARG_COUNT ("rb": destination, kind 8): `arguments.length` of an elided arguments object is the call's argument count. A frameless
+   body holds it in `argc`; a framed one reads the header's count, as the handler does. */
+static int emit_typed_argc(
+    FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t, Q2ValueId *cur, int have_types) {
+  Q2ValueId dv;
+  int dreg;
+  const char *src;
+  if (!have_types || t == NULL || cur == NULL || g_e_inl || in->own != 0) return 0;
+  if (in->rop != ROP_special_object || in->narg < 2 || in->arg[1].val != 8 || in->ndef < 1) return 0;
+  dv = in->def[0];
+  if (dv >= (Q2ValueId)t->nvalues) return 0;
+  dreg = fn->values[dv].reg;
+  if (dreg < 0 || dreg >= fn->nregs) return 0;
+  src = g_e_fl ? "argc" : "(int)*(const uint16_t *)((const unsigned char *)f + QJS_AOT_OFF_REGRUN_ARGC)";
+  if (t->lb[dv] == E_LB_I32)
+    fprintf(f, "    i%u = %s;\n", (unsigned)dv, src);
+  else if (t->lb[dv] == E_LB_F64)
+    fprintf(f, "    d%u = (double)%s;\n", (unsigned)dv, src);
+  else if (t->lb[dv] == E_LB_TAG)
+    fprintf(f, "    v%u = JS_MKVAL(JS_TAG_INT, %s);\n", (unsigned)dv, src);
+  else
+    return 0;
+  cur[dreg] = dv;
+  return 1;
+}
+
 /* `get_arg_el` ("rur": destination, the variable slot of the arguments object, the index): `arguments[i]` for an int32 index below the call's
    argument count is the argument itself, the declared ones in the argument buffer and the rest in the argument vector, exactly as the engine's
    handler reads them. Any other index (out of range, not an int32) leaves before the instruction, where the handler builds the answer. */
@@ -14195,8 +15473,11 @@ static int emit_typed_arg_el(
   int dreg;
   char an[32];
 
-  if (!have_types || t == NULL || cur == NULL || g_e_fl || g_e_inl || in->own != 0) return 0;
-  if (in->rop != ROP_get_arg_el || in->ndef < 1 || in->nuse < 1 || fn->g->light_ok) return 0;
+  if (!have_types || t == NULL || cur == NULL || g_e_inl || in->own != 0) return 0;
+  /* A frameless body reads the argument vector it was entered with; it has no declared argument buffer to tell apart, so only a function
+     with no formal parameter. */
+  if (in->rop != ROP_get_arg_el || in->ndef < 1 || in->nuse < 1) return 0;
+  if (g_e_fl ? fn->g->arg_count != 0 : fn->g->light_ok) return 0;
   dv = in->def[0];
   av = in->use[0];
   if (dv >= (Q2ValueId)t->nvalues || av >= (Q2ValueId)t->nvalues) return 0;
@@ -14211,12 +15492,18 @@ static int emit_typed_arg_el(
   e_sweep_guard(f, "vx", in->pc);
   fprintf(f, "    { JSValue _lv;\n");
   if (t->lb[av] == E_LB_TAG)
-    fprintf(f, "      if (__builtin_expect(Q2_FORCE_MISS || JS_VALUE_GET_TAG(%s) != JS_TAG_INT, 0)) goto vx_%d;\n"
+    fprintf(f, "      if (__builtin_expect(Q2_FORCE_MISS || JS_VALUE_GET_TAG(%s) != JS_TAG_INT, 0)) E_GOTO(vx, %d);\n"
                "      uint32_t _ai = (uint32_t)JS_VALUE_GET_INT(%s);\n", an, in->pc, an);
   else
     fprintf(f, "      uint32_t _ai = (uint32_t)%s;\n", an);
+  if (g_e_fl)
+    fprintf(f,
+            "      if (__builtin_expect(Q2_FORCE_MISS || _ai >= (uint32_t)argc, 0)) E_GOTO(vx, %d);\n"
+            "      _lv = argv[_ai];\n",
+            in->pc);
+  else
   fprintf(f,
-          "      if (__builtin_expect(Q2_FORCE_MISS || _ai >= (uint32_t)*(const uint16_t *)((const unsigned char *)f + QJS_AOT_OFF_REGRUN_ARGC), 0)) goto vx_%d;\n"
+          "      if (__builtin_expect(Q2_FORCE_MISS || _ai >= (uint32_t)*(const uint16_t *)((const unsigned char *)f + QJS_AOT_OFF_REGRUN_ARGC), 0)) E_GOTO(vx, %d);\n"
           "      _lv = _ai < %uu ? q2_arg_buf(f)[_ai]\n"
           "                      : (*(JSValue *const *)((const unsigned char *)f + QJS_AOT_OFF_REGRUN_ARGV))[_ai];\n",
           in->pc, (unsigned)fn->g->arg_count);
@@ -14255,16 +15542,21 @@ static int emit_typed_post(
   inc = in->rop == ROP_post_inc;
   if (t->lb[a] == E_LB_I32 && t->lb[d0] == E_LB_I32 &&
       t->lb[d1] == E_LB_I32) {
+    if (inc && e_idx_known(a)) {
+      /* the value indexed an array in this block: it is below the count, which is at most INT32_MAX */
+      fprintf(f, "    i%u = i%u + 1;\n    i%u = i%u;\n", (unsigned)d1, (unsigned)a, (unsigned)d0, (unsigned)a);
+    } else {
     e_sweep_guard(f, "ox", in->pc);
     fprintf(
         f,
-        "    if (__builtin_expect(i%u == %s, 0)) goto ox_%d;\n"
+        "    if (__builtin_expect(i%u == %s, 0)) E_GOTO(ox, %d);\n"
         "    i%u = i%u %s 1;\n"
         "    i%u = i%u;\n",
         (unsigned)a, inc ? "INT32_MAX" : "INT32_MIN", in->pc, (unsigned)d1,
         (unsigned)a, inc ? "+" : "-", (unsigned)d0, (unsigned)a);
     e_note_stub(
         g_e_ox, g_e_ox_cur, g_e_ox_blk, &g_e_ox_n, in->pc, cur, NULL);
+    }
   } else if (t->lb[a] == E_LB_F64 && t->lb[d0] == E_LB_F64 &&
              t->lb[d1] == E_LB_F64) {
     fprintf(
@@ -14437,9 +15729,18 @@ static int e_dispatch_rop(
       return emit_typed_load_const(f, fn, in, t, cur, have_types) ||
              emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_unary:
+      /* a typeof whose only reader is the next instruction's string comparison builds nothing: the comparison tests the tag */
+      if (have_types && t != NULL && cur != NULL && getenv("QJS_AOT_NOTYPEOF") == NULL) {
+        int ci_ = e_typeof_fusable(fn, in);
+        if (ci_ >= 0 && emit_typeof_cmp_viable(fn, &fn->insns[ci_], t)) return 1;
+      }
       return emit_typed_tag_test(f, fn, in, t, cur, have_types) ||
              emit_tag_numeric(f, fn, in, t, cur, have_types, hex, fi, b) ||
              emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_local_uninit:
+      /* the elided arguments slot of a frameless body: there is no variable area to mark, and no read of the slot */
+      if (g_e_fl && e_vargs_slot(fn) >= 0) return 1;
+      return emit_store_call(f, fn, in, t, cur, have_types);
     case ROP_put_global:
     case ROP_put_local_s0:
     case ROP_put_local_s1:
@@ -14451,7 +15752,6 @@ static int e_dispatch_rop(
     case ROP_put_local_xfer_s3:
     case ROP_put_local:
     case ROP_put_local_xfer:
-    case ROP_local_uninit:
     case ROP_local_check:
     case ROP_close_local:
     case ROP_set_name:
@@ -14488,7 +15788,8 @@ static int e_dispatch_rop(
       return (have_types && emit_typed_arith(f, fn, in, t, cur)) ||
              emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_binary_cpool:
-      return emit_typed_arith_cpool(f, fn, in, t, cur, have_types) ||
+      return (getenv("QJS_AOT_NOTYPEOF") == NULL && emit_typeof_cmp(f, fn, in, t, cur, have_types)) ||
+             emit_typed_arith_cpool(f, fn, in, t, cur, have_types) ||
              emit_tag_numeric(f, fn, in, t, cur, have_types, hex, fi, b) ||
              emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
     case ROP_binary_imm:
@@ -14581,10 +15882,12 @@ static int e_dispatch_rop(
     case ROP_array_const:
     case ROP_make_closure:
     case ROP_object_fill:
-    case ROP_special_object:
     case ROP_apply_arguments:
     case ROP_get_super:
       return emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
+    case ROP_special_object:
+      return emit_typed_argc(f, fn, in, t, cur, have_types) ||
+             emit_alloc_op(f, fn, in, t, cur, have_types, hex, fi, b);
 
     /* -- this, and strict equality as a value -- */
     case ROP_load_this:
@@ -14870,6 +16173,9 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
   free(g_e_pp);
   g_e_pp = calloc((size_t)g_e_spill_nv, 1);
   if (g_e_pp == NULL) abort();
+  free(g_e_ppblk);
+  g_e_ppblk = calloc((size_t)(g_e_spill_nv > 0 ? g_e_spill_nv : 1), sizeof(int));
+  if (g_e_ppblk == NULL) abort();
   g_e_spill_n = 0;
   g_e_inl_nx_used = 0;
   free(g_e_dirty_ins);
@@ -14911,6 +16217,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       have_types = 1;
       g_e_types = &types;
       g_e_facts = &facts;
+      e_bnd_plan(fn, &types, &facts);
     } else {
       /* CLEAR the global when this function has no analysis. Leaving the previous
          function's types in place made e_rep_prefix name locals with ANOTHER
@@ -14925,6 +16232,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       return 0;
     }
     e_irreducible++;
+    if (qjs_aot_rat_mode()) fputs("#line 1 \"NOFRAME\"\n", f);
     fprintf(
         f, "E_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n",
         e_linkage(), hex);
@@ -15002,9 +16310,13 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
     fprintf(
         f,
         "#define q2_arg_buf(f_) (argv)\n%s"
+        "%s"
         "#define qjs_aot_get_var_ref(f_, i_) q2_vref_get(co, (i_))\n"
         "#define qjs_aot_var_ref_ptr(f_, i_) q2_vref_ptr(co, (i_))\n",
-        g_e_inl ? "" : "#undef E_RLINK\n#define E_RLINK(r_) E_RLINK_REAL(r_)\n");
+        g_e_inl ? "" : (e_norec() || e_recscan()) ? "#undef E_RLINK\n#define E_RLINK(r_) ((void)0)\n" : g_e_fl_calls ? "#undef E_RLINK\n#define E_RLINK(r_) E_RLINK_REAL(r_)\n"
+                               : "#undef E_RLINK\n#define E_RLINK(r_) E_RLINK_NR(r_)\n",
+        /* QJS_AOT_NOHOIST=1: the runtime pointer is read from the context at each use again */
+        getenv("QJS_AOT_NOHOIST") == NULL ? "#undef E_RTOF\n#define E_RTOF(c_) ((void)(c_), rt_)\n" : "");
     if (g_e_inl) {
       fprintf(
           f,
@@ -15018,11 +16330,20 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
           "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
           "    JSContext *ctx = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
+          "    uint8_t *const rt_ = *(uint8_t **)((uint8_t *)ctx_in + QJS_AOT_OFF_CTX_RT); (void)rt_;\n"
           "    JSAotFlRec *const rec_ = NULL;\n"
           "    JSValue fr[%d];\n"
-          "    Q2_FILL_UNDEF(fr, %d);\n",
-          hex, g_e_nolazy ? "_n" : "", fn->nregs > 0 ? fn->nregs : 1, fn->nregs > 0 ? fn->nregs : 1);
-    if (g_e_inl && g_e_inl_r) {
+          "%s",
+          hex, g_e_nolazy ? "_n" : "", fn->nregs > 0 ? fn->nregs : 1, e_fr_fill(fn->nregs));
+    if (g_e_inl && g_e_inl_r && g_e_compact) {
+      fprintf(
+          f,
+          "    enum { RT_ = %d };\n"
+          "    JSValue ra_own_[RT_];\n"
+          "    JSValue *ra_ = ra_x_ ? ra_x_ : ra_own_;\n",
+          g_e_rt > 1 ? g_e_rt : 1);
+      g_e_last_inl_rz = g_e_rt > 1 ? g_e_rt : 1;
+    } else if (g_e_inl && g_e_inl_r) {
       int mw = e_win_max(fn);
       fprintf(
           f,
@@ -15036,7 +16357,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       g_e_last_inl_rz = 0;
       fprintf(f, "    (void)ra_x_;\n");
     }
-    if (g_e_inl) fprintf(f, "    (void)this_ok_; (void)rr_;\n");
+    if (g_e_inl) fprintf(f, "    (void)this_ok_; (void)rr_;\n    E_INL_NOTE(%d);\n", fi);
     } else
     fprintf(
         f,
@@ -15049,28 +16370,47 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         "    uint8_t *cb = *(uint8_t **)((uint8_t *)co + "
         "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
         "    JSContext *ctx = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
+        "    uint8_t *const rt_ = *(uint8_t **)((uint8_t *)ctx_in + QJS_AOT_OFF_CTX_RT); (void)rt_;\n"
         "%s"
         "    JSValue fr[%d];\n"
-        "    Q2_FILL_UNDEF(fr, %d);\n",
+        "%s",
         g_e_fl_calls ? "static inline __attribute__((always_inline)) " : "E_TEXT ",
-        g_e_fl_calls ? "" : e_linkage(), g_e_fl_calls ? "nb" : "n", hex,
+        g_e_fl_calls ? "" : e_none_linkage(), g_e_fl_calls ? "nb" : "n", hex,
         g_e_fl_calls ? ", JSAotFlRec *rec_" : "",
         g_e_fl_calls ? "" : "    JSAotFlRec *const rec_ = NULL; (void)rec_;\n",
         fast_has(hex) ? fast_entry_text(hex) : "",
-        fn->nregs > 0 ? fn->nregs : 1, fn->nregs > 0 ? fn->nregs : 1);
+        fn->nregs > 0 ? fn->nregs : 1, e_fr_fill(fn->nregs));
     if (g_e_fl_calls && !g_e_inl) {
       int mw = e_win_max(fn);
+      /* The array is filled at its first mention: a path that never publishes (a fast-fail return) pays nothing. */
+      g_e_lazy_ra = getenv("QJS_AOT_EAGERRA") == NULL;
+      if (g_e_compact) {
+        g_e_lazy_ra = 0;
+        fprintf(
+            f,
+            "    enum { RT_ = %d };\n"
+            "    JSValue ra_[RT_];\n"
+            "%s",
+            g_e_rt > 1 ? g_e_rt : 1,
+            /* stack maps: the array is only the argument window and the park slots, no root range is published and nothing is written before use */
+            (e_scan() && e_stackmaps()) ? ""
+            : e_scan() ? (e_recscan() ? "    rec_->nroots = 0; ra_[0] = JS_UNDEFINED; E_POISON_FROM(1, RT_);\n" : "    rec_->roots = ra_; rec_->nroots = 0; ra_[0] = JS_UNDEFINED; E_POISON_FROM(1, RT_);\n")
+            : (e_recscan() ? "    rec_->nroots = 1; ra_[0] = JS_UNDEFINED; E_POISON_FROM(1, RT_);\n" : "    rec_->roots = ra_; rec_->nroots = 1; ra_[0] = JS_UNDEFINED; E_POISON_FROM(1, RT_);\n"));
+      } else
       fprintf(
           f,
           "    enum { SB_ = %d, RB_ = SB_ + %d, RT_ = RB_ + %d };\n"
-          "    JSValue ra_[RT_];\n"
           "%s",
-          g_e_spill_total > 0 ? g_e_spill_total : 1, mw, g_e_child_decl, "    Q2_FILL_UNDEF(ra_, RT_);\n");
+          g_e_spill_total > 0 ? g_e_spill_total : 1, mw, g_e_child_decl,
+          g_e_lazy_ra ? "    JSValue ra_a_[RT_];\n    int ra_in_ = 0;\n"
+                        "#define ra_ ((ra_in_ ? 0 : (q2_fillu_(ra_a_, RT_), ra_in_ = 1)), ra_a_)\n"
+                      : "    JSValue ra_[RT_];\n    Q2_FILL_UNDEF(ra_, RT_);\n");
     }
   } else {
     /* With loop entries the body is `aot_s_`, and `aot_f_` calls it again whenever the generic
        body hands a loop back (see E_RET_G), so a re-entry is a return and a call: not a jump
        back into the body, and no frame that is not already there. */
+    if (qjs_aot_rat_mode()) fputs("#line 1 \"NOFRAME\"\n", f);
     fprintf(
         f, "E_TEXT %sJSValue aot_%c_%s(JSContext *ctx, JSRegRun *f,\n",
         e_linkage(), (osr_n > 0 || g_e_spec_fb) ? 's' : 'f', hex);
@@ -15087,7 +16427,10 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
      from QJS_AOT_SPEC/QJS_AOT_NO_SPEC, but the OLD emitter's spec entry was the only
      reader -- so the spec body ran even with QJS_AOT_SPEC=0, and the harness's
      "nospec" pass was never a generic-only run. */
-  if (g_e_inl)
+  if (!g_e_inl && g_e_fl) e_kscan(fn, fi);
+  g_e_kfast = !g_e_inl && g_e_fl && e_nogeneric() && getenv("QJS_AOT_KO_GATEFRAME") == NULL && e_khas(fi) && e_kon() &&
+              qjs_aot_bundle_fn_kok(fn->g) && getenv("QJS_AOT_NOKFAST") == NULL;
+  if (g_e_inl || g_e_kfast)
     (void)0;
   else if (g_e_fl && e_nogeneric() && getenv("QJS_AOT_KO_GATEFRAME") == NULL)
     /* the gate: the function is not used from now on (the engine drops its binding) and this call is made in the interpreter */
@@ -15115,6 +16458,13 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         "    if (__builtin_expect(entry_pc != 0 || e_gate[%d], 0))\n"
         "        return %s;\n",
         fi, gene);
+  if (!g_e_inl && g_e_fl && e_nogeneric() && getenv("QJS_AOT_KO_GATEFRAME") == NULL && e_khas(fi))
+    /* the constant globals this body reads are validated before its first run, and a broken fact word hands the call to the cold path */
+    fprintf(
+        f,
+        "    if (__builtin_expect(!q2_kw[%d], 0))\n"
+        "        return q2_kentry(ctx_in, %d, aot_e_%s, caller_f, co, this_obj, argv, argc, %d);\n",
+        fi, fi, hex, g_e_kfast ? (e_pic_sites(fn) > 0) : e_pic_sites(fn) > 0 && getenv("QJS_AOT_NOPICDEFER") == NULL && getenv("QJS_AOT_NOSTATICSH") == NULL ? 0 : (e_pic_sites(fn) > 0));
   /* The index must be inside the switch-off arrays; the generator sized them from the
      function count, so this can only fail if the two disagree. */
   fprintf(
@@ -15164,11 +16514,11 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
   g_e_pic_defer = 0;
   if (e_pic_sites(fn) > 0 && getenv("QJS_AOT_NOPICDEFER") == NULL && getenv("QJS_AOT_NOSTATICSH") == NULL)
     g_e_pic_defer = 1;
-  if (e_pic_sites(fn) > 0 && !g_e_pic_defer)
+  if (e_pic_sites(fn) > 0 && !g_e_pic_defer && !g_e_kfast)
     fprintf(
         f,
         "    if (__builtin_expect(pic == NULL, 0)) {\n"
-        "        E_REFUSE_NOTE(%d);\n"
+        "        E_REFUSE_NOTE_PIC(%d);\n"
         "        return %s;\n"
         "    }\n",
         fi, gen0);
@@ -15203,7 +16553,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           fprintf(
               f,
               "    if (__builtin_expect(pic == NULL, 0)) {\n"
-              "        E_REFUSE_NOTE(%d);\n"
+              "        E_REFUSE_NOTE_PIC(%d);\n"
               "        return %s;\n"
               "    }\n",
               fi, gen0);
@@ -15249,6 +16599,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       if (!g_e_epoch_skip) g_pm_n = 0;
       g_e_mc_n = 0;
       memset(g_e_mc_of, -1, sizeof(g_e_mc_of));
+      memset(g_kval, 0, sizeof(g_kval));
       memset(g_e_pe_flag, 0, sizeof(g_e_pe_flag));
       memset(g_e_mono_st, 0, sizeof(g_e_mono_st));
       g_e_mono_id = ++g_e_mono_seq;
@@ -15269,22 +16620,25 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
       g_e_sm_stat = ngu > 0 || ngf > 0;
       if (g_e_pic_defer && !g_e_sm_stat) {
         g_e_pic_defer = 0;
+        /* a body behind the fact-word gate: q2_kentry (needpic) refused a bytecode with no PIC table before the word was set, and the table is freed only with the bytecode */
+        if (!g_e_kfast)
         fprintf(
             f,
             "    if (__builtin_expect(pic == NULL, 0)) {\n"
-            "        E_REFUSE_NOTE(%d);\n"
+            "        E_REFUSE_NOTE_PIC(%d);\n"
             "        return %s;\n"
             "    }\n",
             fi, gen0);
       }
+      /* The epoch this activation validated against: the static-shape caches of inline bodies compare it as well, whether or not
+         a group of cells exists. */
+      fprintf(f, "    const uint8_t *const q2_rt = E_RTOF(ctx);\n    uint32_t q2_ep = *(const uint32_t *)(q2_rt + QJS_AOT_OFF_RT_PIC_EPOCH);\n    (void)q2_rt; (void)q2_ep;\n");
       if (ngu > 0 || ngf > 0 || g_pm_n > 0) {
         int gk = 0, pk = 0;
         fprintf(
             f,
             "    static const void *e_vg[%d]; static int e_vp[%d]; static uint32_t e_vep = ~0u; static const void *e_vcb;\n"
-            "    static JSValue e_vm[%d]; static const void *e_vme[%d];\n"
-            "    uint32_t q2_ep = *(const uint32_t *)(*(const uint8_t *const *)((const uint8_t *)ctx + "
-            "QJS_AOT_OFF_CTX_RT) + QJS_AOT_OFF_RT_PIC_EPOCH);\n",
+            "    static JSValue e_vm[%d]; static const void *e_vme[%d];\n",
             ngu > 0 ? ngu : 1, npci > 0 ? npci : 1, g_e_mc_n > 0 ? g_e_mc_n : 1, g_e_mc_n > 0 ? g_e_mc_n : 1);
         if (g_pm_n > 0)
           fprintf(
@@ -15323,7 +16677,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           fprintf(
               f,
               "      if (__builtin_expect(pic == NULL, 0)) {\n"
-              "        E_REFUSE_NOTE(%d);\n"
+              "        E_REFUSE_NOTE_PIC(%d);\n"
               "        return %s;\n"
               "      }\n",
               fi, gen0);
@@ -15396,12 +16750,19 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
          test it themselves); only a cell of another shape refuses. */
       fprintf(f, "    if (__builtin_expect(gsh%d == NULL, 0)) gsh%d = E_NO_SHAPE;\n", g, g);
       for (q = 0; q < gr->nsites; q++) {
-        int wr = 0, hot = 0, z;
+        int wr = 0, hot = 0, z, sins = -1;
+        char sop[64] = "?";
         for (z = 0; z < g_e_facts->nsites; z++)
           if (g_e_facts->sites[z].site == gr->sites[q]) {
             wr = g_e_facts->sites[z].write;
             hot = g_e_facts->sites[z].hot;
+            sins = g_e_facts->sites[z].insn;
           }
+        if (sins >= 0 && sins < fn->ninsns) {
+          char rn[40];
+          e_rop_name(fn->insns[sins].rop, rn, sizeof(rn));
+          snprintf(sop, sizeof(sop), "%s@site%d", rn, gr->sites[q]);
+        }
         if (e_facts_site_proto(g_e_facts, gr->sites[q]) == 2)
           fprintf(
               f, "    pci%d = q2_cell2_index(pic, %d, (int)q2_ns, gsh%d);\n",
@@ -15431,14 +16792,14 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
               "        { extern void qjs_aot_dbg_shape(JSContext *, const void *, const char *) __attribute__((weak)); if (qjs_aot_dbg_shape) { qjs_aot_dbg_shape(ctx, _s, \"cell\"); qjs_aot_dbg_shape(ctx, gsh%d, \"group\"); } }\n"
               "        fprintf(stderr, \"refuse-site %d: cell shape %%p group shape %%p cell off %%u misses %%u kinds %%u/%%u/%%u/%%u\\n\", _s, gsh%d, (unsigned)q2_cell_off(pic, %d), (unsigned)*(const uint16_t *)((const unsigned char *)pic + (size_t)%d * QJS_AOT_SIZEOF_JSREGPIC + QJS_AOT_OFF_JSREGPIC_MISSES), (unsigned)*(const uint16_t *)((const unsigned char *)pic + (size_t)%d * QJS_AOT_SIZEOF_JSREGPIC + QJS_AOT_OFF_JSREGPIC_KIND), (unsigned)*(const uint16_t *)((const unsigned char *)pic + ((size_t)%d + q2_ns) * QJS_AOT_SIZEOF_JSREGPIC + QJS_AOT_OFF_JSREGPIC_KIND), (unsigned)*(const uint16_t *)((const unsigned char *)pic + ((size_t)%d + 2 * q2_ns) * QJS_AOT_SIZEOF_JSREGPIC + QJS_AOT_OFF_JSREGPIC_KIND), (unsigned)*(const uint16_t *)((const unsigned char *)pic + ((size_t)%d + 3 * q2_ns) * QJS_AOT_SIZEOF_JSREGPIC + QJS_AOT_OFF_JSREGPIC_KIND));\n"
               "#endif\n"
-              "        E_EXIT_LOG(\"%s\", \"refuse-site\", %d, -2);\n"
+              "        E_REFUSE_LOG(\"%s\", %d, \"%s\", e_pic_nshapes(pic, %d, (int)q2_ns));\n"
               "        if (_s == NULL) E_REFUSE_SOFT(%d); else E_REFUSE_NOTE(%d);\n"
               "        return %s;\n"
               "      } }\n",
               wr && hot ? "q2_cell_wshape" : "q2_cell_shape",
               e_cellidx(cib, sizeof(cib), gr->sites[q]), g,
               cond, g, gr->sites[q], g, gr->sites[q], gr->sites[q], gr->sites[q], gr->sites[q], gr->sites[q], gr->sites[q], hex,
-              gr->sites[q], fi, fi, gen0);
+              sins >= 0 && sins < fn->ninsns ? fn->insns[sins].pc : -1, sop, gr->sites[q], fi, fi, gen0);
           fclose(dbgf);
           e_write_without_dbg(f, dbgb);
           free(dbgb);
@@ -15578,7 +16939,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
   }
   g_e_sm_on = getenv("QJS_AOT_NOSTATICSH") == NULL && g_e_facts != NULL && g_e_group_used != NULL;
   if (g_e_sm_on) e_sm_macros(f, 1);
-  if (g_e_nolazy && !g_e_inl)
+  if (g_e_nolazy && !g_e_inl && !g_e_kfast)
     fprintf(
         f,
         "    if (__builtin_expect(E_LAZY_SEEN(ctx), 0)) {\n"
@@ -15643,6 +17004,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
     fprintf(f, "    (void)fr; (void)ctx; (void)caller_f; (void)this_obj;\n");
   else
     fprintf(f, "    (void)fr; (void)ctx; (void)f;\n");
+  fprintf(f, "    uint32_t pq_ = Q2_POLL_BATCH; (void)pq_;\n");
   if (osr_n > 0) {
     int h;
     fprintf(f, "    if (entry_pc != 0) {\n        switch (entry_pc) {\n");
@@ -15669,6 +17031,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
        broke crypto). */
     b = fn->rpo[bi];
     g_e_blk = b;
+    g_e_blk_epoch++;
     const Q2Block *blk = &fn->blocks[b];
     int i2, lowered_to = blk->first_insn, term_lowered = 0;
     Q2ValueId *cur = NULL;
@@ -15723,6 +17086,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
     for (i2 = blk->first_insn; i2 < blk->first_insn + blk->ninsns; i2++) {
       const Q2Insn *in = &fn->insns[i2];
       unsigned oc0 = g_e_opcalls;
+      e_rat_line(f, fn, in, i2, hex);
       if (getenv("QJS_AOT_INL_TABLE") != NULL) fprintf(f, "/*@%d %d*/\n", in->own, in->pc);
       if (getenv("QJS_AOT_OP_MARK") != NULL) { char rn_[40]; e_rop_name((uint16_t)in->rop, rn_, sizeof(rn_)); fprintf(f, "/*#%d %s*/\n", in->pc, rn_); }   /* census: tools/aot/unit-opkinds.py */
       /* A run of loop-invariant instructions (see plan_invariants) is executed once per entry to its loop. */
@@ -15851,6 +17215,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         fprintf(
             f, "    %s = %s;\n", dn,
             e_copy_expr(g_e_facts->fwd[i2], in->def[0]));
+        e_kcopy(in->def[0], g_e_facts->fwd[i2]);
         e_note_defs(cur, fn, in);
         g_e_n_fwd++;
         g_e_n_typed++;
@@ -16051,6 +17416,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         e_fl_block("terminator", &fn->insns[last]);
         fprintf(f, "    /* the terminator: exit at its own pc */\n");
         if (g_e_dirty_ins != NULL) g_e_dirty_ins[last] = (uint8_t)g_e_inl_dirty;
+        g_e_why = "terminator";
         if (fn->insns[last].own > 0)
           e_emit_exit_at(f, fn, last, fn->insns[last].pc, hex, fi, cur, b, 1);
         else
@@ -16072,6 +17438,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         const uint64_t *lo = q2_live_out(fn, last);
         e_fl_block("no single successor", NULL);
         fprintf(f, "    /* fall through, no single successor: exit */\n");
+        g_e_why = "no-single-successor";
         e_emit_exit(f, fn, blk->end_pc, hex, fi, cur, lo, 1, b);
       }
       free(set);
@@ -16095,7 +17462,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         snprintf(
             te, sizeof(te), "%s%s%s", tx != NULL ? "JS_VALUE_GET_TAG(" : "",
             tx != NULL ? tx : "-100", tx != NULL ? ")" : "");
-        e_emit_exit_log(f, hex, "ax", pc2, te);
+        e_emit_exit_log(f, fn, ins, hex, "ax", pc2, te);
       }
       e_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e_ax_cur[o], g_e_ax_blk[o], 0);
@@ -16120,7 +17487,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         snprintf(
             te, sizeof(te), "%s%s%s", tx != NULL ? "JS_VALUE_GET_TAG(" : "",
             tx != NULL ? tx : "-100", tx != NULL ? ")" : "");
-        e_emit_exit_log(f, hex, "vx", pc2, te);
+        e_emit_exit_log(f, fn, ins, hex, "vx", pc2, te);
       }
       e_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e_vx_cur[o], g_e_vx_blk[o], 0);
@@ -16144,19 +17511,27 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
          then released (the release can run a collection). */
       for (q2 = 0; q2 < g_e_dx_own_n; q2++)
         if (g_e_dx_own_pc[q2] == pc2)
-          fprintf(
-              f,
-              "    if (JS_VALUE_HAS_REF_COUNT(AOT_REG(fr, %d))) {\n"
-              "        qjs_aot_set_reg_p(ctx, &ra_[SB_], 0, AOT_REG(fr, %d));\n"
-              "    }\n",
-              g_e_dx_own_off[q2], g_e_dx_own_off[q2]);
+          {
+            char kb_[24], ck_[64] = "";
+            if (g_e_compact) {
+              snprintf(kb_, sizeof(kb_), "%d", g_e_dx_own_k[q2]);
+              snprintf(ck_, sizeof(ck_), "        E_RCHK(rec_, %d);\n", g_e_dx_own_k[q2]);
+            } else snprintf(kb_, sizeof(kb_), "SB_");
+            fprintf(
+                f,
+                "    if (JS_VALUE_HAS_REF_COUNT(AOT_REG(fr, %d))) {\n"
+                "%s"
+                "        qjs_aot_set_reg_p(ctx, &ra_[%s], 0, AOT_REG(fr, %d));\n"
+                "    }\n",
+                g_e_dx_own_off[q2], ck_, kb_, g_e_dx_own_off[q2]);
+          }
       {
         const char *tx = e_tag_expr('d', pc2);
         char te[200];
         snprintf(
             te, sizeof(te), "%s%s%s", tx != NULL ? "JS_VALUE_GET_TAG(" : "",
             tx != NULL ? tx : "-100", tx != NULL ? ")" : "");
-        e_emit_exit_log(f, hex, "dx", pc2, te);
+        e_emit_exit_log(f, fn, ins, hex, "dx", pc2, te);
       }
       e_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e_dx_cur[o], g_e_dx_blk[o], 0);
@@ -16182,7 +17557,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         snprintf(
             te, sizeof(te), "%s%s%s", tx != NULL ? "JS_VALUE_GET_TAG(" : "",
             tx != NULL ? tx : "-100", tx != NULL ? ")" : "");
-        e_emit_exit_log(f, hex, "ox", pc2, te);
+        e_emit_exit_log(f, fn, ins, hex, "ox", pc2, te);
       }
       e_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e_ox_cur[o], g_e_ox_blk[o], 0);
@@ -16203,6 +17578,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         if (fn->insns[ii].pc == pc2) { ins = ii; break; }
       if (ins < 0) continue;
       fprintf(f, "    hx_%d:;\n", pc2);
+      g_e_why = "compare-cold";
       e_emit_exit_at(
           f, fn, ins, pc2, hex, fi, g_e_hx_cur[o], g_e_hx_blk[o], 1);
     }
@@ -16364,6 +17740,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           else
             fprintf(f, "      goto osr_fail;\n");
         }
+      e_bnd_entry(f, osr_blk[h], "goto osr_fail");
       fprintf(f, "      goto s_%d;\n    }\n", osr_pc[h]);
     }
     fprintf(f, "    osr_fail:;\n    {\n      e_osr_n[%d] += 8;\n      return %s;\n    }\n", fi, gene);
@@ -16373,6 +17750,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
   fprintf(f, "}\n");
   if (g_e_sm_on) e_sm_macros(f, 0);
   g_e_sm_on = 0;
+    if (qjs_aot_rat_mode()) fputs("#line 1 \"NOFRAME\"\n", f);
   if ((osr_n > 0 || g_e_spec_fb) && !g_e_fl && !g_e_inl)
     fprintf(
         f,
@@ -16390,38 +17768,58 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         "static void __attribute__((constructor)) e_osr_reg_%s(void)\n"
         "{ e_osr_ok[%d] = 1; }\n",
         hex, fi);
+    if (qjs_aot_rat_mode()) fputs("#line 1 \"NOFRAME\"\n", f);
   if (g_e_fl && !g_e_inl && g_e_fl_calls)
     fprintf(
         f,
-        "E_TEXT %sJSValue aot_n_%s(JSContext *ctx_in, JSRegRun *caller_f,\n"
+        "E_TEXT %sE_NONE JSValue aot_n_%s(JSContext *ctx_in, JSRegRun *caller_f,\n"
         "                               JSObject *co, JSValue this_obj,\n"
         "                               JSValue *argv, int argc)\n"
         "{\n"
         "    uint8_t *rt = *(uint8_t **)((uint8_t *)ctx_in + QJS_AOT_OFF_CTX_RT);\n"
         "    JSAotFlRec rec;\n"
         "    JSValue r;\n"
-        "    if (__builtin_expect((uintptr_t)__builtin_frame_address(0) <\n"
+        "    if (__builtin_expect(q2_sp_() <\n"
         "            *(uintptr_t *)(rt + QJS_AOT_OFF_RT_STACK_LIMIT) + "
         "E_STACK_MARGIN, 0))\n"
         "        return qjs_aot_throw_stack_overflow(ctx_in);\n"
-        "    if (__builtin_expect(--*(int *)((uint8_t *)ctx_in + "
-        "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {\n"
-        "        ++*(int *)((uint8_t *)ctx_in + "
-        "QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n"
-        "        if (qjs_aot_poll_fl(ctx_in) < 0) return JS_EXCEPTION;\n"
-        "    }\n"
+        "%s"
         "    rec.ifunc = NULL;\n"
-        "    rec.linked = 0;\n"
+        "%s"
         "    r = aot_nb_%s(ctx_in, caller_f, co, this_obj, argv, argc, &rec);\n"
-        "    if (rec.linked) *(JSAotFlRec **)(rt + QJS_AOT_OFF_RT_FL_TOP) = rec.prev;\n"
+        "%s"
         "    return r;\n"
         "}\n",
+        e_linkage(), hex,
+        g_e_kfast ? ""
+                  : "    if (__builtin_expect(--*(int *)((uint8_t *)ctx_in + QJS_AOT_OFF_CTX_INTERRUPT_COUNTER) <= 0, 0)) {\n"
+                    "        ++*(int *)((uint8_t *)ctx_in + QJS_AOT_OFF_CTX_INTERRUPT_COUNTER);\n"
+                    "        if (qjs_aot_poll_fl(ctx_in) < 0) return JS_EXCEPTION;\n"
+                    "    }\n",
+        e_rat() ? "" : e_recscan() ? "    rec.func = co; rec.pc = 0; q2_fl_push(&rec);\n"
+        : (g_e_compact && !e_norec()) ? "    rec.prev = *(JSAotFlRec **)(rt + QJS_AOT_OFF_RT_FL_TOP);\n"
+                      "    rec.func = co; rec.pc = 0; rec.roots = NULL; rec.nroots = 0; rec.linked = 1;\n"
+                      "    *(JSAotFlRec **)(rt + QJS_AOT_OFF_RT_FL_TOP) = &rec;\n"
+                    : "    rec.linked = 0;\n",
+        hex,
+        e_rat() ? "" : e_recscan() ? "    *(JSAotFlRec *volatile *)&rec.prev = NULL;\n" : e_norec() ? "" : g_e_compact ? "    *(JSAotFlRec **)(rt + QJS_AOT_OFF_RT_FL_TOP) = rec.prev;\n"
+                    : "    if (rec.linked) *(JSAotFlRec **)(rt + QJS_AOT_OFF_RT_FL_TOP) = rec.prev;\n");
+    if (qjs_aot_rat_mode()) fputs("#line 1 \"NOFRAME\"\n", f);
+  if (g_e_fl && !g_e_inl)
+    fprintf(
+        f,
+        "E_TEXT %sJSValue aot_e_%s(JSContext *c_, JSRegRun *cf_, JSObject *co_, JSValue t_, JSValue *a_, int n_)\n"
+        "{ return aot_n_%s(c_, cf_, co_, t_, a_, n_); }\n",
         e_linkage(), hex, hex);
   if (g_e_fl)
     fprintf(
         f,
-        "#undef q2_arg_buf\n#undef E_RLINK\n#define E_RLINK(r_) ((void)0)\n#undef qjs_aot_get_var_ref\n"
+        "#undef q2_arg_buf\n#undef E_RTOF\n#define E_RTOF(c_) (*(uint8_t *const *)((const uint8_t *)(c_) + QJS_AOT_OFF_CTX_RT))\n#undef E_RLINK\n#define E_RLINK(r_) ((void)0)\n#undef qjs_aot_get_var_ref\n"
         "#undef qjs_aot_var_ref_ptr\n");
+  if (g_e_lazy_ra) {
+    fprintf(f, "#undef ra_\n");
+    g_e_lazy_ra = 0;
+  }
   if (g_e_fl && !g_e_inl)
     fprintf(
         f,
@@ -16497,6 +17895,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
     if (!g_e_quiet && !g_e_inl) e_report_spec(hex, vals, tiers, checks, lines, bytes);
     if (!g_e_quiet && !g_e_inl && g_e_n_hoist > 0) e_report_hoist(hex, g_e_n_hoist);
   }
+  e_bnd_free();
   e_facts_free(&facts);
   g_e_facts = NULL;
   return 0;
@@ -16521,6 +17920,34 @@ static int e_fl_loops(void) {
 }
 
 /* The loop blocks of the function and whether any loop may run long (see below). */
+/* Mark the instructions of every loop whose body has an effect. A pass over the body has recorded, per instruction, the effects emitted
+   before it in text order (g_e_dirty_ins) and left the state after the last one in g_e_inl_dirty; a loop has an effect when any of its
+   instructions follows one, or when the state after its last instruction is dirty. */
+static void e_inl_loop_dirty(const Q2Func *fn) {
+  int b, si;
+  free(g_e_dirty_loop);
+  g_e_dirty_loop = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  if (g_e_dirty_loop == NULL || g_e_dirty_ins == NULL) abort();
+  for (b = 0; b < fn->nblocks; b++) {
+    const Q2Block *blk = &fn->blocks[b];
+    for (si = 0; si < blk->nsucc && si < 2; si++) {
+      int sb = blk->succ_block[si], first = -1, last = -1, q, dirty = 0;
+      if (sb < 0 || sb >= fn->nblocks || !q2_is_back_edge(fn, b, sb)) continue;
+      for (q = 0; q < fn->ninsns; q++) {
+        int pc = fn->insns[q].pc;
+        if (pc < fn->blocks[sb].start_pc || pc >= blk->end_pc) continue;
+        if (first < 0) first = q;
+        last = q;
+        if (g_e_dirty_ins[q]) dirty = 1;
+      }
+      if (first < 0) continue;
+      if (last + 1 < fn->ninsns ? g_e_dirty_ins[last + 1] : g_e_inl_dirty) dirty = 1;
+      if (dirty)
+        for (q = first; q <= last; q++) g_e_dirty_loop[q] = 1;
+    }
+  }
+}
+
 static void e_fl_loop_setup(const Q2Func *fn) {
   const JSAotGenFunc *g = fn->g;
   {
@@ -16578,6 +18005,61 @@ static int e_call_has_compiled_callee(const Q2Func *fn, const Q2Insn *in) {
   return 0;
 }
 
+/* The variable area of a function that reads `arguments` only as `.length` and `[i]`: the engine elides the object and leaves ONE slot, the
+   arguments slot (the highest variable slot), marked uninitialized by the prologue and named by `get_arg_el` for its slow path. With no
+   formal parameter nothing aliases the arguments, so a frameless body needs no variable area: `.length` is `argc`, `[i]` is `argv[i]`, and a
+   miss leaves for the generic body, whose exit builds the area. Returns that slot, or -1 when the area holds anything else. */
+int e_vargs_slot(const Q2Func *fn) {
+  const JSAotGenFunc *g = fn->g;
+  int i, slot = -1, top = g->light_var_count - 1;
+  if (g->light_var_count <= 0 || g->arg_count != 0 || g->func_kind != E_FUNC_NORMAL) return -1;
+  for (i = 0; i < fn->ninsns; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    char nm[64];
+    if (in->rop == ROP_local_uninit) {
+      if (in->narg < 1 || (int)in->arg[0].val != top) return -1;
+      slot = top;
+      continue;
+    }
+    if (in->rop == ROP_get_arg_el) {
+      if (in->narg < 3 || (int)in->arg[1].val != top) return -1;
+      continue;
+    }
+    if (in->rop == ROP_special_object) {
+      if (in->narg < 2 || in->arg[1].val != 8) return -1;
+      continue;
+    }
+    e_rop_name(in->rop, nm, sizeof(nm));
+    if (strstr(nm, "local") || strstr(nm, "loc_") || strstr(nm, "_loc") || strstr(nm, "apply_arguments") ||
+        strstr(nm, "make_") || strstr(nm, "close_") || strstr(nm, "_ref"))
+      return -1;
+  }
+  return slot;
+}
+
+/* Whether the variable area of `g` is only the elided arguments slot (see e_vargs_slot): a frameless body can serve it. The answer is
+   kept by digest; the function is built once. */
+int e_vargs_capable(const JSAotGenFunc *g) {
+  static struct { uint8_t dg[16]; int v; } memo[256];
+  static int nmemo;
+  Q2Func cf;
+  int i, v;
+  if (g->light_var_count <= 0 || g->arg_count != 0) return 0;
+  for (i = 0; i < nmemo; i++)
+    if (memcmp(memo[i].dg, g->digest, 16) == 0) return memo[i].v;
+  if (q2_build(g, &cf) < 0) {
+    q2_free(&cf);
+    return 0;
+  }
+  v = e_vargs_slot(&cf) >= 0;
+  q2_free(&cf);
+  if (nmemo < 256) {
+    memcpy(memo[nmemo].dg, g->digest, 16);
+    memo[nmemo++].v = v;
+  }
+  return v;
+}
+
 static int e_fused_info(const Q2Func *fn, const Q2Insn *in, char callee_out[33], int *nf, int ao[8], int ai[8]);
 static const char *e_fl_prefilter(const Q2Func *fn) {
   const JSAotGenFunc *g = fn->g;
@@ -16586,7 +18068,7 @@ static const char *e_fl_prefilter(const Q2Func *fn) {
       !(g->func_kind == E_FUNC_NORMAL && g->ctl_count == 0))
     return "not light";
   if (g->light_need > 16 * 1024) return "frame over 16 KB";
-  if (g->light_var_count > 0) return "variable area";
+  if (g->light_var_count > 0 && e_vargs_slot(fn) < 0) return "variable area";
   if (g->func_kind != E_FUNC_NORMAL) return "not a plain function";
   /* A call site keeps the function framed, unless every one is an intrinsic the
      analysis may lower: its fallback is an exit, so the body needs no frame. A
@@ -16658,6 +18140,7 @@ static const char *e_fl_prefilter(const Q2Func *fn) {
     char nm[64];
     size_t k;
     e_rop_name(fn->insns[i].rop, nm, sizeof(nm));
+    if (fn->insns[i].rop == ROP_special_object && fn->insns[i].narg >= 2 && fn->insns[i].arg[1].val == 8) continue;
     for (k = 0; k < sizeof(names) / sizeof(names[0]); k++)
       if (strcmp(nm, names[k]) == 0) {
         static char buf[96];
@@ -16688,9 +18171,27 @@ static int e_fl_enabled(void) {
 #define E_SPEC_BODY_MAX_INSNS 6000
 
 int g_e_spec_fb;   /* the body is a region root's fallback: aot_s_ plus the aot_fs_ wrapper, never frameless, no loop re-entry registration */
+int qjs_aot_unit_len(const char hex[33]);
+/* QJS_AOT_DEBUG_EDGES=1: one line per call site with its profiled callees (hits, callee program length), for choosing what to inline. */
+static void e_debug_edges(const Q2Func *fn) {
+  int i, k;
+  for (i = 0; i < fn->ninsns; i++) {
+    const Q2Insn *in = &fn->insns[i];
+    char callee[4][33];
+    unsigned long long hits[4];
+    int kind[4], n = 0;
+    if (in->rop != ROP_call && in->rop != ROP_call_method && in->rop != ROP_construct) continue;
+    if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, callee, kind, hits)) continue;
+    for (k = 0; k < n && k < 4; k++)
+      fprintf(stderr, "EDGE %llu %s %02x%02x%02x%02x pc %d ops %d argc %d -> %s kind %d len %d\n", hits[k], fn->g->name, fn->g->digest[0], fn->g->digest[1],
+              fn->g->digest[2], fn->g->digest[3], in->pc, fn->ninsns, in->win_n, callee[k], kind[k], kind[k] == 1 ? qjs_aot_unit_len(callee[k]) : -1);
+  }
+}
+
 int e_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
   const char *why;
   int rc;
+  if (getenv("QJS_AOT_DEBUG_EDGES") != NULL) e_debug_edges(fn);
   g_e_fl_chosen = 0;
   g_e_fl_why[0] = 0;
   if (fn->ninsns > E_SPEC_BODY_MAX_INSNS) {
@@ -16722,6 +18223,9 @@ int e_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
     g_e_fl_calls = 0;
     g_e_spill_total = 0;
     g_e_child_max = 0;
+    g_e_rt = 0;
+    g_e_cm = getenv("QJS_AOT_NOCOMPACT") == NULL;
+    g_e_compact = 0;
     g_e_fl_block[0] = 0;
     rc = e_emit_spec_body_pass(m, fn, hex);
     fclose(m);
@@ -16733,7 +18237,23 @@ int e_emit_spec_body(FILE *f, const Q2Func *fn, char hex[33]) {
 
     if (rc == 0 && g_e_fl_block[0] == 0) {
       g_e_fl_chosen = 1;
+      g_e_compact = g_e_fl_calls && g_e_cm;
+      if (g_e_compact && getenv("QJS_AOT_COMPACT_ONLY") != NULL) {
+        /* a bisection aid: only the listed digests (comma-separated hex prefixes) take the compact layout; "none" lists nothing */
+        const char *l = getenv("QJS_AOT_COMPACT_ONLY"), *p = l;
+        int hit = 0;
+        while (*p != 0) {
+          const char *e = strchr(p, ',');
+          size_t n = e != NULL ? (size_t)(e - p) : strlen(p);
+          if (n > 0 && strncmp(hex, p, n) == 0) hit = 1;
+          p += n + (e != NULL ? 1 : 0);
+        }
+        g_e_compact = hit;
+      }
+      if (getenv("QJS_AOT_COMPACT_STAT") != NULL)
+        fprintf(stderr, "compact: %s %s calls=%d child=%d rt=%d\n", hex, g_e_compact ? "yes" : "no", g_e_fl_calls, g_e_child_decl, g_e_rt);
       rc = e_emit_spec_body_pass(f, fn, hex);
+      g_e_compact = 0;
       g_e_fl = 0;
       return rc;
     }
@@ -16871,7 +18391,7 @@ static int e_emit_inline_body_v(
     snprintf(why, whyn, "out of memory");
     return 0;
   }
-  if (ncalls > 6) {
+  if (ncalls > (getenv("QJS_AOT_INL_NCALLS") ? atoi(getenv("QJS_AOT_INL_NCALLS")) : 6)) {
     snprintf(why, whyn, "%d calls", ncalls);
     fclose(m);
     free(mb);
@@ -16882,6 +18402,9 @@ static int e_emit_inline_body_v(
   g_e_inl = 1;
   g_e_quiet = 1;
   g_e_inl_r = ncalls > 0;
+  g_e_cm = getenv("QJS_AOT_NOCOMPACT") == NULL;
+  g_e_rt = 0;
+  g_e_compact = g_e_cm && g_e_inl_r;
   g_e_last_inl_tl = 0;
   g_e_inl_safepoint = 0;
   g_e_inl_pending = 0;
@@ -16889,6 +18412,8 @@ static int e_emit_inline_body_v(
   g_e_child_max = 0;
   g_e_child_decl = 0;
   g_e_fl_block[0] = 0;
+  free(g_e_dirty_loop);
+  g_e_dirty_loop = NULL;
   if (g_e_inl_r) {
     char *tb = NULL;
     size_t tl = 0;
@@ -16897,15 +18422,45 @@ static int e_emit_inline_body_v(
       rc = e_emit_spec_body_pass(tm, fn, hex);
       fclose(tm);
       free(tb);
+      e_inl_loop_dirty(fn);
       g_e_spill_total = g_e_spill_n;
       g_e_child_decl = g_e_child_max;
       g_e_child_max = 0;
       g_e_fl_block[0] = 0;
     }
   }
+  if (!g_e_inl_r) {
+    /* A body without calls can still store in a loop: one quiet pass tells the exits which instructions follow an effect on a later iteration. */
+    int lb, has_loop = 0;
+    for (lb = 0; lb < fn->nblocks && !has_loop; lb++) {
+      int sx;
+      for (sx = 0; sx < fn->blocks[lb].nsucc && sx < 2; sx++) {
+        int sb = fn->blocks[lb].succ_block[sx];
+        if (sb >= 0 && sb < fn->nblocks && q2_is_back_edge(fn, lb, sb)) has_loop = 1;
+      }
+    }
+    if (has_loop) {
+      char *tb = NULL;
+      size_t tl = 0;
+      FILE *tm = open_memstream(&tb, &tl);
+      if (tm != NULL) {
+        (void)e_emit_spec_body_pass(tm, fn, hex);
+        fclose(tm);
+        free(tb);
+        e_inl_loop_dirty(fn);
+        g_e_fl_block[0] = 0;
+        g_e_inl_safepoint = 0;
+        g_e_inl_pending = 0;
+        g_e_last_inl_tl = 0;
+      }
+    }
+  }
   rc = e_emit_spec_body_pass(m, fn, hex);
   g_e_inl_r = 0;
+  g_e_compact = 0;
   fclose(m);
+  free(g_e_dirty_loop);
+  g_e_dirty_loop = NULL;
   g_e_fl = 0;
   g_e_inl = 0;
   g_e_quiet = 0;

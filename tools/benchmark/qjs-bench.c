@@ -24,7 +24,9 @@
  * because the input buffer remains allocated until the runtime is destroyed.
  */
 
+#include <fcntl.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -144,8 +146,13 @@ static JSContext *bench_irq_ctx;
 static JSValue bench_irq_obj = JS_UNDEFINED;
 static int bench_irq_period, bench_irq_count;
 
+/* QJS_BENCH_MAX_SECS=N: the run stops (an uncatchable interrupt, exit status 0, the profile still written) after N seconds of script time.
+   For profiling a benchmark without running it to the end; the interrupt is polled, so the stop is within a few milliseconds. */
+static double bench_deadline_ms;
+static int bench_capped;
 static int bench_interrupt_cb(JSRuntime *rt, void *opaque) {
   (void)opaque;
+  if (bench_deadline_ms > 0 && now_ms() > bench_deadline_ms) { bench_capped = 1; return 1; }
   if (bench_irq_period > 0 && ++bench_irq_count % bench_irq_period == 0 &&
       !JS_IsUndefined(bench_irq_obj)) {
     JSContext *c = bench_irq_ctx;
@@ -391,6 +398,27 @@ static JSValue js_fact_validate(
   return JS_NewInt32(ctx, g ? qjs_aot_fact_validate(ctx, g) : -1);
 }
 
+/* perf_ctl("enable"|"disable"): writes the command to the perf control fifo named by QJS_PERF_CTL, so a profile can be limited to the timed part of a suite. Nothing happens without the variable. */
+static JSValue js_perf_ctl(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  static int fd = -2;
+  const char *cmd;
+  (void)this_val;
+  if (fd == -2) {
+    const char *path = getenv("QJS_PERF_CTL");
+    fd = path ? open(path, O_WRONLY) : -1;
+  }
+  if (fd < 0 || argc < 1) return JS_UNDEFINED;
+  cmd = JS_ToCString(ctx, argv[0]);
+  if (cmd) {
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%s\n", cmd);
+    if (write(fd, buf, (size_t)n) < 0) { /* ignored */ }
+    JS_FreeCString(ctx, cmd);
+  }
+  return JS_UNDEFINED;
+}
+
 static JSValue js_fact_state(
     JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   JSAotFact *g = argc > 0 ? bench_fact_of(ctx, argv[0]) : NULL;
@@ -529,7 +557,9 @@ int main(int argc, char **argv) {
     const char *ip = getenv("QJS_BENCH_INTERRUPT"),
                *irq = getenv("QJS_BENCH_IRQ_HEAP");
     if (irq && *irq) bench_irq_period = atoi(irq);
-    if ((ip && *ip) || bench_irq_period > 0) {
+    const char *ms = getenv("QJS_BENCH_MAX_SECS");
+    if (ms && *ms && atof(ms) > 0) bench_deadline_ms = now_ms() + atof(ms) * 1000.0;
+    if ((ip && *ip) || bench_irq_period > 0 || bench_deadline_ms > 0) {
       if (ip && *ip) bench_interrupt_left = atoi(ip);
       JS_SetInterruptHandler(rt, bench_interrupt_cb, NULL);
     }
@@ -601,6 +631,9 @@ int main(int argc, char **argv) {
       ctx, global, "fact_state",
       JS_NewCFunction(ctx, js_fact_state, "fact_state", 1));
   JS_SetPropertyStr(
+      ctx, global, "perf_ctl",
+      JS_NewCFunction(ctx, js_perf_ctl, "perf_ctl", 1));
+  JS_SetPropertyStr(
       ctx, global, "fact_bit",
       JS_NewCFunction(ctx, js_fact_bit, "fact_bit", 1));
   JS_SetPropertyStr(
@@ -625,8 +658,8 @@ int main(int argc, char **argv) {
   double t_eval = now_ms();
   int status = 0;
   if (JS_IsException(result)) {
-    dump_exception(ctx);
-    status = 1;
+    if (bench_capped) fprintf(stderr, "bench: stopped after QJS_BENCH_MAX_SECS\n");
+    else { dump_exception(ctx); status = 1; }
   }
   JS_FreeValue(ctx, result);
 

@@ -1,0 +1,57 @@
+Subject: Bytecodes with the same register program share the unit entry
+
+What this does
+  - js_aot_bind binds the unit function to every live bytecode with its digest, not to the first one only. The per-function bound flag becomes a count (decremented when a bytecode goes, saturating at 255 holders; the 256th stays interpreted). aot_bc_tab keeps the first holder.
+  - QJS_AOT_NOTWINS=1 restores one holder per function.
+
+Why we need it
+  Two methods with identical bodies (typescript's Scanner and SavedTokens `lastTokenHadNewline`, mandreel's emitted duplicates) have one digest. The second bytecode had an identity but no entry, so every compiled call site that pins the first one failed its callee test on the second, exited, and after 257 exits the whole caller was gated.
+
+Soundness
+  The entry is passed the function object and reads caches, constants and closure cells through its own bytecode; identity of the register program is the digest, which the bind already checks. Gating and unbinding act on each bytecode separately.
+
+Failure modes
+  A unit function that keeps per-function state outside the bytecode would be shared by the holders; none does.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -69539,7 +69539,7 @@
+ 
+     if (rbc_n) rbc_del(b);
+     if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && b->realm->rt->aot_bound != NULL) {
+-        b->realm->rt->aot_bound[b->aot_index] = 0;
++        if (b->realm->rt->aot_bound[b->aot_index] > 0) b->realm->rt->aot_bound[b->aot_index]--;
+         if (aot_bc_tab && aot_bc_tab[b->aot_index] == b) aot_bc_tab[b->aot_index] = NULL;
+     }
+     if (b->aot_fn != NULL) {
+@@ -69587,14 +69587,18 @@
+             if (!js_aot_unit_claim(b->realm->rt))
+                 return;         /* the unit is bound in another runtime: this one interprets */
+             b->aot_ident = (void *)qjs_aot_table[mid].fn;
+-            if (b->realm->rt->aot_bound == NULL || b->realm->rt->aot_bound[mid])
++            if (b->realm->rt->aot_bound == NULL)
++                return;
++            /* A second live bytecode with the same register program (two methods with identical bodies, or the same function
++               evaluated twice) runs the same entry: the bound count keeps the index held until the last one goes. */
++            if (b->realm->rt->aot_bound[mid] && (getenv("QJS_AOT_NOTWINS") != NULL || b->realm->rt->aot_bound[mid] == 255))
+                 return;         /* another live bytecode holds this function */
+-            b->realm->rt->aot_bound[mid] = 1;
++            b->realm->rt->aot_bound[mid]++;
+             b->aot_fn = (void *)qjs_aot_table[mid].fn;
+             b->aot_nfn = (void *)qjs_aot_table[mid].nfn;
+             b->aot_index = mid;
+             if (aot_bc_tab == NULL) aot_bc_tab = calloc(qjs_aot_count ? qjs_aot_count : 1, sizeof(*aot_bc_tab));
+-            if (aot_bc_tab) aot_bc_tab[mid] = b;
++            if (aot_bc_tab && aot_bc_tab[mid] == NULL) aot_bc_tab[mid] = b;
+             b->aot_state = 1;   /* bound */
+             /* The register file the unit compiled this body for. It may be wider
+                than `regvm_reg_count`: the generator allocates registers above the
+@@ -85151,7 +85155,7 @@
+        another bytecode to bind. */
+     if (rbc_n) rbc_del(b);
+     if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && rt->aot_bound != NULL) {
+-        rt->aot_bound[b->aot_index] = 0;
++        if (rt->aot_bound[b->aot_index] > 0) rt->aot_bound[b->aot_index]--;
+         if (aot_bc_tab && aot_bc_tab[b->aot_index] == b) aot_bc_tab[b->aot_index] = NULL;
+     }
+     /* The polymorphic property cache is independent of the register PIC, so it

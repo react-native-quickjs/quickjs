@@ -116,13 +116,14 @@ static void e_emit_native_entry_x(FILE *f, const Q2Func *fn, char hex[33], int r
       need, slots, has_var ? "present" : "absent", has_var ? vc : 0,
       g->var_count, nregs);
 
+  if (qjs_aot_rat_mode()) fputs("#line 1 \"NOFRAME\"\n", f);
   fprintf(
       f,
-      "E_TEXT %sJSValue aot_n%s_%s(JSContext *ctx, JSRegRun *caller_f,\n"
+      "E_TEXT %s%sJSValue aot_n%s_%s(JSContext *ctx, JSRegRun *caller_f,\n"
       "                               JSObject *co, JSValue this_obj,\n"
       "                               JSValue *argv, int argc%s)\n"
       "{\n",
-      e_linkage(), rs ? "r" : "", hex, rs ? ", JSValue *rs" : "");
+      e_linkage(), rs ? "" : "E_NONE ", rs ? "r" : "", hex, rs ? ", JSValue *rs" : "");
   /* The frame. Over-aligned because the register file inside it is read as
      JSValue and the engine's own frames are 16-byte aligned. */
   fprintf(
@@ -242,6 +243,14 @@ static void e_emit_native_entry_x(FILE *f, const Q2Func *fn, char hex[33], int r
   if (has_var)
     fprintf(f, "    qjs_aot_light_release(realm, (JSRegRun *)nf);\n");
   fprintf(f, "    return ret;\n}\n\n");
+  /* the C-convention entry for the engine and the entry tables */
+    if (qjs_aot_rat_mode()) fputs("#line 1 \"NOFRAME\"\n", f);
+  if (!rs)
+    fprintf(
+        f,
+        "E_TEXT %sJSValue aot_e_%s(JSContext *c_, JSRegRun *cf_, JSObject *co_, JSValue t_, JSValue *a_, int n_)\n"
+        "{ return aot_n_%s(c_, cf_, co_, t_, a_, n_); }\n\n",
+        e_linkage(), hex, hex);
 }
 
 /* --- the frameless entry -------------------------------------- */
@@ -254,23 +263,35 @@ static void e_emit_native_entry_x(FILE *f, const Q2Func *fn, char hex[33], int r
    so there is no stack check, no poll and no release; the frame is small (rule 1).
    It takes ONE pointer for everything about the exit, so that leaving costs the
    body no more arguments than entering did. */
-static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char hex[33], const char *prefix);
+int e_vargs_slot(const Q2Func *fn);
+static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char hex[33], const char *prefix, int vslot);
 void e_emit_frameless_exit_fn(FILE *f, const Q2Func *fn, char hex[33]) {
   /* The wider register file, as the native entry uses: the generic body the exit
      continues into reads and writes every register this body was compiled with. */
   int nregs = qjs_aot_frame_regs(qjs_aot_cur_func_idx());
   if (nregs < fn->nregs) nregs = fn->nregs;
-  e_emit_exit_fn_named(f, fn->g, nregs, hex, "aot_nx_");
+  e_emit_exit_fn_named(f, fn->g, nregs, hex, "aot_nx_", e_vargs_slot(fn));
 }
 
 /* `aot_rx_HEX`: the same entry, for a copy of this function in a compiled caller that leaves the copy in the
    middle: it runs the generic body from the callee pc the copy had reached, with the registers the copy holds. Emitted
    for any unit function a caller asks for, whether or not it has a frameless body. */
 void e_emit_resume_fn(FILE *f, const JSAotGenFunc *g, int nregs, char hex[33]) {
-  e_emit_exit_fn_named(f, g, nregs, hex, "aot_rx_");
+  e_emit_exit_fn_named(f, g, nregs, hex, "aot_rx_", -1);
 }
 
-static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char hex[33], const char *prefix) {
+static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char hex[33], const char *prefix, int vslot) {
+  char varsetup[256], varfill[256];
+  const char *varbuf = vslot >= 0 ? "vb" : "NULL";
+  const char *flagstr = vslot >= 0 ? "" : "QJS_AOT_REGVM_FLAG_TRIVIAL_RET |\n";
+  const char *release = vslot >= 0 ? "    qjs_aot_light_release(realm, (JSRegRun *)nf);\n" : "";
+  if (vslot >= 0) {
+    snprintf(varsetup, sizeof(varsetup), "    JSValue *vb = mem + QJS_AOT_LIGHT_PREFIX_SLOTS;\n    JSValue *regs = vb + %d;\n", g->var_count);
+    snprintf(varfill, sizeof(varfill), "    for (k = 0; k < %d; k++)\n        __builtin_memcpy(&vb[k], &e_undefined_value, sizeof(JSValue));\n    vb[%d] = JS_MKVAL(JS_TAG_UNINITIALIZED, 0);\n", g->var_count, vslot);
+  } else {
+    snprintf(varsetup, sizeof(varsetup), "    JSValue *regs = mem + QJS_AOT_LIGHT_PREFIX_SLOTS;\n");
+    varfill[0] = 0;
+  }
   int slots = g->light_need > 0 ? (g->light_need + (int)sizeof(JSValue) - 1) / (int)sizeof(JSValue) : 0;
   int need = g->light_need
              + (int)sizeof(JSValue)
@@ -284,8 +305,9 @@ static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char
   if (g->light_ok)
     snprintf(slotsx, sizeof(slotsx), "%d", slots);
   else
-    snprintf(slotsx, sizeof(slotsx), "QJS_AOT_LIGHT_PREFIX_SLOTS + %d", nregs > 0 ? nregs : 1);
+    snprintf(slotsx, sizeof(slotsx), "QJS_AOT_LIGHT_PREFIX_SLOTS + %d", (nregs > 0 ? nregs : 1) + (vslot >= 0 ? g->var_count : 0));
 
+  if (qjs_aot_rat_mode()) fputs("#line 1 \"NOFRAME\"\n", f);
   fprintf(
       f,
       "/* The exit of the frameless body: builds the frame and runs the generic\n"
@@ -302,17 +324,24 @@ static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char
       "QJS_AOT_OFF_OBJECT_FUNC_BYTECODE);\n"
       "    JSContext *realm = *(JSContext **)(cb + QJS_AOT_OFF_FNBC_REALM);\n"
       "    uint8_t *rt = *(uint8_t **)((uint8_t *)ctx + QJS_AOT_OFF_CTX_RT);\n"
-      "    JSValue *regs = mem + QJS_AOT_LIGHT_PREFIX_SLOTS;\n"
+      "    const uint8_t *const q2_rt = rt; uint32_t q2_ep = *(const uint32_t *)(q2_rt + QJS_AOT_OFF_RT_PIC_EPOCH); (void)q2_rt; (void)q2_ep;\n"
+      "%s"
       "    int argc = x->argc;\n"
       "    JSRegRun *prev;\n"
       "    JSValue ret;\n"
       "    int k;\n"
       "\n"
+      "#ifdef QJS_AOT_RAT\n"
+      "    (void)x->rec;\n"
+      "#elif defined(QJS_AOT_RECSCAN)\n"
+      "    if (x->rec != NULL) *(JSAotFlRec *volatile *)&((JSAotFlRec *)x->rec)->prev = NULL;\n"
+      "#else\n"
       "    if (x->rec != NULL && x->rec->linked) { E_FL_TOP(ctx) = x->rec->prev; ((JSAotFlRec *)x->rec)->linked = 0; }\n"
+      "#endif\n"
       "    if (__builtin_expect(e_exit_log_v != 0, 0) && x->kind != NULL) {\n"
       "        static int seen_[1024];\n"
       "        int *sp_ = &seen_[(x->pc * 7 + x->kind[0]) & 1023];\n"
-      "        if (!*sp_) e_exit_log(\"%s\", x->kind, x->pc, x->tag, sp_);\n"
+      "        if (!*sp_) e_exit_log(\"%s\", x->kind, x->pc, x->tag, sp_, NULL, 0);\n"
       "    }\n"
       "%s"
       "    if (%s__builtin_expect(*(void **)(cb + QJS_AOT_OFF_FNBC_REGVM_PIC) == "
@@ -327,20 +356,21 @@ static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char
       "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_FR) = regs;\n"
       "    *(void **)(nf + QJS_AOT_OFF_REGRUN_VAR_REFS) =\n"
       "        *(void **)((uint8_t *)co + QJS_AOT_OFF_OBJECT_FUNC_VAR_REFS);\n"
-      "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_VAR_BUF) = NULL;\n"
+      "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_VAR_BUF) = %s;\n"
       "    *(JSValue **)(nf + QJS_AOT_OFF_REGRUN_ARG_BUF) = argv;\n"
       "    *(uint64_t *)(nf + QJS_AOT_OFF_REGRUN_HDR_PACK) =\n"
       "        ((uint64_t)(uint16_t)argc << 16) |\n"
       "        ((uint64_t)(uint32_t)(QJS_AOT_REGVM_FLAG_LIGHT |\n"
       "                    QJS_AOT_REGVM_FLAG_C_ENTRY |\n"
       "                    QJS_AOT_REGVM_FLAG_STACK |\n"
-      "                    QJS_AOT_REGVM_FLAG_TRIVIAL_RET |\n"
+      "                    %s"
       "                    (realm == ctx ? QJS_AOT_REGVM_FLAG_SAME_REALM : 0)) "
       "<< 32);\n"
       "    *(JSObject **)(nf + QJS_AOT_OFF_REGRUN_FUNC) = co;\n"
       "    *(void **)(nf + QJS_AOT_OFF_REGRUN_CAP_IP) = NULL;\n"
       "    *(void **)(nf + QJS_AOT_OFF_REGRUN_SF) = NULL;\n"
       "    *(JSValue *)(nf + QJS_AOT_OFF_REGRUN_THIS_OBJ) = this_obj;\n"
+      "%s"
       "    for (k = 0; k < %d; k++)\n"
       "        __builtin_memcpy(&regs[k], &e_undefined_value, "
       "sizeof(JSValue));\n"
@@ -349,14 +379,15 @@ static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char
       "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = (JSRegRun *)nf;\n"
       "    ret = aot_g_%s(realm, (JSRegRun *)nf, regs, (uint32_t)x->pc);\n"
       "    *(JSRegRun **)(rt + QJS_AOT_OFF_RT_REGVM_CUR) = prev;\n"
+      "%s"
       "    return ret;\n"
       "}\n\n",
-      e_linkage(), prefix, hex, slotsx, hex,
+      e_linkage(), prefix, hex, slotsx, varsetup, hex,
       /* an exit at the entry with nothing live is the call itself handed back: the interpreter makes it, no frame is built here */
       e_nogeneric() && getenv("QJS_AOT_KO_GATEFRAME") == NULL && strcmp(prefix, "aot_nx_") == 0
           ? "    if (x->pc == 0 && x->n == 0) return qjs_aot_call_interp(ctx, co, this_obj, argv, argc);\n"
           : "",
-      g->pic_count > 0 ? "" : "0 && ", nregs, hex);
+      g->pic_count > 0 ? "" : "0 && ", varbuf, flagstr, varfill, nregs, hex, release);
 }
 
 /* `aot_f_HEX` for a frameless function: the engine still enters through it with a
@@ -366,6 +397,7 @@ static void e_emit_exit_fn_named(FILE *f, const JSAotGenFunc *g, int nregs, char
    the arguments the caller passed (`argc` of them). A call with fewer than the
    declared arguments, or a resume at a pc, takes the generic body. */
 void e_emit_frameless_forward(FILE *f, const Q2Func *fn, char hex[33]) {
+  if (qjs_aot_rat_mode()) fputs("#line 1 \"NOFRAME\"\n", f);
   fprintf(
       f,
       "E_TEXT %sJSValue aot_f_%s(JSContext *ctx, JSRegRun *f,\n"
@@ -440,7 +472,7 @@ static int e_inline_typed_ok(const Q2Func *fn) {
       if (!ok) continue;
     }
     /* a nullish test reads the tag of any value */
-    if (in->rop == ROP_branch_nullish || in->rop == ROP_branch_not_nullish) continue;
+    if (in->rop == ROP_branch_nullish || in->rop == ROP_branch_not_nullish || in->rop == ROP_branch_null || in->rop == ROP_branch_not_null) continue;
     if (in->op != Q2_OP_BINARY && in->op != Q2_OP_COMPARE && in->op != Q2_OP_UNARY &&
         in->op != Q2_OP_BRANCH_CMP && in->op != Q2_OP_BRANCH &&
         !(in->op == Q2_OP_FALLBACK && (in->rop == ROP_eq || in->rop == ROP_neq ||
@@ -452,6 +484,14 @@ static int e_inline_typed_ok(const Q2Func *fn) {
       if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  copy: remainder at clone pc %d\n", in->pc);
       ok = 0;
       continue;
+    }
+    /* an equality of two tagged values is decided by the chain str_eq / mixed_cmp / ident_cmp, which never leaves: a copy needs no typed operands for it */
+    if ((in->rop == ROP_branch_cmp_reg_reg || in->rop == ROP_branch_cmp_reg_reg_s) && in->nuse == 2 && in->narg >= 1 && in->arg[0].kind == 'b' &&
+        in->use[0] < (Q2ValueId)types.nvalues && in->use[1] < (Q2ValueId)types.nvalues && getenv("QJS_AOT_NOCOPYEQ") == NULL) {
+      int bs = (int)in->arg[0].val & ~REG_CMP_INVERT;
+      if ((bs == REG_BIN_EQ || bs == REG_BIN_NEQ || bs == REG_BIN_STRICT_EQ || bs == REG_BIN_STRICT_NEQ) &&
+          types.lb[in->use[0]] == E_LB_TAG && types.lb[in->use[1]] == E_LB_TAG)
+        continue;
     }
     for (k = 0; k < in->nuse; k++)
       if (in->use[k] >= (Q2ValueId)types.nvalues || types.lb[in->use[k]] == E_LB_TAG ||
@@ -704,6 +744,7 @@ int e_emit_body(FILE *f, const JSAotGenFunc *g, char hex[33]) {
       g_e_spec_fb = rok;
       if (rok && e_nogeneric() && getenv("QJS_AOT_KO_SPECTWIN") == NULL && getenv("QJS_AOT_KO_GATEFRAME") == NULL) {
         /* the interpreter serves an entry the region cannot, as it serves every other exit: the speculative twin of the root is not emitted */
+        if (qjs_aot_rat_mode()) fputs("#line 1 \"NOFRAME\"\n", f);
         fprintf(f, "E_TEXT static JSValue aot_fs_%s(JSContext *ctx, JSRegRun *f, JSValue *fr, uint32_t entry_pc)\n{\n"
                    "    return qjs_aot_deopt(ctx, f, fr, entry_pc, QJS_AOT_NO_SITE);\n}\n", hex);
         rc = 0;

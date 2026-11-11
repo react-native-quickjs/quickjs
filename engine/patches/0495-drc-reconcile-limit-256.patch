@@ -1,0 +1,23 @@
+Subject: Deferred counting: the smallest reconcile limit is 256 zero-count objects (was 4096)
+
+What this does
+  - quickjs.c: `js_drc_minlim` (the floor of `rt->zct_limit`, read at the two places that set the limit) defaults to 256 instead of 4096. The
+    `QJS_DRC_MINLIM` environment knob is unchanged.
+
+Why we need it
+  Earleyboyer (eb-det): -3.2% cycles and -30% LLC load misses (19.0 M -> 13.2 M); the cycles plateau runs from 2048 down to 64, best at
+  128-256. Frees run while the freed cells and their children are still cached, and allocation reuses hot blocks from the block cache
+  (reviewer MSG 667/668).
+
+Soundness
+  A tuning constant only: the limit decides when a reconcile runs, never what it frees.
+
+Failure modes
+  The cost moves to more frequent reconcile scans on workloads with deep stacks (the scan is O(roots) per reconcile). Instructions rise
+  0.4% on eb-det. Check alloc-heavy kernels and one deep-recursion case at the end pass; the fallback is a per-unit setting at unit init.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -4568 +4568 @@
+-static uint32_t js_drc_minlim = 4096;
++static uint32_t js_drc_minlim = 256;

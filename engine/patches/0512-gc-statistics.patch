@@ -1,0 +1,113 @@
+Subject: Collector statistics behind QJS_GC_STATS
+
+What this does
+  - quickjs.c js_run_gc: when QJS_GC_STATS is set, counts per kind (full, young) the runs, the cycles spent in the pin and reconcile, the trial-deletion pass, the freeing of the garbage and the unpin, the objects examined (young: the set S; full: the length of gc_obj_list), the garbage found and the bytes freed; prints them to stderr at exit.
+
+Why we need it
+  The young collection (0511) did not lower the collector's share on deltablue; the counters show how often each kind runs, how big the young set is and how much of it is garbage.
+
+Soundness
+  Statistics only. With the variable unset the cost is one predictable branch per collection.
+
+Failure modes
+  With the variable set the list walks that count objects touch the whole heap; use it for counting, not for timing the pass.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -13128,8 +13128,37 @@
+     return rt->malloc_state.malloc_size;
+ }
+ 
++/* Collector statistics, printed at exit when QJS_GC_STATS is set: per kind (0 full, 1 young) the number of runs, the cycles spent in the pin and reconcile, the trial-deletion
++   passes, the freeing of the garbage and the unpin, the objects examined (young: the set S; full: the length of gc_obj_list), the garbage found and the bytes freed. */
++static struct { uint64_t n, c_pin, c_pass, c_free, c_unpin, examined, max_examined, garbage, bytes; } gc_stat[2];
++static int gc_stat_on = -1;
++
++static void gc_stat_report(void)
++{
++    static const char *nm[2] = { "full", "young" };
++    int k;
++
++    for (k = 0; k < 2; k++) {
++        if (!gc_stat[k].n)
++            continue;
++        fprintf(stderr, "gc %-5s runs=%lu pin+reconcile_cyc=%lu pass_cyc=%lu free_cyc=%lu unpin_cyc=%lu examined=%lu (max %lu) garbage=%lu bytes_freed=%lu\n", nm[k],
++                (unsigned long)gc_stat[k].n, (unsigned long)gc_stat[k].c_pin, (unsigned long)gc_stat[k].c_pass, (unsigned long)gc_stat[k].c_free,
++                (unsigned long)gc_stat[k].c_unpin, (unsigned long)gc_stat[k].examined, (unsigned long)gc_stat[k].max_examined,
++                (unsigned long)gc_stat[k].garbage, (unsigned long)gc_stat[k].bytes);
++    }
++}
++
+ static void js_run_gc(JSRuntime *rt, bool young)
+ {
++    uint64_t t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, tp = 0;
++    size_t sz0 = rt->malloc_state.malloc_size;
++    if (unlikely(gc_stat_on < 0)) {
++        gc_stat_on = getenv("QJS_GC_STATS") != NULL;
++        if (gc_stat_on)
++            atexit(gc_stat_report);
++    }
++    if (unlikely(gc_stat_on))
++        t0 = __builtin_ia32_rdtsc();
+ #if QJS_REGVM && QJS_DRC_VALIDATE
+     js_drc_validate_roots(rt);
+ #endif
+@@ -13140,6 +13169,8 @@
+     js_drc_pin(rt);
+     js_drc_reconcile_locked(rt);
+ #endif
++    if (unlikely(gc_stat_on))
++        t1 = __builtin_ia32_rdtsc();
+     if (young) {
+         gc_young(rt);
+     } else {
+@@ -13151,8 +13182,31 @@
+         gc_scan(rt);
+     }
+ 
++    if (unlikely(gc_stat_on)) {
++        struct list_head *e_;
++        uint64_t g = 0, ex = 0;
++        int k = young;
++
++        tp = __builtin_ia32_rdtsc();
++        for (e_ = rt->tmp_obj_list.next; e_ != &rt->tmp_obj_list; e_ = e_->next)
++            g++;
++        if (young) {
++            ex = gc_young_n;
++        } else {
++            for (e_ = rt->gc_obj_list.next; e_ != &rt->gc_obj_list; e_ = e_->next)
++                ex++;
++            ex += g;
++        }
++        gc_stat[k].garbage += g;
++        gc_stat[k].examined += ex;
++        if (ex > gc_stat[k].max_examined)
++            gc_stat[k].max_examined = ex;
++        t2 = __builtin_ia32_rdtsc();
++    }
+     /* free the GC objects in a cycle */
+     gc_free_cycles(rt);
++    if (unlikely(gc_stat_on))
++        t3 = __builtin_ia32_rdtsc();
+     js_arena_trim(rt);
+     if (!young) {
+         rt->gc_young_streak = 0;
+@@ -13169,6 +13223,17 @@
+ #endif
+     js_drc_rearm_malloc_mark(rt);
+ #endif
++    if (unlikely(gc_stat_on)) {
++        int k = young;
++
++        t4 = __builtin_ia32_rdtsc();
++        gc_stat[k].n++;
++        gc_stat[k].c_pin += t1 - t0;
++        gc_stat[k].c_pass += tp - t1;
++        gc_stat[k].c_free += t3 - t2;
++        gc_stat[k].c_unpin += t4 - t3;
++        gc_stat[k].bytes += sz0 > rt->malloc_state.malloc_size ? sz0 - rt->malloc_state.malloc_size : 0;
++    }
+ }
+ 
+ void JS_RunGC(JSRuntime *rt)

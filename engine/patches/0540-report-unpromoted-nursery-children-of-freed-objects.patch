@@ -1,0 +1,47 @@
+Subject: A freed plain object that holds an unpromoted nursery cell is reported under QJS_Y_STRICT=1
+
+What this does
+  - quickjs.c y_unpromoted_child (cold, new): called from the skip in free_plain_object (0539) when the child is a nursery cell that Y_IS no longer sees (its chunk was closed by y_collect) but whose count is still the nursery bias. By default nothing changes (the cell is dead and skipped, as js_free_value_rt skips it). With QJS_Y_STRICT=1 it prints the parent and the cell and aborts.
+
+Why we need it
+  The 0539 crash was the symptom of a store that left an old object holding a nursery cell the next young collection did not promote: q2_fill_old (the constructor fill generated for a refused nursery fill) moved or copied an argument into the new old object with the plain q2_dup, which does not record a young cell as a root, because it was emitted before the unit remaps q2_dup to q2_dup_nl. The generator now uses q2_dupn there. A cell in that state is a dangling reference in a live parent in general (the parent was only freed here); the strict mode is how any other store of the kind is found: run the programs with QJS_Y_STRICT=1.
+
+Soundness
+  Without the variable the behaviour is 0539's. With it the process aborts at a point that is already an invariant violation.
+
+Failure modes
+  None without the variable. A freed parent that legitimately holds an unpromoted cell cannot exist: a parent that is still reachable would have kept the cell alive as a root.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -11700,6 +11700,21 @@
+     js_free_block_flat(rt, ptr);
+ }
+ 
++/* A child of a plain object being freed whose count is still the nursery bias while its chunk is closed: the nursery collection did not promote it, so
++   whoever stored it in an old object did not record it as a root. It is dead and skipped, as js_free_value_rt skips it; QJS_Y_STRICT=1 reports the
++   parent and aborts, to find the store. */
++static __attribute__((noinline, cold)) void y_unpromoted_child(void *c, JSObject *parent)
++{
++    static int strict = -1;
++
++    if (strict < 0)
++        strict = getenv("QJS_Y_STRICT") != NULL;
++    if (strict) {
++        fprintf(stderr, "QJS_Y_STRICT: plain object %p (class %d) holds the unpromoted nursery cell %p (kind %x)\n", (void *)parent, parent->class_id, c, ((uint8_t *)c)[21]);
++        abort();
++    }
++}
++
+ static inline __attribute__((always_inline)) void
+ free_plain_object(JSRuntime *rt, JSObject *p, JSFreeAcc *acc)
+ {
+@@ -11736,6 +11751,8 @@
+                 if (JS_VALUE_HAS_REF_COUNT(v) && (SPL_K(7), 1) &&
+                     --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0) {
+                     if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && (Y_IS(JS_VALUE_GET_PTR(v)) || Y_NEGCHK(v))) {
++                        if (unlikely(!Y_IS(JS_VALUE_GET_PTR(v))))
++                            y_unpromoted_child(JS_VALUE_GET_PTR(v), p);
+                         pr++;
+                         continue;
+                     }

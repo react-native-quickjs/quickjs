@@ -1,0 +1,31 @@
+Subject: A cached add-transition store promotes a nursery receiver first
+
+What this does
+  - quickjs.c: `regvm_put_field_add_hit` calls `y_promote_now` on a receiver that is still a young cell before it swaps the shape and stores the value.
+
+Why we need it
+  A young cell holds no count on its shape and counts none of its edges until promotion. The replay of a cached add moves counted references (takes the new shape, drops the old one, duplicates the value), so on a young receiver it dropped a reference the cell never held. The shape's count went negative and `js_free_shape0` stopped on `JS_REF_COUNT(sh) == 0` (the typescript Octane unit, built with assertions).
+
+Soundness
+  `add_property` already promotes a young object before it adds a property; the replay now follows the same rule. Promotion counts the cell's edges and takes its shape reference, after which the replay is the ordinary counted add.
+
+Failure modes
+  A store that adds to a young receiver through the engine path costs one promotion.
+
+Tests
+  The typescript Octane unit: before, the abort in js_free_shape0; after, it runs to a score.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -28692,6 +28692,11 @@
+         return 0;
+     if (e->misses != (uint16_t)ctx->rt->ic_watchpoint_epoch)
+         return 0;                   /* a prototype interceptor appeared */
++    /* a nursery cell owns no shape reference and counts none of its edges until
++       it is promoted; the swap below moves counted references, so it is the
++       ordinary object's to make */
++    if (Y_IS(p))
++        y_promote_now(p);
+     nsh = b->regvm_pic_holder[b->regvm_pic_count + site];
+     off = e->slot_off / (uint32_t)sizeof(JSProperty);
+     osh = p->shape;

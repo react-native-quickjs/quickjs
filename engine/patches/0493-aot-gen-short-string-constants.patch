@@ -1,0 +1,59 @@
+Subject: AOT: the generator API exports the short plain strings of the constant pool
+
+What this does
+  - `JSAotGenFunc.cpool_str` (new, after `cpool_numeric`): for every constant-pool entry, `cpool_str[i]` is the text of a
+    JS_TAG_STRING entry that is 8-bit, has only characters 1..127 and is at most 15 bytes long, NUL terminated; every
+    other entry (numbers, functions, wide or long strings, ropes, the empty string) reads "". The table is built with
+    the numeric pool in the generator-info walk and freed with it in js_aot_gen_free.
+
+Why we need it
+  The generator folds `typeof x === "number"` (and the other typeof names) to a tag test; it has to know the string
+  constant that the comparison names. The numeric pool carries only numbers. Earleyboyer's typeof tests are about
+  1% of its instructions in the generic comparison.
+
+Failure modes
+  A failed allocation leaves `cpool_str` NULL; the consumer reads that as "no strings known" and keeps the generic op.
+  No runtime path of the engine reads the table; it exists only in the -DQJS_AOT_GEN build.
+
+Soundness
+  A copy of immutable pool text taken while the function bytecode is alive; nothing in it aliases engine memory.
+  Strings that are not plain short ASCII are never exported, so a consumer cannot mistake a wide or sliced string for
+  its prefix.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -72825,0 +72826,25 @@
++                /* The short plain strings of the pool; a failed allocation leaves the table absent. */
++                if (b->cpool_count > 0 && b->cpool != NULL) {
++                    char (*strs)[16] = js_mallocz_rt(rt, 16 * (size_t)b->cpool_count);
++                    if (strs) {
++                        int ci;
++                        for (ci = 0; ci < b->cpool_count; ci++) {
++                            JSValue cv = b->cpool[ci];
++                            if (JS_VALUE_GET_TAG(cv) == JS_TAG_STRING) {
++                                JSString *sp = JS_VALUE_GET_STRING(cv);
++                                if (!sp->is_wide_char && sp->len <= 15) {
++                                    const uint8_t *sc = (const uint8_t *)strv(sp);
++                                    uint32_t k;
++                                    for (k = 0; k < sp->len; k++)
++                                        if (sc[k] == 0 || sc[k] > 127)
++                                            break;
++                                    if (k == sp->len) {
++                                        memcpy(strs[ci], sc, sp->len);
++                                        strs[ci][sp->len] = 0;
++                                    }
++                                }
++                            }
++                        }
++                        g->cpool_str = (const char (*)[16])strs;
++                    }
++                }
+@@ -72898,0 +72924 @@
++            js_free_rt(rt, (void *)arr[i].cpool_str);
+--- a/quickjs-aot-gen.h
++++ b/quickjs-aot-gen.h
+@@ -52,0 +53,4 @@
++    /* For every constant-pool entry, the text of a short plain string (8-bit characters 1..127, at most 15 bytes) and
++       "" for every other entry, so the generator can tell `typeof x === "number"` from any other comparison. Entry i
++       is `cpool_str[i]`, NUL terminated; an empty string and an entry that is not a short plain string both read "". */
++    const char (*cpool_str)[16];

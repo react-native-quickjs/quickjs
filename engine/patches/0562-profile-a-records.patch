@@ -1,0 +1,652 @@
+Subject: Profile A records: own, add and other counts per site, and the own-read hit takes the bytecode
+
+What this does
+  - The profile writer emits `A <digest> site=<n> pc=<pc> own= add= other= nown= nxf= [o<i>=shape:slot:count] [x<i>=pre:post:slot:count] rest=` per property-write site and `R` lines for reads, counting own-slot writes, adding transitions and other kinds separately, with the shapes seen.
+  - regvm_own_read_hit takes the bytecode, so the read-side records are attributed to the right profile slot; the seven call sites in quickjs-regvm-step.inc pass it.
+
+Why we need it
+  The S sample of a write site mixes adds and own writes; the generator needs the split to pick transition stores, uncached stores and own shapes.
+
+Soundness
+  Profile output only; execution is unchanged when no profile is requested.
+
+Failure modes
+  A reader of the profile that does not know A or R lines skips them.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1769,6 +1769,18 @@
+     /* The slot each recorded shape put the site's property in, or -1 when the
+        fill was not an own data slot. */
+     int16_t shape_slots[4];
++    /* Executions of a store through this site, counted on every path (own-slot hit, add-transition hit, the engine store) and classified:
++       a store that overwrote an own writable data property, one that added the property, or anything else. The distinct hashed shapes
++       and transitions are kept (4 each); `arest` counts the ones that did not fit. */
++    uint64_t aown, aadd, aother, arest;
++    int32_t apc;
++    struct { JSShape *sh; int16_t slot; uint32_t n; } ao[4];
++    struct { JSShape *pre, *post; int16_t slot; uint32_t n; } ax[4];
++    /* Executions of a read through this site and the receiver shapes seen (4); `rrest` counts the reads of a fifth shape or of a value
++       that is not an object with a hashed shape. */
++    uint64_t rtotal, rrest;
++    int32_t rpc;
++    struct { JSShape *sh; uint32_t n; } rs[4];
+ } JSAotProfSite;
+ 
+ typedef struct JSAotProfCallee {
+@@ -2086,6 +2098,11 @@
+ static void js_aot_prof_pic(JSFunctionBytecode *b, int site, JSShape *shape,
+                             int kind, int slot);
+ static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v);
++#define AOT_STORE_OWN 0
++#define AOT_STORE_ADD 1
++#define AOT_STORE_OTHER 2
++static void js_aot_prof_store(JSFunctionBytecode *b, int site, JSShape *pre, JSShape *post, int slot, int cls);
++static void js_aot_prof_rhit(JSFunctionBytecode *b, int site, JSValue recv);
+ static void js_aot_prof_elem(JSFunctionBytecode *b, JSValue v, int holey);
+ static void js_aot_prof_put(JSFunctionBytecode *b, JSValue o, JSValue k);
+ static void js_aot_prof_packed(JSFunctionBytecode *b, JSObject *o);
+@@ -2129,6 +2146,13 @@
+                  js_aot_prof_pic((b_), (s_), (sh_), (k_), (sl_)); } while (0)
+ #define AOT_PROF_REG(b_, d_, v_) \
+         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_reg((b_), (d_), (v_)); } while (0)
++/* While profiling, a read site keeps its generic handler: the own-slot handler would serve the read without the profile seeing it. */
++#define AOT_PROF_QUICKEN(b_) (!AOT_PROF_ON(b_))
++#define AOT_PROF_STORE(b_, s_, pre_, post_, sl_, cls_) \
++        do { if (unlikely(AOT_PROF_ON(b_))) \
++                 js_aot_prof_store((b_), (s_), (pre_), (post_), (sl_), (cls_)); } while (0)
++#define AOT_PROF_RHIT(b_, s_, recv_) \
++        do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_rhit((b_), (s_), (recv_)); } while (0)
+ #define AOT_PROF_ELEM(b_, v_, h_) \
+         do { if (unlikely(AOT_PROF_ON(b_))) js_aot_prof_elem((b_), (v_), (h_)); } while (0)
+ #define AOT_PROF_PACKED(b_, o_) \
+@@ -2180,6 +2204,12 @@
+ #define AOT_PROF_ENTER(b_)          ((void)0)
+ #define AOT_PROF_PIC(b_, s_, sh_, k_, sl_) ((void)0)
+ #define AOT_PROF_REG(b_, d_, v_)    ((void)0)
++#define AOT_PROF_QUICKEN(b_) 1
++#define AOT_PROF_STORE(b_, s_, pre_, post_, sl_, cls_) ((void)0)
++#define AOT_PROF_RHIT(b_, s_, recv_) ((void)0)
++#define AOT_STORE_OWN 0
++#define AOT_STORE_ADD 1
++#define AOT_STORE_OTHER 2
+ #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) ((void)0)
+ #define AOT_PROF_CALLM(c_, b_, pc_, fn_, this_, na_) ((void)0)
+ #define AOT_PROF_CALL_RESULT(c_, rip_, v_) ((void)0)
+@@ -29024,7 +29054,7 @@
+ }
+ 
+ static inline __attribute__((always_inline)) int regvm_own_read_hit(
+-    JSRegPIC *pic, JSShape **holders, JSValue recv, int site, JSValue *out);
++    JSFunctionBytecode *b, JSRegPIC *pic, JSShape **holders, JSValue recv, int site, JSValue *out);
+ static JSValue regvm_get_field_ic_slow(JSContext *ctx, JSFunctionBytecode *b,
+                                   JSRegPIC **ppic, JSValue recv, JSAtom atom,
+                                   int site);
+@@ -29118,10 +29148,13 @@
+                 p2->misses = p1->misses; p1->misses = 0;
+                 /* a swap of two ways of one site changes no fact about a shape or a prototype: compiled code that trusts the epoch keeps its shape keys */
+             }
++            AOT_PROF_RHIT(b, site, recv);
+             return js_dup(v);
+         }
+-        if (regvm_mega_read(ctx->rt, JS_VALUE_GET_OBJ(recv), atom, &v))
++        if (regvm_mega_read(ctx->rt, JS_VALUE_GET_OBJ(recv), atom, &v)) {
++            AOT_PROF_RHIT(b, site, recv);
+             return js_dup(v);
++        }
+     }
+     return regvm_get_field_ic_slow(ctx, b, ppic, recv, atom, site);
+ }
+@@ -29131,10 +29164,22 @@
+ {
+     return regvm_get_field_ic_x(ctx, b, ppic, recv, atom, site, 1);
+ }
++static __attribute__((noinline)) JSValue regvm_get_field_ic_slow0(JSContext *ctx, JSFunctionBytecode *b,
++                                  JSRegPIC **ppic, JSValue recv, JSAtom atom,
++                                  int site);
+ static __attribute__((noinline)) JSValue regvm_get_field_ic_slow(JSContext *ctx, JSFunctionBytecode *b,
+                                   JSRegPIC **ppic, JSValue recv, JSAtom atom,
+                                   int site)
+ {
++    /* every read the cache did not serve: counted once here, whatever the engine does with it */
++    if (site != (int)REG_IC_NONE)
++        AOT_PROF_RHIT(b, site, recv);
++    return regvm_get_field_ic_slow0(ctx, b, ppic, recv, atom, site);
++}
++static __attribute__((noinline)) JSValue regvm_get_field_ic_slow0(JSContext *ctx, JSFunctionBytecode *b,
++                                  JSRegPIC **ppic, JSValue recv, JSAtom atom,
++                                  int site)
++{
+     JSValue val;
+     /* The per-function PIC refuses unhashed shapes and holders deeper than one
+        prototype; the global stub cache does not, so probe it before the engine
+@@ -29163,7 +29208,7 @@
+     if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT && *ppic) {
+         int s2 = b->regvm_pic_count + site;
+         JSValue v2;
+-        if (regvm_own_read_hit(*ppic, b->regvm_pic_holder, recv, s2, &v2)) {
++        if (regvm_own_read_hit(b, *ppic, b->regvm_pic_holder, recv, s2, &v2)) {
+             JSRegPIC *p1 = &(*ppic)[site], *p2 = &(*ppic)[s2];
+             if (unlikely(++p1->misses >= 16) && p2->kind != REG_PIC_PROTO2) {
+                 JSRegPIC t = *p1; JSShape *th = b->regvm_pic_holder[site];
+@@ -29336,6 +29381,7 @@
+             return -1;              /* js_prop_grow threw */
+         p->prop = np;
+     }
++    AOT_PROF_STORE(b, site, osh, nsh, (int)off, AOT_STORE_ADD);
+     js_aot_layout_leave(ctx->rt, p->shape);
+     p->shape = js_dup_shape(nsh);
+     js_free_shape(ctx->rt, osh);
+@@ -29357,11 +29403,21 @@
+     uint32_t pre_count = 0;
+     int prof_was_own = 1;
+     int ret;
++    JSShape *sprof_pre = NULL;      /* profile only: the receiver's shape before the store, referenced */
++    int sprof_cnt = 0, sprof_own = 0;
+ 
+     if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+         JSObject *po = JS_VALUE_GET_OBJ(recv);
+         JSRegPIC *e2 = NULL;
+ #if QJS_AOT_PROFILE
++        if (AOT_PROF_ON(b) && !po->is_exotic && po->shape->is_hashed) {
++            JSProperty *pr9;
++            sprof_own = find_own_property(&pr9, po, atom) != NULL;
++            sprof_pre = js_dup_shape(po->shape);
++            sprof_cnt = po->shape->prop_count;
++        }
++#endif
++#if QJS_AOT_PROFILE
+         /* For the profile only: did the store find `atom` already own? */
+         if (AOT_PROF_ON(b) && !po->is_exotic) {
+             JSProperty *pr1;
+@@ -29388,6 +29444,29 @@
+                            prof_was_own);
+     if (pre_sh)
+         js_free_shape(rt, pre_sh);
++#if QJS_AOT_PROFILE
++    if (AOT_PROF_ON(b)) {
++        int cls = AOT_STORE_OTHER, slot = -1;
++        JSShape *post = NULL;
++        if (ret >= 0 && sprof_pre != NULL && JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
++            JSObject *po = JS_VALUE_GET_OBJ(recv);
++            JSProperty *pr9;
++            JSShapeProperty *prs = po->is_exotic ? NULL : find_own_property(&pr9, po, atom);
++
++            if (prs && !(prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH)) && (prs->flags & JS_PROP_WRITABLE)) {
++                post = po->shape;
++                slot = (int)(pr9 - po->prop);
++                if (sprof_own)
++                    cls = AOT_STORE_OWN;
++                else if (post != sprof_pre && post->prop_count == (uint32_t)sprof_cnt + 1)
++                    cls = AOT_STORE_ADD;
++            }
++        }
++        AOT_PROF_STORE(b, site, sprof_pre, post, slot, cls);
++    }
++    if (sprof_pre)
++        js_free_shape(rt, sprof_pre);
++#endif
+     return ret;
+ }
+ 
+@@ -29407,7 +29486,7 @@
+  * lazy-JSON marker, which goes to the slow path.
+  */
+ static inline __attribute__((always_inline)) int regvm_own_read_hit(
+-    JSRegPIC *pic, JSShape **holders, JSValue recv, int site, JSValue *out)
++    JSFunctionBytecode *b, JSRegPIC *pic, JSShape **holders, JSValue recv, int site, JSValue *out)
+ {
+     JSObject *p;
+     JSRegPIC *e;
+@@ -29443,6 +29522,8 @@
+         JS_REF_COUNT(JS_VALUE_GET_PTR(v))++;
+     }
+ #endif
++    if (site < (int)b->regvm_pic_count)
++        AOT_PROF_RHIT(b, site, recv);
+     *out = v;
+     return 1;
+ }
+@@ -33605,7 +33686,7 @@
+     JSValue recv = f->var_buf[0];
+     JSValue val;
+ 
+-    if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, recv, site, &val))
++    if (regvm_own_read_hit(f->b, f->pic, f->b->regvm_pic_holder, recv, site, &val))
+         T_SET_NEXT_B(d, val, 9);
+     if (site == REG_IC_NONE)
+         val = JS_GetProperty(ctx, recv, atom);
+@@ -33633,7 +33714,7 @@
+     JSValue recv = f->arg_buf[slot];
+     JSValue val;
+ 
+-    if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, recv, site, &val))
++    if (regvm_own_read_hit(f->b, f->pic, f->b->regvm_pic_holder, recv, site, &val))
+         T_SET_NEXT_B(d, val, T_SZ_RUAS);
+     if (site == REG_IC_NONE)
+         val = JS_GetProperty(ctx, recv, atom);
+@@ -34534,6 +34615,7 @@
+             regvm_poly_read_hit(f->pic, f->b, (R_), (SITE_), &pv_, &pe_)) { \
+             if (pe_->kind == REG_PIC_PROTO2 || \
+                 likely(++f->pic[SITE_].misses < 16)) { \
++                AOT_PROF_RHIT(f->b, SITE_, (R_)); \
+                 T_SET_NEXT_B(D_, pv_, SZ_); \
+             } \
+             __attribute__((musttail)) return SLOW_(REGVM_PASS); \
+@@ -34568,7 +34650,7 @@
+                 uint8_t q_ = (f->pic[site].kind == REG_PIC_OWN) \
+                                  ? (uint8_t)ROP_##NAME##_own \
+                                  : (uint8_t)ROP_##NAME; \
+-                if (*ip != q_) \
++                if (*ip != q_ && AOT_PROF_QUICKEN(f->b)) \
+                     *ip = q_; \
+             } \
+         } \
+@@ -34597,7 +34679,7 @@
+         r = (int)(dr >> 16); \
+         site = T_REG(9); \
+         JSValue val; \
+-        if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(r), site, &val)) { \
++        if (regvm_own_read_hit(f->b, f->pic, f->b->regvm_pic_holder, FR(r), site, &val)) { \
+             T_SET_NEXT_B(d, val, T_SZ_RRAS); \
+         } \
+         __attribute__((musttail)) return regvm_t_##NAME##_poly(REGVM_PASS); \
+@@ -34706,7 +34788,7 @@
+     site = T_REG(9);
+     FR(r) = t;
+     AOT_PROF_REG_T(f, r, t);
+-    if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, t, site, &val)) {
++    if (regvm_own_read_hit(f->b, f->pic, f->b->regvm_pic_holder, t, site, &val)) {
+         T_SET_NEXT_B(d, val, T_SZ_RRAS);
+     }
+     __attribute__((musttail)) return regvm_t_get_this_field_poly(REGVM_PASS);
+@@ -34733,7 +34815,7 @@
+     /* Quicken only when both sites are cached own slots. */
+     if (likely(f->pic != NULL && site1 != REG_IC_NONE &&
+                f->pic[site1].kind == REG_PIC_OWN &&
+-               f->pic[site2].kind == REG_PIC_OWN)) {
++               f->pic[site2].kind == REG_PIC_OWN && AOT_PROF_QUICKEN(f->b))) {
+         *ip = (uint8_t)ROP_get_field_chain_own;
+     } else {
+         *ip = (uint8_t)ROP_get_field_chain;
+@@ -34787,9 +34869,9 @@
+         int site2 = T_REG(19);
+         JSValue v2;
+         if (site2 != REG_IC_NONE &&
+-            regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(d1), site2, &v2)) {
++            regvm_own_read_hit(f->b, f->pic, f->b->regvm_pic_holder, FR(d1), site2, &v2)) {
+             if (f->pic != NULL && site1 != REG_IC_NONE &&
+-                f->pic[site1].kind == REG_PIC_OWN && f->pic[site2].kind == REG_PIC_OWN)
++                f->pic[site1].kind == REG_PIC_OWN && f->pic[site2].kind == REG_PIC_OWN && AOT_PROF_QUICKEN(f->b))
+                 *ip = (uint8_t)ROP_get_field_chain_own;
+             else
+                 *ip = (uint8_t)ROP_get_field_chain;
+@@ -34808,7 +34890,7 @@
+     int site2 = T_REG(19);
+     JSValue v1, v2;
+ 
+-    if (unlikely(!regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(r1),
++    if (unlikely(!regvm_own_read_hit(f->b, f->pic, f->b->regvm_pic_holder, FR(r1),
+                                      site1, &v1)))
+         __attribute__((musttail)) return regvm_t_get_field_chain_slow(REGVM_PASS);
+ #if QJS_DRC
+@@ -34823,7 +34905,7 @@
+     }
+ #endif
+     AOT_PROF_REG_T1(f, d1, FR(d1));
+-    if (unlikely(!regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(d1),
++    if (unlikely(!regvm_own_read_hit(f->b, f->pic, f->b->regvm_pic_holder, FR(d1),
+                                      site2, &v2)))
+         __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
+     T_SET_NEXT_B(d2, v2, T_SZ_CHAIN);
+@@ -35098,6 +35180,7 @@
+ #ifdef QJS_REGVM_COUNT
+                 js_regvm_put_hit++;
+ #endif
++                AOT_PROF_STORE(f->b, site, p->shape, p->shape, (int)(e->slot_off / sizeof(JSProperty)), AOT_STORE_OWN);
+                 /* A direct slot store bypasses JS_SetPropertyInternal2, so it
+                    moves the prototype epoch itself. */
+ #if JS_ENABLE_IC
+@@ -38511,7 +38594,7 @@
+                 int site = RD_U16();
+                 JSValue recv = var_buf[slot];
+                 JSValue val;
+-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, recv, site, &val)) {
++                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, recv, site, &val)) {
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -38538,7 +38621,7 @@
+                 JSValue recv = (op == ROP_get_local_field) ? var_buf[slot]
+                                                           : arg_buf[slot];
+                 JSValue val;
+-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, recv, site, &val)) {
++                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, recv, site, &val)) {
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -38566,7 +38649,7 @@
+                 /* Only where the encoder emitted a site. */
+                 js_regvm_getfield_site[site == REG_IC_NONE ? 0 : 1]++;
+ #endif
+-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
++                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r], site, &val)) {
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -38605,7 +38688,7 @@
+                 } else {
+                     SET_REG_B(r, this_obj);
+                 }
+-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
++                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r], site, &val)) {
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -38627,7 +38710,7 @@
+                 JSAtom atom = RD_U32();
+                 int site = RD_U16();
+                 JSValue val;
+-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
++                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r], site, &val)) {
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -38657,7 +38740,7 @@
+                 int own1 = 1, own2 = 1;
+                 (void)r2;
+                 if (site1 != REG_IC_NONE &&
+-                    regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r1], site1, &v1)) {
++                    regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r1], site1, &v1)) {
+                     own1 = 0;
+                 } else if (site1 == REG_IC_NONE) {
+                     REGVM_CAPTURE_IP_MONO(rpc - 1);
+@@ -38677,7 +38760,7 @@
+                 (void)own1;
+ #endif
+                 if (site2 != REG_IC_NONE &&
+-                    regvm_own_read_hit(pic, b->regvm_pic_holder, regs[d1], site2, &v2)) {
++                    regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[d1], site2, &v2)) {
+                     own2 = 0;
+                 } else if (site2 == REG_IC_NONE) {
+                     v2 = JS_GetProperty(ctx, regs[d1], atom2);
+@@ -38782,6 +38865,7 @@
+                             JSValue *slot = (JSValue *)((char *)p->prop + e->slot_off);
+                             JSValue old = *slot;
+ 
++                            AOT_PROF_STORE(b, site, p->shape, p->shape, (int)(e->slot_off / sizeof(JSProperty)), AOT_STORE_OWN);
+ #if JS_ENABLE_IC
+                             if (unlikely(p->is_prototype))
+                                 ic_watchpoint_bump(ctx->rt);
+@@ -41443,7 +41527,7 @@
+                     int site = RD_U16();
+                     JSValue recv = f->var_buf[slot];
+                     JSValue val;
+-                    if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, recv, site, &val)) {
++                    if (regvm_own_read_hit(f->b, f->pic, f->b->regvm_pic_holder, recv, site, &val)) {
+                         SET_REG_B(d, val);
+                         REGVM_NEXT();
+                     }
+@@ -41472,7 +41556,7 @@
+                     JSValue recv = (op == ROP_get_local_field) ? f->var_buf[slot]
+                                                               : f->arg_buf[slot];
+                     JSValue val;
+-                    if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, recv, site, &val)) {
++                    if (regvm_own_read_hit(f->b, f->pic, f->b->regvm_pic_holder, recv, site, &val)) {
+                         SET_REG_B(d, val);
+                         REGVM_NEXT();
+                     }
+@@ -67789,6 +67873,97 @@
+     }
+ }
+ 
++/* A store through a site, classified by the caller. Only a hashed shape is recorded (and referenced, as in js_aot_prof_pic); a store whose
++   shapes are not hashed is counted as `other`. */
++static void js_aot_prof_store(JSFunctionBytecode *b, int site, JSShape *pre, JSShape *post, int slot, int cls)
++{
++    JSAotProfFunc *pf = b->aot_prof;
++    JSAotProfSite *s;
++    int i;
++
++    if (!pf || site < 0 || site >= pf->nsites)
++        return;
++    s = &pf->sites[site];
++    if (s->aown + s->aadd + s->aother == 0)
++        s->apc = pf->last_pc;
++    if (cls != AOT_STORE_OTHER && (!post || !post->is_hashed || (cls == AOT_STORE_ADD && (!pre || !pre->is_hashed))))
++        cls = AOT_STORE_OTHER;
++    if (cls == AOT_STORE_OTHER) {
++        s->aother++;
++        return;
++    }
++    if (cls == AOT_STORE_OWN) {
++        s->aown++;
++        for (i = 0; i < 4 && s->ao[i].sh; i++)
++            if (s->ao[i].sh == post && s->ao[i].slot == (int16_t)slot) {
++                s->ao[i].n++;
++                return;
++            }
++        if (i < 4) {
++            s->ao[i].sh = js_dup_shape(post);
++            s->ao[i].slot = (int16_t)slot;
++            s->ao[i].n = 1;
++            post->aot_prof_seen = 1;
++        } else {
++            s->arest++;
++        }
++        return;
++    }
++    s->aadd++;
++    for (i = 0; i < 4 && s->ax[i].post; i++)
++        if (s->ax[i].pre == pre && s->ax[i].post == post && s->ax[i].slot == (int16_t)slot) {
++            s->ax[i].n++;
++            return;
++        }
++    if (i < 4) {
++        s->ax[i].pre = js_dup_shape(pre);
++        s->ax[i].post = js_dup_shape(post);
++        s->ax[i].slot = (int16_t)slot;
++        s->ax[i].n = 1;
++        pre->aot_prof_seen = 1;
++        post->aot_prof_seen = 1;
++    } else {
++        s->arest++;
++    }
++}
++
++/* A read through a site: the receiver's shape, counted whether the cache served the read or the engine did. */
++static void js_aot_prof_rhit(JSFunctionBytecode *b, int site, JSValue recv)
++{
++    JSAotProfFunc *pf = b->aot_prof;
++    JSAotProfSite *s;
++    JSShape *sh;
++    int i;
++
++    if (!pf || site < 0 || site >= pf->nsites)
++        return;
++    s = &pf->sites[site];
++    if (s->rtotal == 0)
++        s->rpc = pf->last_pc;
++    s->rtotal++;
++    if (JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT) {
++        s->rrest++;
++        return;
++    }
++    sh = JS_VALUE_GET_OBJ(recv)->shape;
++    if (!sh->is_hashed) {
++        s->rrest++;
++        return;
++    }
++    for (i = 0; i < 4 && s->rs[i].sh; i++)
++        if (s->rs[i].sh == sh) {
++            s->rs[i].n++;
++            return;
++        }
++    if (i < 4) {
++        s->rs[i].sh = js_dup_shape(sh);
++        s->rs[i].n = 1;
++        sh->aot_prof_seen = 1;
++    } else {
++        s->rrest++;
++    }
++}
++
+ static void js_aot_prof_reg(JSFunctionBytecode *b, int reg, JSValue v)
+ {
+     JSAotProfFunc *pf = b->aot_prof;
+@@ -68153,9 +68328,18 @@
+     if (pf->sites != NULL) {
+         int si, sj;
+         for (si = 0; si < pf->nsites; si++)
+-            for (sj = 0; sj < pf->sites[si].nshapes; sj++)
+-                if (pf->sites[si].shapes[sj] != NULL)
+-                    js_free_shape(rt, pf->sites[si].shapes[sj]);
++            {
++                JSAotProfSite *fs = &pf->sites[si];
++                for (sj = 0; sj < fs->nshapes; sj++)
++                    if (fs->shapes[sj] != NULL)
++                        js_free_shape(rt, fs->shapes[sj]);
++                for (sj = 0; sj < 4; sj++) {
++                    if (fs->ao[sj].sh) js_free_shape(rt, fs->ao[sj].sh);
++                    if (fs->ax[sj].pre) js_free_shape(rt, fs->ax[sj].pre);
++                    if (fs->ax[sj].post) js_free_shape(rt, fs->ax[sj].post);
++                    if (fs->rs[sj].sh) js_free_shape(rt, fs->rs[sj].sh);
++                }
++            }
+     }
+     js_free_rt(rt, pf->pcs);
+     js_free_rt(rt, pf->cov);
+@@ -68663,6 +68847,33 @@
+                     s->shape_hits[j], j, (int)s->shape_slots[j]);
+         fputc('\n', f);
+     }
++    /* A <digest> site=<n> pc=<pc> own=<N> add=<N> other=<N> nown=<k> nxf=<m> [o<i>=<shape>:<slot>:<count>]... [x<i>=<pre>:<post>:<slot>:<count>]... rest=<N>
++       R <digest> site=<n> pc=<pc> total=<N> nsh=<k> [r<i>=<shape>:<count>]... rest=<N>
++       The counts are of executions through the site, not of cache fills (see js_aot_prof_store, js_aot_prof_rhit). */
++    for (i = 0; i < pf->nsites; i++) {
++        JSAotProfSite *s = &pf->sites[i];
++        int no = 0, nx = 0;
++        if (s->aown + s->aadd + s->aother != 0) {
++            while (no < 4 && s->ao[no].sh) no++;
++            while (nx < 4 && s->ax[nx].post) nx++;
++            fprintf(f, "A %s site=%d pc=%d own=%llu add=%llu other=%llu nown=%d nxf=%d", dgt, i, (int)s->apc,
++                    (unsigned long long)s->aown, (unsigned long long)s->aadd, (unsigned long long)s->aother, no, nx);
++            for (j = 0; j < no; j++)
++                fprintf(f, " o%d=%u:%d:%u", j, (unsigned)s->ao[j].sh->aot_prof_id, (int)s->ao[j].slot, s->ao[j].n);
++            for (j = 0; j < nx; j++)
++                fprintf(f, " x%d=%u:%u:%d:%u", j, (unsigned)s->ax[j].pre->aot_prof_id, (unsigned)s->ax[j].post->aot_prof_id,
++                        (int)s->ax[j].slot, s->ax[j].n);
++            fprintf(f, " rest=%llu\n", (unsigned long long)s->arest);
++        }
++        if (s->rtotal != 0) {
++            int nr = 0;
++            while (nr < 4 && s->rs[nr].sh) nr++;
++            fprintf(f, "R %s site=%d pc=%d total=%llu nsh=%d", dgt, i, (int)s->rpc, (unsigned long long)s->rtotal, nr);
++            for (j = 0; j < nr; j++)
++                fprintf(f, " r%d=%u:%u", j, (unsigned)s->rs[j].sh->aot_prof_id, s->rs[j].n);
++            fprintf(f, " rest=%llu\n", (unsigned long long)s->rrest);
++        }
++    }
+     for (i = 0; i < pf->pc_n; i++) {
+         JSAotProfPc *e = &pf->pcs[i];
+         if (e->rshape == NULL && !e->rmulti)
+@@ -69003,12 +69214,20 @@
+                 int si, sj;
+                 if (pf == NULL)
+                     continue;
+-                for (si = 0; si < pf->nsites; si++)
+-                    for (sj = 0; sj < pf->sites[si].nshapes; sj++)
+-                        if (pf->sites[si].shapes[sj] != NULL) {
+-                            js_free_shape(rt, pf->sites[si].shapes[sj]);
+-                            pf->sites[si].shapes[sj] = NULL;
++                for (si = 0; si < pf->nsites; si++) {
++                    JSAotProfSite *fs = &pf->sites[si];
++                    for (sj = 0; sj < fs->nshapes; sj++)
++                        if (fs->shapes[sj] != NULL) {
++                            js_free_shape(rt, fs->shapes[sj]);
++                            fs->shapes[sj] = NULL;
+                         }
++                    for (sj = 0; sj < 4; sj++) {
++                        if (fs->ao[sj].sh) { js_free_shape(rt, fs->ao[sj].sh); fs->ao[sj].sh = NULL; }
++                        if (fs->ax[sj].pre) { js_free_shape(rt, fs->ax[sj].pre); fs->ax[sj].pre = NULL; }
++                        if (fs->ax[sj].post) { js_free_shape(rt, fs->ax[sj].post); fs->ax[sj].post = NULL; }
++                        if (fs->rs[sj].sh) { js_free_shape(rt, fs->rs[sj].sh); fs->rs[sj].sh = NULL; }
++                    }
++                }
+                 for (si = 0; si < pf->pc_n; si++)
+                     if (pf->pcs[si].rshape != NULL) {
+                         js_free_shape(rt, pf->pcs[si].rshape);
+@@ -69694,7 +69913,7 @@
+ __attribute__((always_inline)) int qjs_aot_own_read_hit(JSRegRun *f, const void *pic, JSValue recv, int site,
+                          JSValue *out)
+ {
+-    return regvm_own_read_hit((JSRegPIC *)pic, f->b->regvm_pic_holder, recv,
++    return regvm_own_read_hit(f->b, (JSRegPIC *)pic, f->b->regvm_pic_holder, recv,
+                               site, out);
+ }
+ 
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -2434,7 +2434,7 @@
+                 /* Only where the encoder emitted a site. */
+                 js_regvm_getfield_site[site == REG_IC_NONE ? 0 : 1]++;
+ #endif
+-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
++                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r], site, &val)) {
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -2474,7 +2474,7 @@
+                 JSAtom atom = RD_U32();
+                 int site = RD_U16();
+                 JSValue val;
+-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
++                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r], site, &val)) {
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -2528,7 +2528,7 @@
+                 } else {
+                     SET_REG_B(r, rf->this_obj);
+                 }
+-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
++                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r], site, &val)) {
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -2575,7 +2575,7 @@
+                 int own1 = 1, own2 = 1;
+                 (void)r2;
+                 if (site1 != REG_IC_NONE &&
+-                    regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r1], site1, &v1)) {
++                    regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r1], site1, &v1)) {
+                     own1 = 0;
+                 } else if (site1 == REG_IC_NONE) {
+                     REGVM_CAPTURE_IP_MONO(rpc - 1);
+@@ -2595,7 +2595,7 @@
+                 (void)own1;
+ #endif
+                 if (site2 != REG_IC_NONE &&
+-                    regvm_own_read_hit(pic, b->regvm_pic_holder, regs[d1], site2, &v2)) {
++                    regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[d1], site2, &v2)) {
+                     own2 = 0;
+                 } else if (site2 == REG_IC_NONE) {
+                     v2 = JS_GetProperty(ctx, regs[d1], atom2);
+@@ -2739,7 +2739,7 @@
+                 JSValue recv = (op == ROP_get_local_field) ? rf->var_buf[slot]
+                                                           : rf->arg_buf[slot];
+                 JSValue val;
+-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, recv, site, &val)) {
++                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, recv, site, &val)) {
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }
+@@ -2781,7 +2781,7 @@
+                 int site = RD_U16();
+                 JSValue recv = rf->var_buf[slot];
+                 JSValue val;
+-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, recv, site, &val)) {
++                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, recv, site, &val)) {
+                     SET_REG_B(d, val);
+                     REGVM_NEXT();
+                 }

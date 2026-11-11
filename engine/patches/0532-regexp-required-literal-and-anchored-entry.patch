@@ -1,0 +1,387 @@
+Subject: RegExp: required-literal prefilter and anchored entry from static analysis of the bytecode
+
+What this does
+  - libregexp.c: `lre_analyze` walks the compiled instruction stream of a non-sticky pattern. Jumps are treated as covering the instructions they pass over; the longest run of exact-character instructions that no jump skips (save instructions are transparent) is the required literal. A forward pass over the prefix gives the most code units a match can start before the literal (unbounded if a loop, back reference or lookbehind precedes it). A pattern whose first instruction after the match start is a non-multiline `^` is marked anchored. Nothing is added to the serialized bytecode.
+  - quickjs.c: the analysis is cached per context by bytecode string (512 slots, the slot holds a reference). The generic matcher path uses it: an anchored pattern runs from index 0 through `lre_exec_at` and fails at once for any other start index; a pattern with a required literal returns "no match" when the subject has no occurrence at or after the start index (memchr + compare for 8-bit strings), and starts scanning at the first occurrence minus the prefix bound. `JS_REGEXP_CAPTURE_STACK_SIZE` rises from 16 to 64 so patterns with up to about 30 groups need no heap capture buffer.
+
+Why we need it
+  Census: one pattern with a required literal after a group was 42.6% of matcher cycles (26,520 scans of 2,264 characters, no hit); `/^ba/` ran 1.16M scans of 5 characters; an 11-group URL pattern allocated a capture buffer per exec.
+
+Soundness
+  Every match contains the literal at or after its start and the start is at most prefix_max units before it, so skipping to that point or failing cannot lose a match; `^` without the multiline flag matches only at index 0. Case-insensitive classes use other instructions and are never part of the literal. Literals with units above 0xff cannot occur in an 8-bit subject. Lookahead interiors and loop bodies are covered by their jump and excluded.
+
+Failure modes
+  Patterns with bytecode over 4096 bytes are not analysed. The cache holds up to 512 bytecode strings per context until the context is freed.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1382,6 +1382,15 @@
+ } JSGVCell;
+ 
+ #define JS_RE_SNAP_N 16
++#define JS_RE_REQ_SLOTS 512
++
++/* what libregexp's analysis found for a compiled pattern, by bytecode string */
++typedef struct JSReReq {
++    JSString *bc;          /* holds a reference; NULL if the slot is empty */
++    LRERequired r;
++    bool lit8_ok;          /* every unit of r.lit fits in 8 bits */
++    uint8_t lit8[LRE_REQ_MAX];
++} JSReReq;
+ 
+ struct JSContext {
+     JSGCObjectHeader header; /* must come first */
+@@ -1465,6 +1474,7 @@
+     JSValue re_snap[JS_RE_SNAP_N];
+     uint16_t re_snap_idx[JS_RE_SNAP_N];
+     uint8_t re_snap_getter[JS_RE_SNAP_N];
++    JSReReq *re_req;       /* JS_RE_REQ_SLOTS entries, allocated on first use */
+     int re_snap_n;
+     int re_species_idx;
+     JSValue re_species;
+@@ -6286,6 +6296,12 @@
+         JS_FreeValue(ctx, ctx->re_snap[i]);
+     if (ctx->re_snap_n)
+         JS_FreeValue(ctx, ctx->re_species);
++    if (ctx->re_req) {
++        for (i = 0; i < JS_RE_REQ_SLOTS; i++)
++            if (ctx->re_req[i].bc)
++                JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, ctx->re_req[i].bc));
++        js_free_rt(ctx->rt, ctx->re_req);
++    }
+     for (i = 0; i < (int)countof(ctx->closure_shape); i++)
+         js_free_shape_null(ctx->rt, ctx->closure_shape[i]);
+ 
+@@ -102215,7 +102231,7 @@
+ /* Most patterns need only a handful of capture/register slots; keep those on
+    the stack to avoid a malloc/free pair on every exec. Larger patterns fall
+    back to the heap. */
+-#define JS_REGEXP_CAPTURE_STACK_SIZE 16
++#define JS_REGEXP_CAPTURE_STACK_SIZE 64
+ 
+ 
+ typedef enum {
+@@ -102587,6 +102603,110 @@
+     }
+ }
+ 
++/* The analysis of 're' (see lre_analyze), kept per context by bytecode
++   string. Never NULL once the table exists; r.len == 0 and !r.anchored mean
++   there is nothing to use. */
++static const JSReReq *js_regexp_req(JSContext *ctx, JSRegExp *re)
++{
++    JSReReq *e;
++    JSString *bc = re->bytecode;
++    uint32_t h = (uint32_t)(((uintptr_t)bc >> 4) * 2654435761u) >> 8;
++
++    if (unlikely(!ctx->re_req)) {
++        ctx->re_req = js_mallocz(ctx, sizeof(JSReReq) * JS_RE_REQ_SLOTS);
++        if (!ctx->re_req)
++            return NULL;
++    }
++    e = &ctx->re_req[h & (JS_RE_REQ_SLOTS - 1)];
++    if (likely(e->bc == bc))
++        return e;
++    if (e->bc)
++        JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, e->bc));
++    memset(e, 0, sizeof(*e));
++    e->bc = bc;
++    JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, bc));
++    if (!bc->is_wide_char) {
++        int i;
++        lre_analyze(str8(bc), bc->len, &e->r);
++        e->lit8_ok = true;
++        for (i = 0; i < e->r.len; i++) {
++            if (e->r.lit[i] > 0xff)
++                e->lit8_ok = false;
++            e->lit8[i] = (uint8_t)e->r.lit[i];
++        }
++    }
++    return e;
++}
++
++/* Index of the first occurrence of the literal in str[from..], or -1 */
++static int js_regexp_find_literal(const JSReReq *e, JSString *str, int from)
++{
++    int m = e->r.len, n = str->len, i;
++
++    if (n - from < m)
++        return -1;
++    if (!str->is_wide_char) {
++        const uint8_t *s = str8(str), *p;
++        const uint8_t *end = s + n - m + 1;
++        if (!e->lit8_ok)
++            return -1;
++        p = s + from;
++        while (p < end) {
++            p = memchr(p, e->lit8[0], end - p);
++            if (!p)
++                return -1;
++            if (memcmp(p, e->lit8, m) == 0)
++                return (int)(p - s);
++            p++;
++        }
++        return -1;
++    } else {
++        const uint16_t *s = str16(str);
++        for (i = from; i + m <= n; i++) {
++            int k;
++            if (s[i] != e->r.lit[0])
++                continue;
++            for (k = 1; k < m && s[i + k] == e->r.lit[k]; k++)
++                ;
++            if (k == m)
++                return i;
++        }
++        return -1;
++    }
++}
++
++/* The scanning matcher, entered after what the analysis proves: a pattern
++   that starts with ^ can only match at index 0 and needs no scan; one with a
++   required literal cannot match a subject that lacks it, and cannot start
++   before the first occurrence minus the longest possible prefix. */
++static int js_regexp_match_generic(JSContext *ctx, uint8_t **capture,
++                                   const JSRegExpExecData *d, JSRegExp *re,
++                                   JSString *str, int start_index)
++{
++    const JSReReq *e = js_regexp_req(ctx, re);
++
++    if (e && (e->r.anchored || e->r.len)) {
++        if (e->r.anchored) {
++            if (start_index != 0)
++                return 0;
++            return lre_exec_at(capture, d->bytecode, e->r.entry, str8(str), 0,
++                               str->len, str->is_wide_char, ctx);
++        }
++        {
++            int at = js_regexp_find_literal(e, str, start_index);
++            if (at < 0)
++                return 0;
++            if (e->r.prefix_max >= 0) {
++                int lo = at - e->r.prefix_max - 1;
++                if (lo > start_index)
++                    start_index = lo;
++            }
++        }
++    }
++    return lre_exec(capture, d->bytecode, str8(str), start_index,
++                    str->len, str->is_wide_char, ctx);
++}
++
+ /* Run one match attempt starting at 'start_index', choosing the fastest
+    applicable strategy. Same return convention as lre_exec. */
+ static inline int
+@@ -102605,8 +102725,7 @@
+                                          d->metadata, str, start_index);
+     case JS_REGEXP_MATCH_GENERIC:
+     default:
+-        return lre_exec(capture, d->bytecode, str8(str), start_index,
+-                        str->len, str->is_wide_char, ctx);
++        return js_regexp_match_generic(ctx, capture, d, re, str, start_index);
+     }
+ }
+ 
+--- a/libregexp.c
++++ b/libregexp.c
+@@ -3878,6 +3878,180 @@
+     return 0;
+ }
+ 
++/* ==== Static analysis of compiled bytecode ================================ *
++ * What every match of a pattern must contain, derived from the instruction
++ * stream without changing it: a literal run that every path executes, how far
++ * before it a match can start, and whether a match can only start at index 0. */
++
++#define LRE_ANALYZE_MAX_CODE 4096
++
++static bool lre_op_target(const uint8_t *code, size_t pos, int *ptarget)
++{
++    switch (code[pos]) {
++    case REOP_goto:
++    case REOP_split_goto_first:
++    case REOP_split_next_first:
++    case REOP_lookahead:
++    case REOP_negative_lookahead:
++        *ptarget = (int)pos + 5 + (int32_t)get_u32(code + pos + 1);
++        return true;
++    case REOP_loop:
++        *ptarget = (int)pos + 6 + (int32_t)get_u32(code + pos + 2);
++        return true;
++    case REOP_loop_split_goto_first:
++    case REOP_loop_split_next_first:
++    case REOP_loop_check_adv_split_goto_first:
++    case REOP_loop_check_adv_split_next_first:
++        *ptarget = (int)pos + 10 + (int32_t)get_u32(code + pos + 6);
++        return true;
++    default:
++        return false;
++    }
++}
++
++int lre_analyze(const uint8_t *bc_buf, size_t bc_buf_len, LRERequired *out)
++{
++    int32_t cover[LRE_ANALYZE_MAX_CODE + 2];
++    int32_t maxw[LRE_ANALYZE_MAX_CODE + 2];
++    const uint8_t *code;
++    size_t code_len, pos, len, entry = 11;
++    int best_pos = -1, best_len = 0, run_pos = -1, run_len = 0;
++    uint16_t run[LRE_REQ_MAX];
++    int unit, flags, c, i;
++
++    memset(out, 0, sizeof(*out));
++    out->prefix_max = -1;
++    if (bc_buf_len < RE_HEADER_LEN)
++        return 0;
++    code_len = get_u32(bc_buf + RE_HEADER_BYTECODE_LEN);
++    if (code_len > bc_buf_len - RE_HEADER_LEN || code_len > LRE_ANALYZE_MAX_CODE ||
++        code_len < entry + 2)
++        return 0;
++    flags = lre_get_flags(bc_buf);
++    /* a sticky pattern has no scan prologue and never scans */
++    if (flags & LRE_FLAG_STICKY)
++        return 0;
++    code = bc_buf + RE_HEADER_LEN;
++    if (code[0] != REOP_split_goto_first || code[5] != REOP_any ||
++        code[6] != REOP_goto || code[entry] != REOP_save_start ||
++        code[entry + 1] != 0)
++        return 0;
++    unit = (flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) ? 2 : 1;
++    out->entry = (uint32_t)entry;
++    if (code_len >= entry + 3 && code[entry + 2] == REOP_line_start)
++        out->anchored = 1;
++
++    /* cover[p] > 0: a jump passes over the instruction boundary p, so the
++       instruction at p is not executed by every path */
++    memset(cover, 0, sizeof(int32_t) * (code_len + 2));
++    for (pos = entry; pos < code_len; pos += len) {
++        int target;
++        if (!re_checked_op_len(code + pos, code_len - pos, &len))
++            return 0;
++        if (lre_op_target(code, pos, &target)) {
++            int lo, hi;
++            if (target < 0 || (size_t)target > code_len)
++                return 0;
++            if ((size_t)target > pos) {
++                lo = (int)pos + 1;
++                hi = target;
++            } else {
++                lo = target;
++                hi = (int)(pos + len);
++            }
++            for (i = lo; i < hi; i++)
++                cover[i] = 1;
++        }
++    }
++    /* the longest run of exact characters executed by every path */
++    for (pos = entry; pos < code_len; pos += len) {
++        uint8_t op = code[pos];
++        if (!re_checked_op_len(code + pos, code_len - pos, &len))
++            return 0;
++        if ((op == REOP_char || op == REOP_char32) && !cover[pos]) {
++            c = op == REOP_char ? get_u16(code + pos + 1) :
++                (int)get_u32(code + pos + 1);
++            if (c > 0xffff || (c >= 0xd800 && c <= 0xdfff)) {
++                goto flush;
++            }
++            if (run_len == 0)
++                run_pos = (int)pos;
++            if (run_len < LRE_REQ_MAX)
++                run[run_len++] = (uint16_t)c;
++            continue;
++        }
++        if (cover[pos] == 0 && (op == REOP_save_start || op == REOP_save_end ||
++                                op == REOP_save_reset) && run_len)
++            continue;
++    flush:
++        if (run_len > best_len) {
++            best_len = run_len;
++            best_pos = run_pos;
++            memcpy(out->lit, run, sizeof(run[0]) * run_len);
++        }
++        run_len = 0;
++    }
++    if (run_len > best_len) {
++        best_len = run_len;
++        best_pos = run_pos;
++        memcpy(out->lit, run, sizeof(run[0]) * run_len);
++    }
++    if (best_len == 0)
++        return out->anchored;
++    out->len = best_len;
++
++    /* the farthest the match start can lie before the literal, in code units */
++    for (i = 0; i <= (int)code_len; i++)
++        maxw[i] = -1;
++    maxw[entry] = 0;
++    for (pos = entry; (int)pos < best_pos; pos += len) {
++        uint8_t op = code[pos];
++        int w = maxw[pos], target, nw, ok = 1;
++        if (!re_checked_op_len(code + pos, code_len - pos, &len))
++            return 1;
++        if (w < 0)
++            continue;
++        nw = w;
++        switch (op) {
++        case REOP_char: case REOP_char_i: case REOP_char32: case REOP_char32_i:
++        case REOP_dot: case REOP_any: case REOP_space: case REOP_not_space:
++        case REOP_range: case REOP_range_i: case REOP_range32: case REOP_range32_i:
++            nw = w + unit;
++            break;
++        case REOP_line_start: case REOP_line_start_m: case REOP_line_end:
++        case REOP_line_end_m: case REOP_save_start: case REOP_save_end:
++        case REOP_save_reset: case REOP_word_boundary: case REOP_word_boundary_i:
++        case REOP_not_word_boundary: case REOP_not_word_boundary_i:
++        case REOP_set_i32: case REOP_set_char_pos: case REOP_check_advance:
++            break;
++        case REOP_goto: case REOP_split_goto_first: case REOP_split_next_first:
++        case REOP_lookahead: case REOP_negative_lookahead:
++            lre_op_target(code, pos, &target);
++            if ((size_t)target <= pos || (int)target > best_pos) {
++                if ((size_t)target <= pos)
++                    ok = 0;
++                break;
++            }
++            if (maxw[target] < w)
++                maxw[target] = w;
++            if (op == REOP_goto || op == REOP_lookahead ||
++                op == REOP_negative_lookahead)
++                continue;
++            break;
++        default:
++            ok = 0;
++            break;
++        }
++        if (!ok)
++            return 1;
++        if (pos + len <= (size_t)best_pos && maxw[pos + len] < nw)
++            maxw[pos + len] = nw;
++    }
++    if (maxw[best_pos] >= 0)
++        out->prefix_max = maxw[best_pos];
++    return 1;
++}
++
+ int lre_get_capture_count(const uint8_t *bc_buf)
+ {
+     return bc_buf[RE_HEADER_CAPTURE_COUNT];
+--- a/libregexp.h
++++ b/libregexp.h
+@@ -114,6 +114,17 @@
+                 const uint8_t *cbuf, int cindex, int clen,
+                 int cbuf_type, void *opaque);
+ 
++#define LRE_REQ_MAX 32
++typedef struct LRERequired {
++    uint16_t lit[LRE_REQ_MAX]; /* code units every match contains, in order */
++    int len;                   /* 0 if none */
++    int prefix_max;            /* most code units a match can start before lit, -1 if unbounded */
++    uint32_t entry;            /* bytecode offset of the anchored entry (save_start 0) */
++    int anchored;              /* a match can only start at index 0 */
++} LRERequired;
++/* Analyse compiled bytecode. Returns 1 if anything was found, else 0. */
++int lre_analyze(const uint8_t *bc_buf, size_t bc_buf_len, LRERequired *out);
++
+ int lre_parse_escape(const uint8_t **pp, int allow_utf16);
+ /* lre_is_space() is provided as an inline in libunicode.h */
+ 

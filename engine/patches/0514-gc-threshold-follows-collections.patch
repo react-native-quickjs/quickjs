@@ -1,0 +1,43 @@
+Subject: The collection threshold moves only with collections, and starts at 16 MB
+
+What this does
+  - quickjs.c js_trigger_gc_slow: when a reconcile alone brings the heap under the threshold, the threshold is left alone (0513 raised it to 1.5x the current size).
+  - quickjs.c js_new_runtime: the initial threshold is 16 MB instead of 256 KB.
+
+Why we need it
+  The reconcile frees the nursery's dead cells in bulk, so the heap looks small right after it while cyclic garbage keeps growing underneath. Resetting the threshold to 1.5x the post-reconcile size on every such event made it follow the garbage: on deltablue the threshold reached 1.1 GB, every allocation-path call was judged "reconcile enough", and the only collections were at teardown. The threshold is now set only by a collection (post-collection size plus max(16 MB, 50%)), so a heap that keeps growing past it is collected.
+
+Soundness
+  Pacing only.
+
+Failure modes
+  A program may hold up to 16 MB of garbage cycles before its first collection. Embedders that call JS_SetGCThreshold keep their value.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -3373,14 +3373,9 @@
+                 js_drc_reconcile(rt);
+                 if (rt->malloc_state.malloc_size + size <=
+                     rt->malloc_gc_threshold) {
+-                    /* A reconcile is not a collection: it must not count as an unproductive one, or the threshold ratchets up by a factor of
+-                       five each time the parked values are what grew the heap and cyclic garbage is never collected. */
++                    /* A reconcile is not a collection: the threshold stays where the last collection put it (its result plus the growth step).
++                       Moving it up with the heap, as every rearm did, made it follow the uncollected cyclic garbage and never be reached. */
+                     gc_trig[1]++;
+-                    {
+-                        size_t step_ = rt->malloc_state.malloc_size >> 1;
+-
+-                        rt->malloc_gc_threshold = rt->malloc_state.malloc_size + (step_ < GC_MIN_STEP ? GC_MIN_STEP : step_);
+-                    }
+                     return;
+                 }
+             }
+@@ -4267,7 +4262,7 @@
+     rt->malloc_state = ms;
+     rt->json_lazy_enabled = QJS_JSON_LAZY_DEFAULT;
+     js_arena_init(rt);
+-    rt->malloc_gc_threshold = 256 * 1024;
++    rt->malloc_gc_threshold = GC_MIN_STEP;
+     rt->gc_pace_streak_cap = JS_GC_PACE_STREAK_DEFAULT;
+     rt->gc_cyc_empty_streak = 0;
+ 

@@ -1,0 +1,45 @@
+Subject: The final collection of a runtime scans no native stack
+
+What this does
+  - quickjs.c: JS_FreeRuntime sets `ss_final` before its collection, and `js_drc_pin` skips the native-stack scan while it is set.
+
+Why we need it
+  Teardown runs after the program's frames are gone, but the scan still read the frames of the caller (main and the runtime's own), whose slots can hold stale words that name objects of the run. Each hit took a count on an object that was then never released, and the final collection left the object, and everything it reaches, in the list (an error's stack data keeps the whole script's bytecode): the release build tolerated it, the build with assertions stopped on `list_empty(&rt->gc_obj_list)` for every program that created an error at the top level.
+
+Soundness
+  At that point no register window and no compiled frame exists, so the scan has nothing to find that is live. The flag is set once and never cleared; a runtime is not used after JS_FreeRuntime.
+
+Failure modes
+  None: the flag only removes a scan whose results were all stale.
+
+Tests
+  A program that runs `Error("x")` at the top level of a compiled unit built with assertions: before, the abort in JS_FreeRuntime; after, a clean exit.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -4896,6 +4896,8 @@
+ #define DRC_ST(x) ((void)0)
+ #endif
+ 
++/* Set while the runtime is torn down: the final collection scans no native stack (every word on it is stale). */
++static int ss_final;
+ void JS_FreeRuntime(JSRuntime *rt)
+ {
+ #ifdef QJS_DRC_STATS
+@@ -5006,6 +5008,7 @@
+     js_gc_promote_all_code(rt);
+ 
+     /* Nothing is live on the machine stack any more: a stale word in a frame slot must not pin an object (and its cycle) through the collection below. */
++    ss_final = 1;
+     JS_RunGC(rt);
+ 
+ #if QJS_DRC
+@@ -11969,7 +11972,7 @@
+     js_drc_pend_flush(rt);
+     regvm_for_each_root_range(rt, js_drc_pin_range, NULL);
+     if (ss_on < 0) ss_on = (qjs_aot_form_v & 1) || getenv("QJS_STACKSCAN") != NULL;
+-    if (ss_on) ss_scan(rt); else ss_n = 0;
++    if (ss_on && !ss_final) ss_scan(rt); else ss_n = 0;
+ }
+ 
+ static void js_drc_unpin_range(void *opaque, JSValue *regs, uint32_t nregs)

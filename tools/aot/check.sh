@@ -31,7 +31,7 @@ cd "$ROOT"
 S=engine/quickjs-ng
 K2=tools/aot/kernels2
 GOLDEN=$K2/golden
-CC=${CC:-clang}
+CC=${CC:-$ROOT/tools/aot/ccsplit}
 # The engine is built with QJS_AOT and tests the unit's symbols for NULL when no unit is linked; Apple's linker needs to be told those references may stay undefined.
 LDX=; [ "$(uname)" = Darwin ] && LDX="-Wl,-undefined,dynamic_lookup"
 WORK=${WORK:-$(dirname "$0")/../../.local/scratch/qjs-check}

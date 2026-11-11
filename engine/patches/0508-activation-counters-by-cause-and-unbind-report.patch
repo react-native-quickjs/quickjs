@@ -1,0 +1,83 @@
+Subject: Register VM: activation counters split by cause, unbinds reported
+
+What this does
+  - quickjs.c (QJS_AOT_ICOUNT builds): the activation table has two halves: activations of a function whose binding was dropped, and activations a compiled entry handed back to the interpreter (JS_CALL_FLAG_AOT_DEOPT). `qjs_aot_icount_table` reports the half length; the second half starts at that index.
+  - js_aot_unbind prints `aot unbind idx= by=<caller>` (QJS_AOT_STATS=1, QJS_AOT_ICOUNT builds) the first time a bound function is unbound.
+
+Why we need it
+  Unit functions that run interpreted without ever being gated need their cause named: dropped by which path, or handed back.
+
+Soundness
+  Read-only counters and a diagnostic line.
+
+Failure modes
+  None.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2197,10 +2197,12 @@
+    unit table index, allocated at the first bind. An activation is counted where the interpreter starts a function whose binding was
+    dropped (gated) or whose compiled entry handed the whole call back. */
+ extern uint64_t *js_aot_icount;
++extern uint32_t js_aot_icount_n;
++/* The first half counts activations of a function whose binding was dropped, the second half those the compiled entry handed back. */
+ #define AOT_ICOUNT(b_, fl_) \
+-    do { if (unlikely(js_aot_icount != NULL) && (b_)->aot_index != UINT32_MAX && \
+-                      ((b_)->aot_fn == NULL || ((fl_) & JS_CALL_FLAG_AOT_DEOPT))) \
+-             js_aot_icount[(b_)->aot_index]++; } while (0)
++    do { if (unlikely(js_aot_icount != NULL) && (b_)->aot_index != UINT32_MAX) { \
++             if ((b_)->aot_fn == NULL) js_aot_icount[(b_)->aot_index]++; \
++             else if ((fl_) & JS_CALL_FLAG_AOT_DEOPT) js_aot_icount[js_aot_icount_n + (b_)->aot_index]++; } } while (0)
+ #endif
+ #endif
+ #ifndef AOT_ICOUNT
+@@ -68602,11 +68604,12 @@
+ uint64_t js_aot_enter_count;
+ #if defined(QJS_AOT_ICOUNT) && QJS_AOT
+ uint64_t *js_aot_icount;
++uint32_t js_aot_icount_n;
+ 
+ /* The unit's report reads the counters through this (a weak reference there, so a unit also links against an engine without it). */
+ const uint64_t *qjs_aot_icount_table(unsigned *n)
+ {
+-    *n = js_aot_icount != NULL ? (unsigned)qjs_aot_count : 0u;
++    *n = js_aot_icount != NULL ? js_aot_icount_n : 0u;
+     return js_aot_icount;
+ }
+ #endif
+@@ -68687,10 +68690,21 @@
+ /* Stop using the unit for one function: drop the binding and recompute the
+    call descriptor, so its calls take the record or light path instead of the
+    AOT entry's path. A function reaches this when its guards keep failing. */
+-static void js_aot_unbind(JSFunctionBytecode *b)
++#if defined(QJS_AOT_ICOUNT) && QJS_AOT
++#define js_aot_unbind(b_) js_aot_unbind_why((b_), __func__)
++#else
++#define js_aot_unbind(b_) js_aot_unbind_why((b_), NULL)
++#endif
++static void js_aot_unbind_why(JSFunctionBytecode *b, const char *why)
+ {
+     if (b->aot_index == UINT32_MAX)
+         return;
++#if defined(QJS_AOT_ICOUNT) && QJS_AOT
++    if (js_aot_icount != NULL && b->aot_fn != NULL)
++        fprintf(stderr, "aot unbind idx=%u by=%s\n", (unsigned)b->aot_index, why);
++#else
++    (void)why;
++#endif
+     /* A compiled body that identified a callee by its bound entry (a method table's entry pointer) trusts
+        it until the cache epoch moves, so dropping the binding moves it. */
+     if (b->aot_fn != NULL) {
+@@ -68903,8 +68917,10 @@
+     if (!aot_unit_present())
+         return;
+ #if defined(QJS_AOT_ICOUNT) && QJS_AOT
+-    if (js_aot_icount == NULL && getenv("QJS_AOT_STATS") != NULL)
+-        js_aot_icount = calloc(qjs_aot_count ? qjs_aot_count : 1, sizeof(uint64_t));
++    if (js_aot_icount == NULL && getenv("QJS_AOT_STATS") != NULL) {
++        js_aot_icount_n = qjs_aot_count ? (uint32_t)qjs_aot_count : 1;
++        js_aot_icount = calloc(2 * (size_t)js_aot_icount_n, sizeof(uint64_t));
++    }
+ #endif
+     if (!b->regvm_compiled || b->regvm_len <= 0 || b->is_lazy)
+         return;

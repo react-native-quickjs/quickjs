@@ -1,0 +1,20 @@
+Subject: The nursery reconcile reads the time-stamp counter only when QJS_Y_STATS is set
+
+What this does
+  - quickjs.c: `y_tsc()` returns 0 unless QJS_Y_STATS is in the environment; the environment is read once.
+
+Why we need it
+  Every reconcile and every young collection read the counter several times for a statistics report nobody asked for.
+
+Soundness
+  The counters feed only the QJS_Y_STATS report; nothing else reads them.
+
+Failure modes
+  Without QJS_Y_STATS the cycle columns of the report are zero.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -4675 +4675,2 @@
+-static inline uint64_t y_tsc(void) { return __builtin_ia32_rdtsc(); }
++static int y_tsc_on = -1;
++static inline uint64_t y_tsc(void) { if (unlikely(y_tsc_on < 0)) y_tsc_on = getenv("QJS_Y_STATS") != NULL; return y_tsc_on ? __builtin_ia32_rdtsc() : 0; }

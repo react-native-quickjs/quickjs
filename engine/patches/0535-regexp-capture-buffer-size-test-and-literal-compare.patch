@@ -1,0 +1,36 @@
+Subject: RegExp: the capture buffer test used the size of a pointer; plain literal compare
+
+What this does
+  - quickjs.c `js_regexp_exec_prepare`: `alloc_count > countof(capture_stack)` took `capture_stack`, a pointer parameter, so countof was 1 and every pattern with more than one capture or register slot allocated its capture buffer with js_malloc and freed it after the match. The test now uses JS_REGEXP_CAPTURE_STACK_SIZE, the size of the callers' arrays.
+  - `js_regexp_find_literal` compares a case-sensitive literal with memcmp instead of the per-unit loop.
+
+Why we need it
+  A frame-pointer profile of the Octane regexp row (interpreter) showed js_regexp_exec_prepare as 1.7% of the row in js_malloc_rt, plus the matching frees.
+
+Soundness
+  The callers' arrays hold JS_REGEXP_CAPTURE_STACK_SIZE entries (64 since 0532); a pattern needing more still takes the heap.
+
+Failure modes
+  None known.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -101899,7 +101899,8 @@
+                 if (!p)
+                     return -1;
+             }
+-            if (js_regexp_lit_at(e, str, (int)(p - s) - r))
++            if (e->r.ci ? js_regexp_lit_at(e, str, (int)(p - s) - r)
++                        : memcmp(p - r, e->lit8, m) == 0)
+                 return (int)(p - s) - r;
+             p++;
+         }
+@@ -102026,7 +102027,7 @@
+     int alloc_count = lre_get_alloc_count(bytecode);
+     uint8_t **capture = capture_stack;
+ 
+-    if (alloc_count > (int)countof(capture_stack)) {
++    if (alloc_count > JS_REGEXP_CAPTURE_STACK_SIZE) {
+         capture = js_malloc(ctx, sizeof(capture[0]) * alloc_count);
+         if (!capture)
+             return false;

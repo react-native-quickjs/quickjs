@@ -1,0 +1,460 @@
+Subject: Deferred counting: roots found by scanning the native stack for units built with stack maps
+
+What this does
+  - quickjs.c: ss_scan scans the native stack between the current sp and the runtime's stack top (callee-saved registers spilled first) and accepts young cells by chunk membership and stamp and parked old objects by sorted byte ranges; qjs_aot_set_form lets a unit declare the form (1 stack scan, 2 frame records found by a magic word and ordered by sequence number, 4 return-address table) so no environment variable is needed; backtraces merge those records, or the frames a unit's return-address table names for the return addresses on the frame-pointer chain, with the interpreter frames; a compiled function that has a light or entry frame in the interpreter's list is named once.
+
+Why we need it
+  Compiled frames no longer publish root ranges; the window and record stores of the publication form go away.
+
+Soundness
+  A word that looks like a cell is only ever treated as a root (it keeps a cell alive, never frees one); interior pointers into parked objects are accepted so a derived pointer also pins. Not applicable to a unit built in the publication form, which never sets the form.
+
+Failure modes
+  A stale stack word can keep garbage alive until it is overwritten. QJS_Y_CHECK=1 compares the scan with the published roots in a publication build.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1125,7 +1125,7 @@
+ static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque);
+ #endif
+ #if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
+-static void regvm_fl_roots(JSRuntime *rt, JSRegRootFn fn, void *opaque);
++static int ss_src; static void regvm_fl_roots(JSRuntime *rt, JSRegRootFn fn, void *opaque);
+ #endif
+ 
+ static void regvm_for_each_root_range(JSRuntime *rt, JSRegRootFn fn,
+@@ -1137,7 +1137,7 @@
+     regvm_light_walk(regvm_light_head(rt->regvm_cur), fn, opaque);
+ #endif
+ #if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
+-    regvm_fl_roots(rt, fn, opaque);
++    ss_src = 1; regvm_fl_roots(rt, fn, opaque); ss_src = 0;
+ #endif
+     for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
+         if (sf->rv_regs && sf->rv_nregs)
+@@ -4638,6 +4638,8 @@
+     y_roots_cap = y_roots_cap ? y_roots_cap * 2 : 65536; y_roots = __builtin_realloc(y_roots, (size_t)y_roots_cap * sizeof(void *)); y_roots[y_roots_n++] = p; }
+ int qjs_y_force, qjs_y_gate = 1;
+ static uint64_t y_cyc[8], y_cnt[16], y_pinr, y_pinv;
++uint64_t qjs_y_ep48 = (uint64_t)1 << 48; static uint32_t y_epoch = 1;
++static uint64_t ss_stat[8];
+ static_assert(offsetof(JSObject, arr_kind) == 21, "young flag byte");
+ #define Y_KIND(p) (((uint8_t *)(p))[21])
+ static inline int y_is(const void *p) { unsigned m; if (!Y_REG(p)) return 0; m = ((YChunk *)((uintptr_t)p & ~(uintptr_t)65535))->ymode; return m == 1 || (m == 2 && Y_KIND(p) == 0x80); }
+@@ -4759,6 +4761,7 @@
+     fprintf(stderr, "reconciles=%lu pin_cyc=%lu locked_cyc(incl y_collect)=%lu unpin_cyc=%lu pin_ranges=%lu pin_values=%lu\n", (unsigned long)y_cnt[8], (unsigned long)y_cyc[3], (unsigned long)y_cyc[4], (unsigned long)y_cyc[5], (unsigned long)y_pinr, (unsigned long)y_pinv);
+     { int k; for (k = 0; k < 16; k++) if (qjs_y_oldcap[k]) fprintf(stderr, "oldalloc cap %d: %lu\n", k, (unsigned long)qjs_y_oldcap[k]); }
+     if (y_sites > 0) { extern void qjs_y_dump_sites(void); qjs_y_dump_sites(); }
++    fprintf(stderr, "SS words=%lu young=%lu exact=%lu interior=%lu ranges/scan=%lu scans=%lu\n", (unsigned long)ss_stat[0], (unsigned long)ss_stat[1], (unsigned long)ss_stat[2], (unsigned long)ss_stat[5], ss_stat[7] ? (unsigned long)(ss_stat[6] / ss_stat[7]) : 0ul, (unsigned long)ss_stat[7]);
+     fprintf(stderr, "Y collections=%lu allocs(cells)=%lu survivors=%lu dead=%lu promoted_freed=%lu chunks_alloc=%lu refills=%lu chunks_reset=%lu chunks_retained=%lu holeruns=%lu chpeak=%u livepeak=%lu cyc_markpromote=%lu cyc_promote=%lu cyc_sweep=%lu rootentries=%lu rootsmarked=%lu check_missing=%lu mutviol=%lu promnow=%lu end_chunks_live=%u end_cells_live=%u\n",
+         (unsigned long)y_cnt[0], (unsigned long)y_cnt[1], (unsigned long)y_cnt[2], (unsigned long)y_cnt[3], (unsigned long)y_cnt[4], (unsigned long)y_cnt[12], (unsigned long)y_cnt[13],
+         (unsigned long)y_cnt[5], (unsigned long)y_cnt[6], (unsigned long)y_cnt[7], y_chpeak, (unsigned long)y_livepeak,
+@@ -11862,11 +11865,99 @@
+     }
+ }
+ 
++
++/* ---- native-stack root discovery (scan build) ---- */
++static JSValue *ss_vec; static uint32_t ss_n, ss_cap;
++static void *ss_set_key[1 << 16]; static JSValue ss_set_val[1 << 16]; static uint32_t ss_used[1 << 15];
++static inline void ss_push(JSValue v) { if (ss_n >= ss_cap) { ss_cap = ss_cap ? ss_cap * 2 : 4096; ss_vec = __builtin_realloc(ss_vec, ss_cap * sizeof(JSValue)); } ss_vec[ss_n++] = v; }
++typedef struct { uintptr_t lo, hi; JSValue val; } SsRng;
++static uint64_t ss_bm[1 << 12]; static SsRng *ss_rng; static uint32_t ss_rng_n, ss_rng_cap; static uintptr_t ss_rmin, ss_rmax;
++static void ss_rng_add(uintptr_t lo, uintptr_t hi, JSValue val)
++{
++    if (ss_rng_n >= ss_rng_cap) { ss_rng_cap = ss_rng_cap ? ss_rng_cap * 2 : 8192; ss_rng = __builtin_realloc(ss_rng, ss_rng_cap * sizeof(SsRng)); }
++    ss_rng[ss_rng_n].lo = lo; ss_rng[ss_rng_n].hi = hi; ss_rng[ss_rng_n].val = val; ss_rng_n++;
++    { uintptr_t g_; uint32_t ng_ = 0; for (g_ = lo >> 6; g_ <= (hi - 1) >> 6 && ng_ < 128; g_++, ng_++) { uint32_t h_ = (uint32_t)((g_ * 0x9E3779B97F4A7C15ull) >> 46); ss_bm[h_ >> 6] |= (uint64_t)1 << (h_ & 63); } }
++    if (lo < ss_rmin) ss_rmin = lo;
++    if (hi > ss_rmax) ss_rmax = hi;
++}
++/* every byte range a derived pointer into a parked value can point into: the block (header word included), the property block, the array element block */
++static void ss_rng_of(void *ptr, JSValue val)
++{
++    uintptr_t p = (uintptr_t)ptr;
++    if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
++        JSObject *o = ptr;
++        ss_rng_add(p - 8, p + sizeof(JSObject) + 8 * sizeof(JSProperty) + 16, val);
++        if (o->shape != NULL && o->prop != NULL && !o->prop_inline_cap && (uintptr_t)o->prop > 4096)
++            ss_rng_add((uintptr_t)o->prop, (uintptr_t)o->prop + (size_t)o->shape->prop_size * sizeof(JSProperty), val);
++        if (o->fast_array && o->class_id == JS_CLASS_ARRAY && o->u.array.u.values != NULL)
++            ss_rng_add((uintptr_t)o->u.array.u.values, (uintptr_t)o->u.array.u.values + (size_t)o->u.array.count * sizeof(JSValue), val);
++    } else if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING || JS_VALUE_GET_TAG(val) == JS_TAG_STRING_ROPE) {
++        JSString *st = ptr;
++        ss_rng_add(p - 8, p + sizeof(JSString) + ((size_t)st->len << st->is_wide_char) + 24, val);
++    } else {
++        ss_rng_add(p - 8, p + 64, val);
++    }
++}
++static int ss_rng_cmp(const void *a, const void *b) { uintptr_t x = ((const SsRng *)a)->lo, y = ((const SsRng *)b)->lo; return x < y ? -1 : x > y; }
++static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
++{
++    uintptr_t lo, hi = rt->stack_top, *w;
++    uint32_t i, k;
++    struct list_head *el;
++    __builtin_unwind_init();
++    __asm__ volatile("mov %%rsp, %0" : "=r"(lo));
++    ss_rng_n = 0; ss_rmin = ~(uintptr_t)0; ss_rmax = 0; memset(ss_bm, 0, sizeof ss_bm);
++    for (i = 0; i < rt->zpark_len; i++) __builtin_prefetch(rt->zpark[i]);
++    for (i = 0; i < rt->zct_len; i++) __builtin_prefetch(JS_VALUE_GET_PTR(rt->zct[i]));
++    for (i = 0; i < rt->zpark_len; i++) ss_rng_of(rt->zpark[i], JS_MKPTR(JS_TAG_OBJECT, rt->zpark[i]));
++    list_for_each(el, &rt->gc_zero_ref_count_list) {
++        JSGCObjectHeader *g = list_entry(el, JSGCObjectHeader, link);
++        if (JS_GC_TYPE(g) == JS_GC_OBJ_TYPE_JS_OBJECT) ss_rng_of((void *)g, JS_MKPTR(JS_TAG_OBJECT, g));
++    }
++    for (i = 0; i < rt->zct_len; i++) ss_rng_of(JS_VALUE_GET_PTR(rt->zct[i]), rt->zct[i]);
++    ss_stat[6] += ss_rng_n; ss_stat[7]++;
++    qsort(ss_rng, ss_rng_n, sizeof(SsRng), ss_rng_cmp);
++    ss_n = 0;
++    for (w = (uintptr_t *)(lo & ~(uintptr_t)7); (uintptr_t)w < hi; w++) {
++        uintptr_t v = *w;
++        ss_stat[0]++;
++        if (Y_REG((void *)v)) {
++            YChunk *c = (YChunk *)(v & ~(uintptr_t)65535);
++            uintptr_t off, idx, p;
++            for (k = 0; k < y_nurs_n; k++) if (y_nurs[k] == c) break;
++            if (k < y_nurs_n && v >= (uintptr_t)c + 64) {
++                off = v - ((uintptr_t)c + 64); idx = off / c->stride;
++                p = (uintptr_t)c + 64 + idx * c->stride + 8;
++                if (idx * c->stride + c->stride <= 65536 - 64 && Y_KIND((void *)p) == 0x80 && *(uint16_t *)(p + 22) == (uint16_t)(qjs_y_ep48 >> 48)) {
++                    ss_stat[1]++;
++                    ++JS_REF_COUNT((void *)p); y_note((void *)p);
++                    ss_push(JS_MKPTR(JS_TAG_OBJECT, (void *)p));
++                    continue;
++                }
++            }
++        }
++        if (v > 4096) {
++        if (ss_rng_n && v >= ss_rmin && v < ss_rmax && ({ uint32_t h_ = (uint32_t)(((v >> 6) * 0x9E3779B97F4A7C15ull) >> 46); (ss_bm[h_ >> 6] >> (h_ & 63)) & 1; })) {
++            uint32_t lo_i = 0, hi_i = ss_rng_n;
++            while (lo_i < hi_i) { uint32_t mid = (lo_i + hi_i) / 2; if (ss_rng[mid].lo <= v) lo_i = mid + 1; else hi_i = mid; }
++            /* ranges may overlap: walk back over the few that start below v */
++            { uint32_t q; for (q = lo_i; q > 0 && q + 16 > lo_i; q--) if (v < ss_rng[q - 1].hi) { JSValue pv = ss_rng[q - 1].val; ++JS_REF_COUNT(JS_VALUE_GET_PTR(pv)); ss_push(pv); ss_stat[5]++; break; } }
++        }
++        next_w: ;
++        }
++    }
++}
+ static void js_drc_pend_flush(JSRuntime *rt);
++/* The unit tells the engine its root form: 1 = roots are found by scanning the native stack, 2 = frame records are found by their magic word. */
++static int qjs_aot_form_v;
++void qjs_aot_set_form(int f) { qjs_aot_form_v |= f; }
++static int ss_on = -1;
+ static void js_drc_pin(JSRuntime *rt)
+ {
+     js_drc_pend_flush(rt);
+     regvm_for_each_root_range(rt, js_drc_pin_range, NULL);
++    if (ss_on < 0) ss_on = (qjs_aot_form_v & 1) || getenv("QJS_STACKSCAN") != NULL;
++    if (ss_on) ss_scan(rt); else ss_n = 0;
+ }
+ 
+ static void js_drc_unpin_range(void *opaque, JSValue *regs, uint32_t nregs)
+@@ -11887,6 +11978,7 @@
+ static void js_drc_unpin(JSRuntime *rt)
+ {
+     regvm_for_each_root_range(rt, js_drc_unpin_range, rt);
++    if (ss_n) { uint32_t n = ss_n; ss_n = 0; js_drc_unpin_range(rt, ss_vec, n); }
+ }
+ 
+ /* Frees every parked value that no live register refers to. The caller must
+@@ -11980,6 +12072,7 @@
+             if (pr->flags & JS_PROP_TMASK) continue;
+             v = p->prop[j].u.value;
+             if (JS_VALUE_HAS_REF_COUNT(v)) {
++                if (y_check_on && Y_REG(JS_VALUE_GET_PTR(v)) && !Y_VAL(v) && Y_KIND(JS_VALUE_GET_PTR(v)) != 0x40 && y_cnt[10]++ < 5) fprintf(stderr, "Y_CHECK: parent %p (stamp %x) child %p kind %x rc %x collect %lu\n", (void*)p, *(uint16_t*)((char*)p+22), JS_VALUE_GET_PTR(v), Y_KIND(JS_VALUE_GET_PTR(v)), JS_REF_COUNT(JS_VALUE_GET_PTR(v)), (unsigned long)y_cnt[0]);
+                 JS_REF_COUNT(JS_VALUE_GET_PTR(v))++;
+                 if (Y_VAL(v)) {
+                     JSObject *c = JS_VALUE_GET_OBJ(v);
+@@ -12019,6 +12112,7 @@
+     y_cnt[1] += cells; y_cnt[2] += ns; y_cnt[3] += cells - ns;
+     t2 = y_tsc();
+     y_cyc[0] += t1 - t0; y_cyc[2] += t2 - t1;
++    y_epoch++; if ((y_epoch & 0xffff) == 0) y_epoch++; qjs_y_ep48 = (uint64_t)(y_epoch & 0xffff) << 48;
+ }
+ 
+ static void js_drc_reconcile_locked(JSRuntime *rt)
+@@ -13735,6 +13829,7 @@
+    frame, whose function is `func` and whose pc is the register pc `rpc`. */
+ typedef struct JSRegBtFrame {
+     JSValue func;
++    JSFunctionBytecode *bc; /* a frame found from a return address names its bytecode only, func is then undefined */
+     const uint8_t *cur_pc;
+     int rpc;
+     JSStackFrame *sf;
+@@ -13763,6 +13858,7 @@
+ 
+         if (js_class_has_bytecode(fp->class_id))
+             fb = fp->u.func.function_bytecode;
++        bt[nb].bc = NULL;
+         bt[nb].func = sf->cur_func;
+         bt[nb].cur_pc = sf->cur_pc;
+         bt[nb].rpc = fb ? regvm_frame_pc(rt, sf, fb) : -1;
+@@ -13893,20 +13989,26 @@
+                 continue;
+             }
+ 
+-            p = JS_VALUE_GET_OBJ(bt[bi].func);
+             b = NULL;
+             backtrace_barrier = false;
+-
+-            if (js_class_has_bytecode(p->class_id)) {
+-                b = p->u.func.function_bytecode;
++            if (bt[bi].bc) {
++                p = NULL;
++                b = bt[bi].bc;
+                 backtrace_barrier = b->backtrace_barrier;
++            } else {
++                p = JS_VALUE_GET_OBJ(bt[bi].func);
++                if (js_class_has_bytecode(p->class_id)) {
++                    b = p->u.func.function_bytecode;
++                    backtrace_barrier = b->backtrace_barrier;
++                }
+             }
+             rpc = bt[bi].rpc;
+ 
+             if (lazy) {
+                 JSErrorStackFrame *lzf = &lazy_frames[i];
+ 
+-                lzf->func_name = get_func_name_value(ctx, bt[bi].func);
++                lzf->func_name = bt[bi].bc ? (b->func_name != JS_ATOM_NULL ? JS_AtomToString(ctx, b->func_name) : JS_NULL)
++                                           : get_func_name_value(ctx, bt[bi].func);
+                 if (b && (bt[bi].cur_pc || rpc >= 0)) {
+                     uint32_t pc = bt[bi].cur_pc
+                         ? (uint32_t)(bt[bi].cur_pc - b->byte_code_buf - 1)
+@@ -13930,6 +14032,11 @@
+             } else if (has_prepare) {
+                 if (bt[bi].sf) {
+                     js_new_callsite_data(ctx, &csd[i], bt[bi].sf);
++                } else if (bt[bi].bc) {
++                    JSStackFrame tmp;
++                    memset(&tmp, 0, sizeof(tmp));
++                    tmp.cur_func = JS_UNDEFINED;
++                    js_new_callsite_data(ctx, &csd[i], &tmp);
+                 } else {
+                     JSStackFrame tmp;
+                     memset(&tmp, 0, sizeof(tmp));
+@@ -13938,7 +14045,8 @@
+                 }
+             } else {
+                 /* func_name_str is UTF-8 encoded if needed */
+-                func_name_str = get_func_name(ctx, bt[bi].func);
++                func_name_str = bt[bi].bc ? (b->func_name != JS_ATOM_NULL ? JS_AtomToCString(ctx, b->func_name) : NULL)
++                                          : get_func_name(ctx, bt[bi].func);
+                 if (!func_name_str || func_name_str[0] == '\0')
+                     str1 = "<anonymous>";
+                 else
+@@ -29916,14 +30024,131 @@
+    addresses order them; a frame in the arena takes the address of the next outer
+    frame on the C stack, which is its run's entry frame. The order assumes one C
+    stack, growing down, per runtime: a runtime is used on one thread at a time. */
++const char qjs_aot_rec_magic[16] = "qjsrecmagic";
++uint64_t qjs_aot_seq;
++static int rec_seq_cmp(const void *a, const void *b) { uintptr_t x = (uintptr_t)(*(JSAotFlRec *const *)a)->roots, y = (uintptr_t)(*(JSAotFlRec *const *)b)->roots; return x < y ? 1 : x > y ? -1 : 0; }
++
++/* Return-address table of a unit built with QJS_AOT_RAT: a compiled frame is found from its return address and names (function, pc) frames. */
++typedef struct { uint8_t d[16]; int32_t pc; } JSAotRatFr;
++typedef struct { const char *ra; uint16_t first, n; } JSAotRatEnt;
++static JSAotRatEnt *rat_e; static size_t rat_n; static const JSAotRatFr *rat_f;
++extern const JSAotEntry qjs_aot_table[] __attribute__((weak));
++extern const uint32_t qjs_aot_count __attribute__((weak));
++static JSFunctionBytecode **aot_bc_tab;
++static int rat_ent_cmp(const void *a, const void *b) { const char *x = ((const JSAotRatEnt *)a)->ra, *y = ((const JSAotRatEnt *)b)->ra; return x < y ? -1 : x > y; }
++void qjs_aot_set_rat(const JSAotRatEnt *e, size_t n, const JSAotRatFr *f)
++{
++    rat_e = (JSAotRatEnt *)(malloc)(sizeof(*e) * (n ? n : 1));
++    if (!rat_e) return;
++    memcpy(rat_e, e, sizeof(*e) * n);
++    qsort(rat_e, n, sizeof(*e), rat_ent_cmp);
++    rat_n = n; rat_f = f;
++}
++static const JSAotRatEnt *rat_find(uintptr_t ra)
++{
++    size_t lo = 0, hi = rat_n;
++    while (lo < hi) {
++        size_t mid = (lo + hi) / 2;
++        uintptr_t v = (uintptr_t)rat_e[mid].ra;
++        if (v == ra) return &rat_e[mid];
++        if (v < ra) lo = mid + 1; else hi = mid;
++    }
++    return NULL;
++}
++static JSFunctionBytecode *rat_bc(const uint8_t *d)
++{
++    uint32_t lo = 0, hi = qjs_aot_count;
++    while (lo < hi) {
++        uint32_t mid = lo + (hi - lo) / 2;
++        int c = memcmp(d, qjs_aot_table[mid].digest, 16);
++        if (c == 0) return aot_bc_tab ? aot_bc_tab[mid] : NULL;
++        if (c < 0) hi = mid; else lo = mid + 1;
++    }
++    return NULL;
++}
++static int regvm_merge_rat_frames(JSRuntime *rt, JSRegBtFrame *bt, uintptr_t *anc, int nb, int max)
++{
++    struct { uintptr_t addr; JSFunctionBytecode *bc; int pc; } rf[130];
++    uint8_t rf_used[130];
++    JSRegBtFrame tmp[130];
++    int nrf = 0, ri = 0, i, n = 0;
++    uintptr_t next = UINTPTR_MAX, prev = 0;
++    void **fp = (void **)__builtin_frame_address(0);
++
++    while ((uintptr_t)fp < rt->stack_top && (uintptr_t)fp > prev && ((uintptr_t)fp & 7) == 0 && nrf < 124) {
++        const JSAotRatEnt *e = rat_find((uintptr_t)fp[1]);
++        prev = (uintptr_t)fp;
++        if (e) {
++            int k;
++            for (k = 0; k < e->n; k++) {
++                JSFunctionBytecode *b = rat_bc(rat_f[e->first + k].d);
++                if (!b) continue;
++                rf[nrf].addr = (uintptr_t)fp; rf[nrf].bc = b; rf[nrf].pc = rat_f[e->first + k].pc; nrf++;
++            }
++        }
++        fp = (void **)fp[0];
++    }
++    for (i = nb - 1; i >= 0; i--) {
++        if (anc[i]) next = anc[i]; else anc[i] = next;
++    }
++    /* A compiled function that has a frame in the interpreter's list (an entry or light frame) is not named twice: its frame in the table is dropped. */
++    memset(rf_used, 0, sizeof(rf_used));
++    for (i = 0; i < nb; i++) {
++        JSFunctionBytecode *b = bt[i].bc;
++        int j;
++        if (!b && JS_VALUE_GET_TAG(bt[i].func) == JS_TAG_OBJECT) {
++            JSObject *po = JS_VALUE_GET_OBJ(bt[i].func);
++            if (js_class_has_bytecode(po->class_id)) b = po->u.func.function_bytecode;
++        }
++        if (!b) continue;
++        for (j = 0; j < nrf && rf[j].addr < anc[i]; j++)
++            if (!rf_used[j] && rf[j].bc == b) { rf_used[j] = 1; break; }
++    }
++    i = 0;
++    while (n < max && n < 128) {
++        if (ri < nrf && (i >= nb || rf[ri].addr < anc[i])) {
++            if (rf_used[ri]) { ri++; continue; }
++            tmp[n].bc = rf[ri].bc;
++            tmp[n].func = JS_UNDEFINED;
++            tmp[n].cur_pc = NULL;
++            tmp[n].rpc = rf[ri].pc;
++            tmp[n].sf = NULL;
++            n++; ri++;
++        } else if (i < nb) {
++            tmp[n++] = bt[i++];
++        } else
++            break;
++    }
++    memcpy(bt, tmp, sizeof(*bt) * (size_t)n);
++    return n;
++}
++static int rec_scan = -1;
+ static int regvm_merge_fl_records(JSRuntime *rt, JSRegBtFrame *bt, uintptr_t *anc,
+                                   int nb, int max)
+ {
+     JSRegBtFrame tmp[130];
+-    JSAotFlRec *r = rt->aot_fl_top;
++    JSAotFlRec *rl[130], *r;
++    int nrl = 0, ri = 0;
+     uintptr_t next = UINTPTR_MAX;
+     int i, n = 0;
+ 
++    if (qjs_aot_form_v & 4)
++        return regvm_merge_rat_frames(rt, bt, anc, nb, max);
++    if (rec_scan < 0) rec_scan = (qjs_aot_form_v & 2) || getenv("QJS_RECSCAN") != NULL;
++    if (rec_scan) {
++        uintptr_t *w;
++        __builtin_unwind_init();
++        for (w = (uintptr_t *)((uintptr_t)__builtin_frame_address(0) & ~(uintptr_t)7); (uintptr_t)w < rt->stack_top && nrl < 128; w++)
++            if (*w == (uintptr_t)qjs_aot_rec_magic) {
++                JSAotFlRec *c = (JSAotFlRec *)w;
++                if (c->func != NULL) rl[nrl++] = c;
++            }
++        if (nrl > 1) qsort(rl, nrl, sizeof(rl[0]), rec_seq_cmp);
++    } else {
++        for (r = rt->aot_fl_top; r != NULL && nrl < 128; r = r->prev) rl[nrl++] = r;
++    }
++    r = nrl ? rl[0] : NULL;
++
+     for (i = nb - 1; i >= 0; i--) {
+         if (anc[i])
+             next = anc[i];
+@@ -29934,6 +30159,7 @@
+     while (n < max && n < 128) {
+         if (r != NULL && (i >= nb || (uintptr_t)r < anc[i])) {
+             if (r->ifunc != NULL) {
++                tmp[n].bc = NULL;
+                 tmp[n].func = JS_MKPTR(JS_TAG_OBJECT, r->ifunc);
+                 tmp[n].cur_pc = NULL;
+                 tmp[n].rpc = (int)r->ipc;
+@@ -29942,13 +30168,14 @@
+                 if (n >= max || n >= 128)
+                     break;
+             }
++            tmp[n].bc = NULL;
+             tmp[n].func = JS_MKPTR(JS_TAG_OBJECT, r->func);
+             tmp[n].cur_pc = NULL;
+             tmp[n].rpc = (int)r->pc;
+             tmp[n].sf = NULL;
+             n++;
+             assert(regvm_on_c_stack(rt, (uintptr_t)r));
+-            r = r->prev;
++            r = ++ri < nrl ? rl[ri] : NULL;
+         } else if (i < nb) {
+             tmp[n++] = bt[i++];
+         } else {
+@@ -29974,6 +30201,7 @@
+         if (fr.light != NULL) {
+             JSRegRun *lf = fr.light;
+ 
++            bt[nb].bc = NULL;
+             bt[nb].func = JS_MKPTR(JS_TAG_OBJECT, lf->func);
+             bt[nb].cur_pc = NULL;
+             bt[nb].rpc = fr.callee_ret ? regvm_ret_pc(lf->b, fr.callee_ret)
+@@ -29989,6 +30217,7 @@
+ 
+             if (js_class_has_bytecode(fp->class_id))
+                 fb = fp->u.func.function_bytecode;
++            bt[nb].bc = NULL;
+             bt[nb].func = sf->cur_func;
+             bt[nb].cur_pc = sf->cur_pc;
+             if (fb && fr.callee_ret)
+@@ -30011,7 +30240,7 @@
+         nb++;
+     }
+ #if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
+-    if (rt->aot_fl_top != NULL)
++    if ((qjs_aot_form_v & 4) || rt->aot_fl_top != NULL || rec_scan > 0 || (rec_scan < 0 && ((qjs_aot_form_v & 2) || getenv("QJS_RECSCAN"))))
+         nb = regvm_merge_fl_records(rt, bt, anc, nb, max);
+ #endif
+     return nb;
+@@ -68467,8 +68696,10 @@
+     uint8_t digest[16];
+     uint32_t lo, hi;
+ 
+-    if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && b->realm->rt->aot_bound != NULL)
++    if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && b->realm->rt->aot_bound != NULL) {
+         b->realm->rt->aot_bound[b->aot_index] = 0;
++        if (aot_bc_tab && aot_bc_tab[b->aot_index] == b) aot_bc_tab[b->aot_index] = NULL;
++    }
+     if (b->aot_fn != NULL) {
+         b->realm->rt->aot_epoch_bumps++;
+         AOT_EPOCH_BUMP(b->realm->rt, 11);
+@@ -68513,6 +68744,8 @@
+             b->aot_fn = (void *)qjs_aot_table[mid].fn;
+             b->aot_nfn = (void *)qjs_aot_table[mid].nfn;
+             b->aot_index = mid;
++            if (aot_bc_tab == NULL) aot_bc_tab = calloc(qjs_aot_count ? qjs_aot_count : 1, sizeof(*aot_bc_tab));
++            if (aot_bc_tab) aot_bc_tab[mid] = b;
+             b->aot_state = 1;   /* bound */
+             /* The register file the unit compiled this body for. It may be wider
+                than `regvm_reg_count`: the generator allocates registers above the
+@@ -84030,8 +84263,10 @@
+ #if QJS_AOT || QJS_AOT_GEN
+     /* After the register PIC went (every entry reset moves aot_pic_epoch), the unit index is free for
+        another bytecode to bind. */
+-    if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && rt->aot_bound != NULL)
++    if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && rt->aot_bound != NULL) {
+         rt->aot_bound[b->aot_index] = 0;
++        if (aot_bc_tab && aot_bc_tab[b->aot_index] == b) aot_bc_tab[b->aot_index] = NULL;
++    }
+     /* The polymorphic property cache is independent of the register PIC, so it
+        is released here rather than in js_free_regvm_pic, which returns early
+        when a function has no PIC at all. */

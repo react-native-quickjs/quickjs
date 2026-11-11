@@ -1,0 +1,36 @@
+Subject: The engine builds with QJS_PACKED_ARRAYS=1: diagnostic code reads the raw array storage
+
+What this does
+  - quickjs.c ss_rng_of and the held-by-array diagnostic read the array storage through JS_ARR_RAW / JS_ARR_VALS and only for generic-kind arrays.
+
+Why we need it
+  With the packed-array flag on, `u.array.u.values` is renamed `values_raw`, so the stack-scan range helper and the leak diagnostic no longer compiled and the flag could not be built at all.
+
+Soundness
+  Diagnostic code only. A packed array holds no references, so skipping it in the held-by-array search loses nothing; the range helper covers the same bytes (the packed element is smaller than a JSValue).
+
+Failure modes
+  None with the flag off: the macros expand to the old member.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -12086,8 +12086,8 @@
+         if (ss_hit(p - 8, p + sizeof(JSObject) + 8 * sizeof(JSProperty) + 16, val)) return;
+         if (o->shape != NULL && o->prop != NULL && !o->prop_inline_cap && (uintptr_t)o->prop > 4096 &&
+             ss_hit((uintptr_t)o->prop, (uintptr_t)o->prop + (size_t)o->shape->prop_size * sizeof(JSProperty), val)) return;
+-        if (o->fast_array && o->class_id == JS_CLASS_ARRAY && o->u.array.u.values != NULL)
+-            ss_hit((uintptr_t)o->u.array.u.values, (uintptr_t)o->u.array.u.values + (size_t)o->u.array.count * sizeof(JSValue), val);
++        if (o->fast_array && o->class_id == JS_CLASS_ARRAY && JS_ARR_RAW(o) != NULL && o->arr_kind == JS_ARR_KIND_GENERIC)
++            ss_hit((uintptr_t)JS_ARR_RAW(o), (uintptr_t)JS_ARR_RAW(o) + (size_t)o->u.array.count * sizeof(JSValue), val);
+     } else if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING || JS_VALUE_GET_TAG(val) == JS_TAG_STRING_ROPE) {
+         JSString *st = ptr;
+         ss_hit(p - 8, p + sizeof(JSString) + ((size_t)st->len << st->is_wide_char) + 24, val);
+@@ -12247,7 +12247,7 @@
+                                 if (o_->shape == NULL) continue;
+                                 if (o_->class_id == JS_CLASS_OBJECT || o_->class_id == JS_CLASS_ARRAY) {
+                                     if (o_->class_id == JS_CLASS_OBJECT) { for (q = 0; q < o_->shape->prop_count; q++) if (JS_VALUE_GET_TAG(o_->prop[q].u.value) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(o_->prop[q].u.value) == p) { fprintf(stderr, "  held by plain %p (kind %x) slot %d shape-atom...\n", (void *)o_, Y_KIND(o_), q); nh++; } }
+-                                    else { for (q = 0; q < (int)o_->u.array.count; q++) if (JS_VALUE_GET_TAG(o_->u.array.u.values[q]) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(o_->u.array.u.values[q]) == p) { fprintf(stderr, "  held by array %p idx %d\n", (void *)o_, q); nh++; } }
++                                    else if (JS_ARR_RAW(o_) != NULL && o_->arr_kind == JS_ARR_KIND_GENERIC) { for (q = 0; q < (int)o_->u.array.count; q++) if (JS_VALUE_GET_TAG(JS_ARR_VALS(o_)[q]) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(JS_ARR_VALS(o_)[q]) == p) { fprintf(stderr, "  held by array %p idx %d\n", (void *)o_, q); nh++; } }
+                                 }
+                             }
+                         }

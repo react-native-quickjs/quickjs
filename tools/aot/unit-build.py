@@ -18,6 +18,8 @@ sha256(part text, compiler command, compiler version); an unchanged part is not 
 """
 import argparse, hashlib, os, re, subprocess, sys, time, concurrent.futures as cf
 
+# BSD time reports with -l, GNU time with -v
+TIME_FLAG = '-l' if sys.platform == 'darwin' else '-v'
 HEX = re.compile(r'[0-9a-f]{32}')
 ATTR = re.compile(r'__attribute__\s*\(\((?:[^()]|\([^()]*\))*\)\)')
 
@@ -205,6 +207,8 @@ def main():
     ap.add_argument('--report', default=None, help='the generator report: functions whose region holds at least --hot-min %% of the profile are hot')
     ap.add_argument('--hot-min', type=float, default=1.0)
     ap.add_argument('--budget', type=int, default=3000)
+    ap.add_argument('--cg-cap', type=int, default=int(os.environ.get('QJS_UNIT_CG_CAP', '40000')),
+                    help='call-graph grouping: the most lines a part built around hot functions and their callees may reach (0 turns it off)')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--cache', default=None)
     ap.add_argument('--stats', action='store_true')
@@ -239,11 +243,76 @@ def main():
                 if m and float(m.group(1)) >= args.hot_min:
                     hot.add(cur_hex)
                 cur_hex = None
+    # Call-graph grouping. A direct call into a function of another part is an ordinary call (the callee is not static there and its body is
+    # not visible), so a hot function and the functions it calls lose the inlining a single translation unit gives. The hot functions are
+    # therefore joined with their callees, heaviest edge first, into one part up to --cg-cap lines; an edge weighs the caller's share of the
+    # profile (the report's region percentage) times the number of call sites naming the callee. The ei_ bodies are copied into every
+    # part that uses them already. Functions not reached by any such edge keep the hash grouping.
+    share = {}
+    if args.report:
+        cur_hex = None
+        for l in open(args.report, errors='replace'):
+            if l.startswith('root-hex '):
+                cur_hex = l.split()[1]
+            elif l.startswith('root ') and cur_hex:
+                m = re.search(r'region ([\d.]+)%', l)
+                if m:
+                    share[cur_hex] = float(m.group(1))
+                cur_hex = None
+    comp = {h: h for h in owners}
+    csize = dict(owners)
+
+    def find(x):
+        while comp[x] != x:
+            comp[x] = comp[comp[x]]
+            x = comp[x]
+        return x
+    cg_edges = []
+    if args.cg_cap > 0:
+        sym = re.compile(r'\baot_[a-z]+_([0-9a-f]{32})\b')
+        body = {}
+        for it in items:
+            if it.kind == 'fndef' and it.owner in owners and not (it.name or '').startswith('ei_'):
+                body.setdefault(it.owner, []).append(it.text)
+        ei_text = {}
+        for n, it in ei.items():
+            if it.owner in owners:
+                ei_text.setdefault(it.owner, []).append(it.text)
+        for a in owners:
+            if a not in hot and share.get(a, 0.0) <= 0.0:
+                continue
+            cnt = {}
+            for t in body.get(a, []) + ei_text.get(a, []):
+                for b in sym.findall(t):
+                    if b != a and b in owners:
+                        cnt[b] = cnt.get(b, 0) + 1
+            for b, c in cnt.items():
+                cg_edges.append((max(share.get(a, 0.0), 0.01) * c, a, b))
+        cg_edges.sort(reverse=True)
+        for w, a, b in cg_edges:
+            ra, rb = find(a), find(b)
+            if ra != rb and csize[ra] + csize[rb] <= args.cg_cap:
+                comp[rb] = ra
+                csize[ra] += csize[rb]
+    members = {}
+    for h in owners:
+        members.setdefault(find(h), []).append(h)
+    if args.stats and cg_edges:
+        cut = [(w, a, b) for w, a, b in cg_edges if find(a) != find(b)]
+        print('call graph: %d edges, %d joined, weight cut %.1f of %.1f; components %s' % (
+            len(cg_edges), len(cg_edges) - len(cut), sum(w for w, _, _ in cut), sum(w for w, _, _ in cg_edges),
+            sorted((csize[r] for r in members if len(members[r]) > 1), reverse=True)[:6]))
+        for w, a, b in cut[:5]:
+            print('  cut %.1f %s (%d lines) -> %s (%d lines)' % (w, a[:12], csize[find(a)], b[:12], csize[find(b)]))
     parts = {}
     for h in sorted(owners):
-        key = ('big', h, h in hot) if owners[h] > big else ('grp', int(h[:8], 16) % ngroups, h in hot)
+        r = find(h)
+        if len(members[r]) > 1:
+            key = ('cg', r, any(m in hot for m in members[r]))
+        else:
+            key = ('big', h, h in hot) if owners[h] > big else ('grp', int(h[:8], 16) % ngroups, h in hot)
         parts.setdefault(key, []).append(h)
-    names = {k: (('b_' + k[1][:12]) if k[0] == 'big' else ('g%03d' % k[1])) + ('h' if k[2] else 'c') for k in parts}
+    names = {k: (('b_' + k[1][:12]) if k[0] == 'big' else ('c_' + k[1][:12]) if k[0] == 'cg' else ('g%03d' % k[1])) + ('h' if k[2] else 'c') for k in parts}
     ei_use = {}
     for k, hs in parts.items():
         hs = set(hs)
@@ -284,6 +353,9 @@ def main():
                 if it.owner not in hs:
                     continue
                 buf.append(hide(it.text) if it.kind == 'fndef' and nm.startswith('aot_') and it.static else it.text)
+                continue
+            if it.kind == 'data' and it.text.lstrip().startswith('_Static_assert'):
+                buf.append(it.text)
                 continue
             if it.kind == 'data':
                 ex = externalize_data(it)
@@ -327,30 +399,64 @@ def main():
     # A generated unit needs no stack canary (the frame records on its stacks made clang add one to every native entry: ~9 instructions a
     # call) and no per-entry statistics counter. QJS_UNIT_DEBUG=1 keeps both (the unit-stats report then counts entries).
     if not os.environ.get('QJS_UNIT_DEBUG'):
-        extra = ' -fno-stack-protector -DQJS_AOT_NOENTNOTE=1'
+        extra = ' -fno-stack-protector'
+        # Entries are counted (one increment per own or inlined entry): the profitability gate compares exits and refusals with them, and
+        # without the count it tripped at the 257th exit whatever the call count. QJS_UNIT_NO_ENTRY_COUNT=1 drops the counters (the gate
+        # then fires at 257 exits), for measuring what they cost.
+        if os.environ.get('QJS_UNIT_NO_ENTRY_COUNT'):
+            extra += ' -DQJS_AOT_NOENTNOTE=1'
+        args.cc += extra
+        if args.hot_cc:
+            args.hot_cc += extra
+    # QJS_AOT_RAT: the unit's frames are named from return addresses. The objects carry line tables and keep frame pointers; calls are not
+    # turned into jumps; rat-table.py reads the tables into a table object that is linked with the unit.
+    head = open(args.unit, errors='replace').read(1 << 20)
+    lay = os.path.join(os.path.dirname(args.unit) or '.', 'u-l.h')
+    use_rat = bool(re.search(r'^#define QJS_AOT_RAT\b', head, re.M)) or (os.path.exists(lay) and bool(re.search(r'^#define QJS_AOT_RAT\b', open(lay, errors='replace').read(), re.M)))
+    if use_rat:
+        extra = ' -g1 -fno-omit-frame-pointer -fno-optimize-sibling-calls'
         args.cc += extra
         if args.hot_cc:
             args.hot_cc += extra
     cc_ver = subprocess.run(args.cc.split()[0] + ' --version', shell=True, capture_output=True, text=True).stdout
     hot_cc = args.hot_cc or args.cc
+    # The unit's headers (the layout header u-l.h) are part of every part's object: a changed layout with an identical part text must not reuse a cached object.
+    hdr_text = b''
+    for h in sorted(os.listdir(os.path.dirname(os.path.abspath(args.unit)))):
+        if h.endswith('.h'):
+            hdr_text += h.encode() + b'\0' + open(os.path.join(os.path.dirname(os.path.abspath(args.unit)), h), 'rb').read()
+
+    # Every header a part includes through the -I directories (engine internals, the runtime headers) joins the key as well: found with -MM on one part.
+    if files:
+        probe = os.path.join(args.out, files[0][0])
+        dep = subprocess.run(args.cc + ' -MM ' + probe, shell=True, capture_output=True, text=True).stdout
+        deps = sorted({t for t in dep.replace('\\\n', ' ').split()[1:] if t.endswith('.h')})
+        for d in deps:
+            try:
+                hdr_text += d.encode() + b'\0' + open(d, 'rb').read()
+            except OSError:
+                pass
 
     def build(fn, ishot):
         cc = hot_cc if ishot else args.cc
         src = os.path.join(args.out, fn)
         obj = src[:-2] + '.o'
-        key = hashlib.sha256(open(src, 'rb').read() + b'\0' + cc.encode() + b'\0' + cc_ver.encode()).hexdigest()
+        key = hashlib.sha256(open(src, 'rb').read() + b'\0' + hdr_text + b'\0' + cc.encode() + b'\0' + cc_ver.encode()).hexdigest()
         if cache:
             cobj = os.path.join(cache, key + '.o')
             if os.path.exists(cobj):
                 subprocess.run(['cp', cobj, obj])
                 return fn, 'hit', 0.0, obj
         t = time.time()
-        r = subprocess.run('/usr/bin/time -l ' + cc + ' -c ' + src + ' -o ' + obj, shell=True, capture_output=True, text=True)
+        r = subprocess.run('/usr/bin/time ' + TIME_FLAG + ' ' + cc + ' -c ' + src + ' -o ' + obj, shell=True, capture_output=True, text=True)
         dt = time.time() - t
         if r.returncode != 0:
             return fn, 'FAIL ' + '\n'.join(l for l in r.stderr.split('\n') if 'error' in l)[:800], dt, obj
         m = re.search(r'(\d+)\s+maximum resident set size', r.stderr)
         rss = int(m.group(1)) / 1048576 if m else 0
+        if not m:
+            m = re.search(r'Maximum resident set size \(kbytes\): (\d+)', r.stderr)
+            rss = int(m.group(1)) / 1024 if m else 0
         if cache:
             subprocess.run(['cp', obj, cobj])
         return fn, 'built %.0fMB' % rss, dt, obj
@@ -367,7 +473,20 @@ def main():
     peak = max([float(re.search(r'([\d.]+)MB', r[1]).group(1)) for r in res if 'MB' in r[1]] or [0])
     print('build: %d parts (%d cached) wall %.1fs, split %.1fs, largest part rss %.0fMB, %s' % (
         len(res), hits, wall, t_split, peak, 'FAILED' if bad else 'ok'))
-    open(os.path.join(args.out, 'objs.txt'), 'w').write('\n'.join(r[3] for r in res) + '\n')
+    objs = [r[3] for r in res]
+    if use_rat and not bad:
+        side = os.environ.get('QJS_AOT_RAT_FILE') or args.unit + '.rat'
+        rsrc = os.path.join(args.out, 'zrat.c')
+        here = os.path.dirname(os.path.abspath(__file__))
+        if subprocess.run([sys.executable, os.path.join(here, 'rat-table.py'), side, rsrc] + objs).returncode != 0:
+            print('rat-table failed')
+            return 1
+        robj = rsrc[:-2] + '.o'
+        if subprocess.run(args.cc.split()[0] + ' -O1 -w -c ' + rsrc + ' -o ' + robj, shell=True).returncode != 0:
+            print('rat table compile failed')
+            return 1
+        objs.append(robj)
+    open(os.path.join(args.out, 'objs.txt'), 'w').write('\n'.join(objs) + '\n')
     return 1 if bad else 0
 
 

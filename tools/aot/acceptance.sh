@@ -30,7 +30,7 @@ MD=${AOT_REPORT:-$O/acceptance.md}
 BOX2D=${BOX2D:-}
 [ -n "$BOX2D" ] || { echo "acceptance.sh: set BOX2D to the box2d checksum script" >&2; exit 2; }
 K=tools/benchmark/kernels
-BASE="-g -std=gnu11 -D_GNU_SOURCE -I$S"
+BASE="-g -std=gnu11 -D_GNU_SOURCE -DJS_ENABLE_DEBUGGER=0 -I$S"
 # AOT is release-only: the engine refuses JS_ENABLE_DEBUGGER with QJS_AOT.
 # The unit is compiled separately from the engine, at UNIT_OPT (an -O2 unit is
 # the shipping shape; -O0 is available when debugging one).
@@ -153,7 +153,7 @@ if [ "$FULL" = 1 ]; then
   "$CLANG" -O2 $BASE -c $S/quickjs-libc.c -o "$O/obj/quickjs-libc.o"
   "$CLANG" -o "$O/aot-test262" "$O/obj/run-test262.o" "$O/obj/quickjs-libc.o" \
     "$O/obj/t262.o" "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm
-  ( cd $S && "$O/aot-test262" -m -c test262.conf -c test262-fast.conf -a > "$O/test262.out" 2>&1 )
+  ( cd $S && "$O/aot-test262" -m -t "${T262_THREADS:-3}" -c test262.conf -c test262-fast.conf -a > "$O/test262.out" 2>&1 )
   T262=$(grep -E '^Result:' "$O/test262.out" | tail -1)
 
   log "diff corpus"
@@ -167,19 +167,19 @@ if [ "$FULL" = 1 ]; then
 
   log "asan (test262-fast)"
   for f in quickjs libregexp libunicode dtoa; do
-    "$CLANG" -O1 $BASE -fsanitize=address,undefined -fno-omit-frame-pointer \
+    "$CLANG" ${ASAN_OPT:--O1} $BASE -fsanitize=address,undefined -fno-omit-frame-pointer \
       -DQJS_REGVM=1 -DQJS_AOT=1 -c $S/$f.c -o "$O/obj/$f-asan.o"
   done
-  "$CLANG" $UNIT_OPT $BASE -I"$O" -ffp-contract=off -fsanitize=address,undefined -fno-omit-frame-pointer \
+  "$CLANG" ${ASAN_UNIT_OPT:-$UNIT_OPT} $BASE -I"$O" -ffp-contract=off -fsanitize=address,undefined -fno-omit-frame-pointer \
     -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/t262.c" -o "$O/obj/t262-asan.o"
-  "$CLANG" -O1 $BASE -fsanitize=address,undefined -fno-omit-frame-pointer \
+  "$CLANG" ${ASAN_OPT:--O1} $BASE -fsanitize=address,undefined -fno-omit-frame-pointer \
     -c $S/run-test262.c -o "$O/obj/run-test262-asan.o"
-  "$CLANG" -O1 $BASE -fsanitize=address,undefined -fno-omit-frame-pointer \
+  "$CLANG" ${ASAN_OPT:--O1} $BASE -fsanitize=address,undefined -fno-omit-frame-pointer \
     -c $S/quickjs-libc.c -o "$O/obj/quickjs-libc-asan.o"
   "$CLANG" -fsanitize=address,undefined -o "$O/aot-test262-asan" \
     "$O/obj/run-test262-asan.o" "$O/obj/quickjs-libc-asan.o" "$O/obj/t262-asan.o" \
     "$O/obj/quickjs-asan.o" "$O/obj/libregexp-asan.o" "$O/obj/libunicode-asan.o" "$O/obj/dtoa-asan.o" -lm
-  ( cd $S && "$O/aot-test262-asan" -m -c test262.conf -c test262-fast.conf -a > "$O/asan.out" 2>&1 )
+  ( cd $S && "$O/aot-test262-asan" -m -t "${T262_THREADS:-3}" -c test262.conf -c test262-fast.conf -a > "$O/asan.out" 2>&1 )
   T=$(grep -E '^Result:' "$O/asan.out" | tail -1)
   U=$(grep -c 'runtime error' "$O/asan.out")
   A=$(grep -c 'ERROR: AddressSanitizer' "$O/asan.out")

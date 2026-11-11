@@ -1,0 +1,108 @@
+Subject: Register VM: interpreter activations of functions the unit holds a body for, counted per function (statistics build)
+
+What this does
+  - quickjs.c: with QJS_AOT_ICOUNT defined and QJS_AOT_STATS set in the environment, `js_aot_icount[]` (one counter per unit table index, allocated at the first bind) is incremented where the interpreter starts a function whose unit binding was dropped by the profitability gate, or whose compiled entry handed the whole call back (JS_CALL_FLAG_AOT_DEOPT): js_regvm_execute, regvm_t_call_record, regvm_t_call_method_record, regvm_t_construct_record and regvm_light_prepare. `qjs_aot_icount_table()` exports the table; the generated unit's statistics report (`aot interp fn=...`) reads it through a weak reference.
+  - Without QJS_AOT_ICOUNT, AOT_ICOUNT() is an empty statement: no code in any call path.
+
+Why we need it
+  The share of calls that run in the interpreter, per function, is what the generator's coverage work is measured by (a function the unit holds a body for that runs in the register interpreter is a coverage defect). The sampling profile gives the share by handler, not by function.
+
+Soundness
+  Read-only counters; nothing a compiled body or the interpreter reads.
+
+Failure modes
+  A generator resumed in the interpreter counts once per resume. A bytecode without its own table slot (a twin of the bound one) is not counted.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2192,6 +2192,19 @@
+ static void aot_run_free(JSRuntime *rt);
+ extern uint64_t js_aot_bound_count;
+ extern uint64_t js_aot_enter_count;
++#if defined(QJS_AOT_ICOUNT) && QJS_AOT
++/* Interpreter activations of functions the unit holds a body for (QJS_AOT_STATS=1 builds that define QJS_AOT_ICOUNT): one counter per
++   unit table index, allocated at the first bind. An activation is counted where the interpreter starts a function whose binding was
++   dropped (gated) or whose compiled entry handed the whole call back. */
++extern uint64_t *js_aot_icount;
++#define AOT_ICOUNT(b_, fl_) \
++    do { if (unlikely(js_aot_icount != NULL) && (b_)->aot_index != UINT32_MAX && \
++                      ((b_)->aot_fn == NULL || ((fl_) & JS_CALL_FLAG_AOT_DEOPT))) \
++             js_aot_icount[(b_)->aot_index]++; } while (0)
++#endif
++#endif
++#ifndef AOT_ICOUNT
++#define AOT_ICOUNT(b_, fl_) ((void)0)
+ #endif
+ 
+ /* Shared backing for lazily deserialized function bodies.
+@@ -32170,6 +32183,8 @@
+     int slots = regvm_args_borrowable(cb, na) ? 0
+         : (na > cb->arg_count ? na : cb->arg_count);
+ 
++    AOT_ICOUNT(cb, 0);
++
+     /* The interrupt countdown: JS_CallInternal polls once per activation, and a
+        call that stays in the chain must poll too or a recursion cannot be
+        interrupted. */
+@@ -32220,6 +32235,8 @@
+     int slots = regvm_args_borrowable(cb, na) ? 0
+         : (na > cb->arg_count ? na : cb->arg_count);
+ 
++    AOT_ICOUNT(cb, 0);
++
+     /* The interrupt countdown: JS_CallInternal polls once per activation, and a
+        call that stays in the chain must poll too or a recursion cannot be
+        interrupted. */
+@@ -32447,6 +32464,8 @@
+         return NULL;
+     nf = regvm_light_enter(ctx, co, cb, f, d, ip + ret_off,
+                            oargv, na, out_regs);
++    if (likely(nf != NULL))
++        AOT_ICOUNT(cb, 0);
+     return nf;
+ }
+ 
+@@ -32529,6 +32548,8 @@
+     int slots = regvm_args_borrowable(cb, na) ? 0
+         : (na > cb->arg_count ? na : cb->arg_count);
+ 
++    AOT_ICOUNT(cb, 0);
++
+     if (unlikely(js_poll_interrupts(ctx)))
+         T_FAIL();
+     if (unlikely(cb->regvm_pic == NULL && cb->regvm_pic_count != 0)
+@@ -36591,6 +36612,7 @@
+     /* Previous op start, for backward-branch (loop) detection. */
+     uint8_t *aot_prev_rpc = NULL;
+ #endif
++    AOT_ICOUNT(b, flags);
+  restart:
+     {
+ #if QJS_AOT_PROFILE
+@@ -68578,6 +68600,15 @@
+ uint64_t qjs_aot_spec_refused, qjs_aot_spec_exits;
+ uint64_t js_aot_bound_count;
+ uint64_t js_aot_enter_count;
++#if defined(QJS_AOT_ICOUNT) && QJS_AOT
++uint64_t *js_aot_icount;
++
++/* The unit's report reads the counters through this (a weak reference there, so a unit also links against an engine without it). */
++const uint64_t *qjs_aot_icount_table(void)
++{
++    return js_aot_icount;
++}
++#endif
+ 
+ void js_aot_stats_dump(JSRuntime *rt)
+ {
+@@ -68870,6 +68901,10 @@
+     b->aot_layout_tries = 0;
+     if (!aot_unit_present())
+         return;
++#if defined(QJS_AOT_ICOUNT) && QJS_AOT
++    if (js_aot_icount == NULL && getenv("QJS_AOT_STATS") != NULL)
++        js_aot_icount = calloc(qjs_aot_count ? qjs_aot_count : 1, sizeof(uint64_t));
++#endif
+     if (!b->regvm_compiled || b->regvm_len <= 0 || b->is_lazy)
+         return;
+     js_aot_digest(b, digest);

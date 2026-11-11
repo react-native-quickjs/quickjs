@@ -69,7 +69,19 @@ static int bs_count(const BSet *d) {
   for (i = 0; i < BN_W; i++) n += __builtin_popcountll(d->w[i]);
   return n;
 }
-#define BS_FOR(s, set) for ((s) = 0; (s) < BN_MAXSITES; (s)++) if (bs_has((set), (s)))
+/* first set bit at or after `from`, or -1; whole zero words are skipped */
+static int bs_next(const BSet *d, int from) {
+  int wi = from >> 6;
+  uint64_t w;
+  if (from >= BN_MAXSITES) return -1;
+  w = d->w[wi] & (~0ull << (from & 63));
+  for (;;) {
+    if (w) return wi * 64 + __builtin_ctzll(w);
+    if (++wi >= BN_W) return -1;
+    w = d->w[wi];
+  }
+}
+#define BS_FOR(s, set) for ((s) = 0; ((s) = bs_next((set), (s))) >= 0; (s)++)
 
 enum { SK_EXT, SK_OBJ, SK_ARR, SK_FUNC, SK_PROTO, SK_INST, SK_BUILTIN, SK_NATIVE };
 static const char *const sk_names[] = {"ext", "object", "array", "function", "prototype", "instance", "builtin", "native"};
@@ -80,6 +92,8 @@ typedef struct BSite {
   int afn, apc;   /* the function and pc that allocates it */
   int ctx;        /* the call-site context of the allocating instance (0: none) */
   int owner;      /* PROTO: its function site */
+  int own_head, own_tail; /* FUNC: its PROTO sites as an index+1 list in creation order (0 = none) */
+  int own_next;           /* PROTO: next PROTO site of the same owner, index+1 */
   int flags;      /* SF_* */
   int proto_assigned; /* FUNC: the bundle assigns F.prototype */
   char label[80];
@@ -130,6 +144,7 @@ typedef struct BFn {
   /* own effects */
   uint64_t wn[BN_NAMES / 64];
   uint64_t twn[BN_NAMES / 64];
+  int wdyn, twdyn;
   int welem, twelem, wglobal, twglobal, alloc, talloc, unkcall, tunkcall, thrw, tthrw, wvarref, twvarref;
   /* closure cells: the functions whose make_closure creates this one, and which of this function's own locals / arguments some inner function captures */
   int ncreat, creat[4];
@@ -156,7 +171,8 @@ typedef struct BRun {
   BSite *st; int nst;
   BField *fl; int nfl, flcap;
   int *fhash; int fhcap;
-  BInst *in; int nin;
+  BInst *in; int nin, incap;
+  int *ihash; int ihcap;     /* (fn, ctx) -> instance index, -1 empty */
   BSet esc;
   int *globals;             /* name id -> node, -1 */
   int varref_node, sink_node, tmp_in, tmp_out;
@@ -168,10 +184,12 @@ typedef struct BRun {
   BEdge *ed; int ned, edcap;
   BCall *cs; int ncs, cscap;
   int unmodeled[256];
-  int dyn_key_stores, delete_ops, setproto_ops, eval_ops, with_ops, copyprops_ops, special_args, thru_calls, native_typed;
+  int dyn_key_stores, ext_dyn_stores, delete_ops, setproto_ops, eval_ops, with_ops, copyprops_ops, special_args, thru_calls, native_typed;
   int unk_calls, unk_calls_objargs, escaped_funcs;
   int overflow_sites, accessors;
+  int *edh; int edhcap; /* open-addressing index of ed by (cfn, cpc, tfn) */
   BEv *ev; int nev, evcap;
+  int *evh; int evhcap; /* open-addressing index of ev by (inst, pc, site, name, callee); -1 = empty */
   BAcc *acc; int nacc, acccap;
   BRcv *rcv; int nrcv, rcvcap;
   BRT *rt; int nrt, rtcap;
@@ -189,12 +207,44 @@ static uint8_t g_gdef[BN_NAMES];
 static uint8_t *g_made; /* per function: some make_closure in the bundle creates it */
 static const char *fn_name(int fn);
 
+/* Property names are interned once; the id is the index in g_bn_names. Open addressing over the name hash. */
+#define BN_HASH_CAP (BN_NAMES * 4)
+static int g_bn_hash[BN_HASH_CAP];
+/* per-name class bits, computed once when the name is interned */
+enum { NF_OBJBI = 1, NF_FNBI = 2, NF_CAB = 4, NF_PROTOTYPE = 8, NF_LENGTH = 16, NF_BRK = 32, NF_IMPLICIT = 64, NF_CONSTRUCTOR = 128 };
+static uint8_t g_bn_flags[BN_NAMES];
+static int implicit_callee_name(const char *nm);
+static unsigned bn_flags_of(const char *nm) {
+  static const char *const objbi[] = {"toString", "valueOf", "toLocaleString", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "constructor", "__proto__",
+                                      "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", NULL};
+  unsigned f = 0;
+  int k;
+  for (k = 0; objbi[k]; k++) if (strcmp(nm, objbi[k]) == 0) f |= NF_OBJBI;
+  if (!strcmp(nm, "call") || !strcmp(nm, "apply") || !strcmp(nm, "bind")) f |= NF_CAB | NF_FNBI;
+  if (!strcmp(nm, "name") || !strcmp(nm, "length")) f |= NF_FNBI;
+  if (!strcmp(nm, "prototype")) f |= NF_PROTOTYPE;
+  if (!strcmp(nm, "length")) f |= NF_LENGTH;
+  if (!strcmp(nm, "[]")) f |= NF_BRK;
+  if (implicit_callee_name(nm)) f |= NF_IMPLICIT;
+  if (!strcmp(nm, "constructor")) f |= NF_CONSTRUCTOR;
+  return f;
+}
+static unsigned bn_hash_str(const char *s) {
+  unsigned h = 2166136261u;
+  while (*s) h = (h ^ (unsigned char)*s++) * 16777619u;
+  return h;
+}
 static int bn_name(const char *s) {
-  int i;
-  for (i = 0; i < g_bn_nnames; i++)
-    if (strcmp(g_bn_names[i], s) == 0) return i;
+  static int init;
+  unsigned h, k;
+  if (!init) { memset(g_bn_hash, 0xff, sizeof(g_bn_hash)); init = 1; }
+  h = bn_hash_str(s) % BN_HASH_CAP;
+  for (k = h; g_bn_hash[k] >= 0; k = (k + 1) % BN_HASH_CAP)
+    if (strcmp(g_bn_names[g_bn_hash[k]], s) == 0) return g_bn_hash[k];
   if (g_bn_nnames >= BN_NAMES) return BN_NAMES - 1;
   g_bn_names[g_bn_nnames] = strdup(s);
+  g_bn_flags[g_bn_nnames] = (uint8_t)bn_flags_of(s);
+  g_bn_hash[k] = g_bn_nnames;
   return g_bn_nnames++;
 }
 
@@ -271,16 +321,16 @@ static int st_new(int kind, int fn, int afn, int apc, int ctx, const char *label
       return i;
   /* A function with thousands of allocation sites of one kind (a long top level building constant structures: 27 674 `new sc_Pair` literals in the Boyer/Earley file) must
      not fill the site table, since every site past the cap is merged into EXT, and with it the function sites created after them (every global function defined late in
-     that top level became EXT: 223 calls unresolved, no region on any hot function). Past SITE_SUMMARY allocation sites of the same kind, constructor and function, the
+     that top level became EXT: 223 calls unresolved, no region on any hot function). Past 48 allocation sites (QJS_AOT_BUNDLE_SITESUM=n) of the same kind, constructor, function and context (a long run of one function, never the few classes a shared factory such as Class.create makes), the
      next ones share the last real site as a summary: a sound weak merge of same-shaped objects. QJS_AOT_BUNDLE_NOSITESUM=1 turns it off. */
   if (kind == SK_OBJ || kind == SK_ARR || kind == SK_INST) {
-    static int off = -1;
+    static int off = -1, cap = 0;
     int n = 0, last = -1;
-    if (off < 0) off = getenv("QJS_AOT_BUNDLE_NOSITESUM") != NULL;
+    if (off < 0) { const char *ce = getenv("QJS_AOT_BUNDLE_SITESUM"); off = getenv("QJS_AOT_BUNDLE_NOSITESUM") != NULL; cap = ce != NULL ? atoi(ce) : 48; if (cap < 2) cap = 2; }
     if (!off) {
       for (i = 0; i < R->nst; i++)
-        if (R->st[i].kind == kind && R->st[i].afn == afn && R->st[i].fn == fn) { n++; last = i; }
-      if (n >= 24) return last;
+        if (R->st[i].kind == kind && R->st[i].afn == afn && R->st[i].fn == fn && R->st[i].ctx == ctx) { n++; last = i; }
+      if (n >= cap) return last;
     }
   }
   if (R->nst >= BN_MAXSITES) { R->overflow_sites++; return 0; }
@@ -344,12 +394,27 @@ static int fnode(int site, int name, int create) {
 /* instances */
 static int small_fn(int fn) { return g_bfn[fn].ok && g_bfn[fn].q.ninsns <= 110; }
 
+static unsigned inst_hash(int fn, int ctx) {
+  uint64_t h = ((uint64_t)(uint32_t)fn << 32 | (uint32_t)ctx) * 0x9E3779B97F4A7C15ull;
+  return (unsigned)(h >> 32);
+}
+static void inst_index(int i) {
+  unsigned m = (unsigned)R->ihcap - 1, j;
+  for (j = inst_hash(R->in[i].fn, R->in[i].ctx) & m; R->ihash[j] >= 0; j = (j + 1) & m) {}
+  R->ihash[j] = i;
+}
 static int inst_get(int fn, int ctx) {
   int i, k;
   if (!R->pts) ctx = 0;
-  for (i = 0; i < R->nin; i++)
-    if (R->in[i].fn == fn && R->in[i].ctx == ctx) return i;
-  R->in = realloc(R->in, (size_t)(R->nin + 1) * sizeof(BInst));
+  if (R->ihcap) {
+    unsigned m = (unsigned)R->ihcap - 1, j;
+    for (j = inst_hash(fn, ctx) & m; (i = R->ihash[j]) >= 0; j = (j + 1) & m)
+      if (R->in[i].fn == fn && R->in[i].ctx == ctx) return i;
+  }
+  if (R->nin == R->incap) {
+    R->incap = R->incap ? R->incap * 2 : 64;
+    R->in = realloc(R->in, (size_t)R->incap * sizeof(BInst));
+  }
   {
     BInst *x = &R->in[R->nin];
     const JSAotGenFunc *g = g_bfn[fn].g;
@@ -368,7 +433,17 @@ static int inst_get(int fn, int ctx) {
     for (k = 0; k < x->nloc; k++) nd_new();
   }
   R->changed = 1;
-  return R->nin++;
+  R->nin++;
+  if (2 * R->nin > R->ihcap) {
+    int nc = R->ihcap ? R->ihcap * 2 : 256, j;
+    free(R->ihash);
+    R->ihash = malloc((size_t)nc * sizeof(int));
+    R->ihcap = nc;
+    for (j = 0; j < nc; j++) R->ihash[j] = -1;
+    for (j = 0; j < R->nin; j++) inst_index(j);
+  } else
+    inst_index(R->nin - 1);
+  return R->nin - 1;
 }
 
 static int vnode(const BInst *I, Q2ValueId v) {
@@ -482,8 +557,11 @@ static const char *g_cur_why = "";
 
 /* the objects in `src` reach unknown code; the first cause is kept for the report */
 static int diag_noesc(int fn, int pc) {   /* DIAGNOSTIC ONLY (unsound): QJS_AOT_BUNDLE_DIAG_NOESC="fn:pc,fn:*,..." escapes made at these instructions are dropped */
-  const char *e = getenv("QJS_AOT_BUNDLE_DIAG_NOESC"), *q;
+  static int init = 0;
+  static const char *e;
+  const char *q;
   char tok[32];
+  if (!init) { e = getenv("QJS_AOT_BUNDLE_DIAG_NOESC"); init = 1; }
   if (e == NULL) return 0;
   snprintf(tok, sizeof(tok), "%d:%d", fn, pc);
   for (q = e; *q;) {
@@ -497,10 +575,12 @@ static int diag_noesc(int fn, int pc) {   /* DIAGNOSTIC ONLY (unsound): QJS_AOT_
   return 0;
 }
 static void esc_add(const BSet *src) {
-  int s;
+  int s, w;
   if (g_cur_fn >= 0 && diag_noesc(g_cur_fn, g_cur_pc)) return;
-  for (s = 0; s < BN_MAXSITES; s++)
-    if (bs_has(src, s) && !bs_has(&R->esc, s)) {
+  for (w = 0; w < BN_W; w++) {
+    uint64_t nw = src->w[w] & ~R->esc.w[w];
+    for (; nw; nw &= nw - 1) {
+      s = w * 64 + __builtin_ctzll(nw);
       bs_add(&R->esc, s);
       R->changed = 1;
       if (getenv("QJS_AOT_BUNDLE_ESCALL") != NULL) fprintf(stderr, "escape-all: %s <- %s (fn %d pc %d%s%s) pts=%d phase %d\n", R->st[s].label, g_cur_why, g_cur_fn, g_cur_pc, g_cur_fn == -1 && g_cur_pc >= 0 && g_cur_pc < R->nst ? " from site " : "", g_cur_fn == -1 && g_cur_pc >= 0 && g_cur_pc < R->nst ? R->st[g_cur_pc].label : "", R->pts, R->phase);
@@ -515,6 +595,7 @@ static void esc_add(const BSet *src) {
         }
       }
     }
+  }
 }
 static void escape_node(int n) {
   if (n < 0) return;
@@ -554,14 +635,16 @@ static int implicit_callee_name(const char *nm) {
   return 0;
 }
 
+static const char *g_readdbg;
+static int g_noimplicit, g_bn_brk = -1;
 /* a read of `name` from the objects in `recv` into dst */
 static void read_field(int dst, int recv, int name, int fn, int pc) {
   int s;
   const char *nm = g_bn_names[name];
   seal_recv(recv, fn, pc);
-  if (R->pts && R->collect && getenv("QJS_AOT_BUNDLE_READDBG") != NULL) {
+  if (R->pts && R->collect && g_readdbg != NULL) {
     char want_[96]; int wpc_ = -1; char *col_;
-    snprintf(want_, sizeof(want_), "%s", getenv("QJS_AOT_BUNDLE_READDBG"));
+    snprintf(want_, sizeof(want_), "%s", g_readdbg);
     col_ = strrchr(want_, ':');
     if (col_) { *col_ = 0; wpc_ = atoi(col_ + 1); }
     if (pc == wpc_ && strstr(fn_name(fn), want_) != NULL) {
@@ -586,7 +669,7 @@ static void read_field(int dst, int recv, int name, int fn, int pc) {
       nd_site(dst, 0);
       if (site_is_ext(s)) continue;
     }
-    if (R->st[s].kind == SK_ARR && strcmp(nm, "length") == 0) { nd_cls(dst, K_INT); continue; }
+    if (R->st[s].kind == SK_ARR && (g_bn_flags[name] & NF_LENGTH)) { nd_cls(dst, K_INT); continue; }
     memset(&seen, 0, sizeof(seen));
     stack[sp++] = s;
     bs_add(&seen, s);
@@ -600,20 +683,17 @@ static void read_field(int dst, int recv, int name, int fn, int pc) {
       }
       {
         /* a computed-key store on this site may have defined any name */
-        int fe_ = R->st[c].kind == SK_ARR || g_diag_noelem ? -1 : fl_find(c, bn_name("[]"), 0);   /* an array's [] holds its indexed elements, not named properties */
-        if (fe_ >= 0 && strcmp(nm, "[]") != 0) {
-          static const char *const bi_[] = {"toString", "valueOf", "toLocaleString", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "constructor", "__proto__",
-                                            "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", NULL};
-          int k_, isb_ = 0;
+        int fe_ = R->st[c].kind == SK_ARR || g_diag_noelem ? -1 : fl_find(c, g_bn_brk >= 0 ? g_bn_brk : (g_bn_brk = bn_name("[]")), 0);   /* an array's [] holds its indexed elements, not named properties */
+        if (fe_ >= 0 && !(g_bn_flags[name] & NF_BRK)) {
+          int isb_ = (g_bn_flags[name] & NF_OBJBI) != 0;
           nd_flow(dst, R->fl[fe_].node);
-          for (k_ = 0; bi_[k_]; k_++) if (strcmp(nm, bi_[k_]) == 0) isb_ = 1;
-          if (R->st[c].kind == SK_FUNC && (strcmp(nm, "call") == 0 || strcmp(nm, "apply") == 0 || strcmp(nm, "bind") == 0 || strcmp(nm, "name") == 0 || strcmp(nm, "length") == 0)) isb_ = 1;   /* Function.prototype's own */
+          if (R->st[c].kind == SK_FUNC && (g_bn_flags[name] & NF_FNBI)) isb_ = 1;   /* Function.prototype's own */
           if (!isb_) found = 1;   /* a name Object.prototype does not define: the computed store is the only candidate besides undefined (the miss branch's unknown inherited builtin is not one) */
         }
       }
-      if (R->st[c].kind == SK_FUNC && strcmp(nm, "prototype") == 0 && !R->st[c].proto_assigned) {
+      if (R->st[c].kind == SK_FUNC && (g_bn_flags[name] & NF_PROTOTYPE) && !R->st[c].proto_assigned) {
         int pp;
-        for (pp = 0; pp < R->nst; pp++)
+        for (pp = R->st[c].own_head - 1; pp >= 0; pp = R->st[pp].own_next - 1)
           if (R->st[pp].kind == SK_PROTO && R->st[pp].owner == c) { nd_site(dst, pp); found = 1; }
       }
       BS_FOR(p, &R->st[c].proto) {
@@ -627,7 +707,7 @@ static void read_field(int dst, int recv, int name, int fn, int pc) {
     }
     if (!found) {
       /* a builtin array method or an inherited builtin */
-      if (R->st[s].kind == SK_FUNC && (strcmp(nm, "call") == 0 || strcmp(nm, "apply") == 0 || strcmp(nm, "bind") == 0)) {
+      if (R->st[s].kind == SK_FUNC && (g_bn_flags[name] & NF_CAB)) {
         nd_site(dst, builtin_site("Function", nm));
       } else if (R->phase == 0 && R->st[s].kind != SK_ARR) {
         /* misses settle at the end of the first phase */
@@ -645,11 +725,8 @@ static void read_field(int dst, int recv, int name, int fn, int pc) {
         /* a miss on a site whose whole prototype chain is modelled (no escaped or external site on it) and a name that is not an Object.prototype builtin is exactly undefined.
            QJS_AOT_BUNDLE_NOPRECISEMISS=1 restores undefined|unknown. */
         static int nopm = -1;
-        static const char *const objbi_[] = {"toString", "valueOf", "toLocaleString", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "constructor", "__proto__",
-                                             "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__", "[]", NULL};
-        int isb2_ = 0, k2_;
+        int isb2_ = (g_bn_flags[name] & (NF_OBJBI | NF_BRK)) != 0;
         if (nopm < 0) nopm = getenv("QJS_AOT_BUNDLE_NOPRECISEMISS") != NULL;
-        for (k2_ = 0; objbi_[k2_]; k2_++) if (strcmp(nm, objbi_[k2_]) == 0) isb2_ = 1;
         if (!nopm && clean && !isb2_ && (R->st[s].kind == SK_OBJ || R->st[s].kind == SK_INST) && R->phase == 1) nd_cls(dst, K_UNDEF);
         else
         nd_cls(dst, K_UNDEF | K_UNK);
@@ -683,14 +760,14 @@ static void write_field(int recv, int name, int val, int fn, int pc, int blk) {
     }
     f = fl_find(s, name, 1);
     nd_flow(R->fl[f].node, val);
-    if (implicit_callee_name(g_bn_names[name]) && getenv("QJS_AOT_BUNDLE_NOIMPLICIT") == NULL && !g_nolost && strcmp(g_bn_names[name], "constructor") != 0 && bs_count(&R->nd[val].pts) > 0) {
+    if ((g_bn_flags[name] & NF_IMPLICIT) && !g_noimplicit && !g_nolost && !(g_bn_flags[name] & NF_CONSTRUCTOR) && bs_count(&R->nd[val].pts) > 0) {
       /* only the FUNCTIONS stored there can be called (a `next` field that holds a list node is data) */
       BSet fs_; int q_; memset(&fs_, 0, sizeof(fs_));
       BS_FOR(q_, &R->nd[val].pts) if (R->st[q_].kind == SK_FUNC) bs_add(&fs_, q_);
       g_cur_why = "stored under a name the engine calls implicitly";
       esc_add(&fs_);
     }
-    if (strcmp(g_bn_names[name], "prototype") == 0 && R->st[s].kind == SK_FUNC && bs_count(&R->nd[recv].pts) == 1 &&
+    if ((g_bn_flags[name] & NF_PROTOTYPE) && R->st[s].kind == SK_FUNC && bs_count(&R->nd[recv].pts) == 1 &&
         !R->st[s].proto_assigned) {
       R->st[s].proto_assigned = 1; /* assumed to run before the first construct; see the report */
       R->changed = 1;
@@ -755,22 +832,50 @@ static void rt_add(int fn, int pc, int site, int tfn) {
   R->nrt++;
 }
 
-static void ev_add(int inst, int pc, int blk, int site, int name, int callee, const BSet *this_set) {
+static unsigned ev_hash(int inst, int pc, int site, int name, int callee) {
+  uint64_t h = (uint64_t)(unsigned)inst * 0x9E3779B97F4A7C15ull;
+  h = (h ^ (unsigned)pc) * 0xC2B2AE3D27D4EB4Full;
+  h = (h ^ (unsigned)site) * 0x165667B19E3779F9ull;
+  h = (h ^ (unsigned)name) * 0x9E3779B97F4A7C15ull;
+  h = (h ^ (unsigned)callee) * 0xC2B2AE3D27D4EB4Full;
+  return (unsigned)(h >> 32);
+}
+static void ev_rehash(void) {
   int i;
-  for (i = 0; i < R->nev; i++)
-    if (R->ev[i].inst == inst && R->ev[i].pc == pc && R->ev[i].site == site && R->ev[i].name == name && R->ev[i].callee == callee) {
-      if (this_set) bs_or(&R->ev[i].this_set, this_set);
-      return;
+  unsigned k;
+  free(R->evh);
+  R->evhcap = R->evcap * 2;
+  R->evh = malloc((size_t)R->evhcap * sizeof(int));
+  memset(R->evh, 0xff, (size_t)R->evhcap * sizeof(int));
+  for (i = 0; i < R->nev; i++) {
+    k = ev_hash(R->ev[i].inst, R->ev[i].pc, R->ev[i].site, R->ev[i].name, R->ev[i].callee) % (unsigned)R->evhcap;
+    while (R->evh[k] >= 0) k = (k + 1) % (unsigned)R->evhcap;
+    R->evh[k] = i;
+  }
+}
+static void ev_add(int inst, int pc, int blk, int site, int name, int callee, const BSet *this_set) {
+  unsigned k;
+  if (R->evhcap > 0) {
+    for (k = ev_hash(inst, pc, site, name, callee) % (unsigned)R->evhcap; R->evh[k] >= 0; k = (k + 1) % (unsigned)R->evhcap) {
+      BEv *e = &R->ev[R->evh[k]];
+      if (e->inst == inst && e->pc == pc && e->site == site && e->name == name && e->callee == callee) {
+        if (this_set) bs_or(&e->this_set, this_set);
+        return;
+      }
     }
+  }
   if (R->nev >= R->evcap) {
     R->evcap = R->evcap ? R->evcap * 2 : 1024;
     R->ev = realloc(R->ev, (size_t)R->evcap * sizeof(BEv));
+    ev_rehash();
   }
   memset(&R->ev[R->nev], 0, sizeof(BEv));
   R->ev[R->nev].seq = R->nev;
   R->ev[R->nev].inst = inst; R->ev[R->nev].pc = pc; R->ev[R->nev].blk = blk;
   R->ev[R->nev].site = site; R->ev[R->nev].name = name; R->ev[R->nev].callee = callee;
   if (this_set) R->ev[R->nev].this_set = *this_set;
+  for (k = ev_hash(inst, pc, site, name, callee) % (unsigned)R->evhcap; R->evh[k] >= 0; k = (k + 1) % (unsigned)R->evhcap) {}
+  R->evh[k] = R->nev;
   R->nev++;
 }
 
@@ -815,15 +920,32 @@ static int fn_of_closure(const JSAotGenFunc *g, int cpool) {
   return -1;
 }
 
+static unsigned ed_hash(int cfn, int cpc, int tfn) {
+  uint64_t h = ((uint64_t)(unsigned)cfn * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)(unsigned)cpc * 0xC2B2AE3D27D4EB4Full);
+  h = (h ^ (unsigned)tfn) * 0x165667B19E3779F9ull;
+  return (unsigned)(h >> 32);
+}
 static void note_edge(int cfn, int cpc, int tfn, int inloop) {
-  int i;
-  for (i = 0; i < R->ned; i++)
-    if (R->ed[i].cfn == cfn && R->ed[i].cpc == cpc && R->ed[i].tfn == tfn) return;
+  unsigned k;
+  if (R->edhcap > 0)
+    for (k = ed_hash(cfn, cpc, tfn) % (unsigned)R->edhcap; R->edh[k] >= 0; k = (k + 1) % (unsigned)R->edhcap)
+      if (R->ed[R->edh[k]].cfn == cfn && R->ed[R->edh[k]].cpc == cpc && R->ed[R->edh[k]].tfn == tfn) return;
   if (R->ned >= R->edcap) {
+    int i;
     R->edcap = R->edcap ? R->edcap * 2 : 256;
     R->ed = realloc(R->ed, (size_t)R->edcap * sizeof(BEdge));
+    free(R->edh);
+    R->edhcap = R->edcap * 2;
+    R->edh = malloc((size_t)R->edhcap * sizeof(int));
+    memset(R->edh, 0xff, (size_t)R->edhcap * sizeof(int));
+    for (i = 0; i < R->ned; i++) {
+      for (k = ed_hash(R->ed[i].cfn, R->ed[i].cpc, R->ed[i].tfn) % (unsigned)R->edhcap; R->edh[k] >= 0; k = (k + 1) % (unsigned)R->edhcap) {}
+      R->edh[k] = i;
+    }
   }
   R->ed[R->ned].cfn = cfn; R->ed[R->ned].cpc = cpc; R->ed[R->ned].tfn = tfn; R->ed[R->ned].inloop = inloop;
+  for (k = ed_hash(cfn, cpc, tfn) % (unsigned)R->edhcap; R->edh[k] >= 0; k = (k + 1) % (unsigned)R->edhcap) {}
+  R->edh[k] = R->ned;
   R->ned++;
 }
 
@@ -919,7 +1041,7 @@ static void builtin_define_property(const BInst *I, const Q2Insn *in, int dst) {
   desc = vnode(I, in->win_val[2]);
   if (!bn_const_name(I, in->win_val[1], key, sizeof(key))) {
     unknown_call(I, in, dst, -1, 0);
-    if (R->collect) R->dyn_key_stores++;
+    if (R->collect) { R->dyn_key_stores++; R->ext_dyn_stores++; g_bfn[I->fn].wdyn = 1; }
     return;
   }
   BS_FOR(s, &R->nd[tgt].pts) {
@@ -973,7 +1095,7 @@ static void link_target(const BInst *I, const Q2Insn *in, int s, int kind, int r
       }
       if (R->pts && !S->proto_assigned) {
         int pp;
-        for (pp = 0; pp < R->nst; pp++)
+        for (pp = R->st[s].own_head - 1; pp >= 0; pp = R->st[pp].own_next - 1)
           if (R->st[pp].kind == SK_PROTO && R->st[pp].owner == s)
             if (bs_add(&R->st[inst].proto, pp)) R->changed = 1;
       }
@@ -1654,6 +1776,9 @@ static void do_insn(const BInst *I, int ii, int blk, int inloop) {
     case ROP_get_global:
       if (bn_atom(in, NULL, nm, sizeof(nm), 0)) {
         int nid = bn_name(nm), g = gnode(nid);
+        if (R->collect && (strcmp(nm, "globalThis") == 0 || strcmp(nm, "window") == 0 || strcmp(nm, "self") == 0 || strcmp(nm, "global") == 0 ||
+                           strcmp(nm, "Function") == 0 || strcmp(nm, "Reflect") == 0 || strcmp(nm, "eval") == 0))
+          WF->wdyn = 1;   /* the global object, or a way to it, is named here */
         nd_flow(dst, g);
         /* nothing in the bundle defines it: a builtin or an external binding */
         if (!g_gdef[nid] && strcmp(nm, "Object") != 0 && !(g_math_model && strcmp(nm, "Math") == 0)) { nd_cls(dst, K_UNK); nd_site(dst, 0); }
@@ -1699,7 +1824,14 @@ static void do_insn(const BInst *I, int ii, int blk, int inloop) {
         if (R->st[fs].label[0] == 0) snprintf(R->st[fs].label, sizeof(R->st[fs].label), "%s", lb);
         ps = st_new(SK_PROTO, -1, I->fn, in->pc, I->ctx, "");
         if (R->st[ps].label[0] == 0) snprintf(R->st[ps].label, sizeof(R->st[ps].label), "%s.prototype", fn_name(fn));
-        R->st[ps].owner = fs;
+        if (R->st[ps].owner != fs) {
+          R->st[ps].owner = fs;
+          /* site 0 stands for every site past the table's end: as a prototype it takes no part in an owner list (it would loop on itself) */
+          if (ps != 0 && fs != ps) {
+          if (R->st[fs].own_tail) R->st[R->st[fs].own_tail - 1].own_next = ps + 1; else R->st[fs].own_head = ps + 1;
+          R->st[fs].own_tail = ps + 1;
+          }
+        }
         nd_site(dst, fs);
         nd_site(fnode(ps, bn_name("constructor"), 1), fs);
         if (R->collect) WF->alloc++;
@@ -1847,6 +1979,8 @@ static void do_insn(const BInst *I, int ii, int blk, int inloop) {
           int rs2, nonarr = 0;
           BS_FOR(rs2, &R->nd[recv].pts) if (R->st[rs2].kind != SK_ARR) nonarr = 1;
           if (nonarr) R->dyn_key_stores++;
+          if (!(kv != NULL && kv->has_prof && kv->prof_src == 0 && kv->ptypes == Q2_T_INT32))
+            BS_FOR(rs2, &R->nd[recv].pts) if (site_is_ext(rs2) || R->st[rs2].kind == SK_EXT) { R->ext_dyn_stores++; if (WF) WF->wdyn = 1; break; }
         }
       }
       if (in->rop != ROP_define_element && forin_copy(I, in)) { if (R->collect) WF->welem = 1; break; }
@@ -1885,7 +2019,7 @@ static void do_insn(const BInst *I, int ii, int blk, int inloop) {
           write_field(tgt, bn_name(nm), val, I->fn, in->pc, blk);
           if (R->st[s].kind == SK_FUNC) {
             int pp;
-            for (pp = 0; pp < R->nst; pp++) if (R->st[pp].kind == SK_PROTO && R->st[pp].owner == s) nd_site(fnode(pp, bn_name(nm), 1), 0);
+            for (pp = R->st[s].own_head - 1; pp >= 0; pp = R->st[pp].own_next - 1) if (R->st[pp].kind == SK_PROTO && R->st[pp].owner == s) nd_site(fnode(pp, bn_name(nm), 1), 0);
           }
         }
         if (dst >= 0) nd_flow(dst, tgt);
@@ -2177,6 +2311,8 @@ static void compute_cells(void) {
   g_diag_nocoerce = getenv("QJS_AOT_BUNDLE_DIAG_NOCOERCE") != NULL;
   if (getenv("QJS_AOT_BUNDLE_EVENTMAX") != NULL) g_dbg_max = atoi(getenv("QJS_AOT_BUNDLE_EVENTMAX"));
   g_nolost = getenv("QJS_AOT_BUNDLE_DIAG_NOLOST") != NULL || g_diag_noelem;
+  g_readdbg = getenv("QJS_AOT_BUNDLE_READDBG");
+  g_noimplicit = getenv("QJS_AOT_BUNDLE_NOIMPLICIT") != NULL;
   g_x_nodst2 = getenv("QJS_AOT_BUNDLE_X_NODST2") != NULL; g_x_noacc = getenv("QJS_AOT_BUNDLE_X_NOACC") != NULL; g_x_nocomp = getenv("QJS_AOT_BUNDLE_X_NOCOMP") != NULL; g_diag_noredef = getenv("QJS_AOT_BUNDLE_DIAG_NOREDEF") != NULL;
   if (g_nocells) { for (i = 0; i < g_bnfuncs; i++) { free(g_bfn[i].cap_loc); free(g_bfn[i].cap_arg); g_bfn[i].cap_loc = g_bfn[i].cap_arg = NULL; g_bfn[i].ncreat = 0; } return; }
   for (i = 0; i < g_bnfuncs; i++) {
@@ -2444,7 +2580,7 @@ static int assigned_add(int afn, int apc, int ctx) {
 }
 
 static void run_free(BRun *r) {
-  free(r->nd); free(r->st); free(r->fl); free(r->fhash); free(r->in); free(r->globals); free(r->ed); free(r->cs); free(r->acc); free(r->ev); free(r->rcv); free(r->rt); free(r->cellk); free(r->celln);
+  free(r->nd); free(r->st); free(r->fl); free(r->fhash); free(r->in); free(r->ihash); free(r->globals); free(r->ed); free(r->cs); free(r->acc); free(r->ev); free(r->rcv); free(r->rt); free(r->cellk); free(r->celln);
   memset(r, 0, sizeof(*r));
 }
 
@@ -2453,7 +2589,7 @@ static void reset_effects(void) {
   for (i = 0; i < g_bnfuncs; i++) {
     BFn *F = &g_bfn[i];
     memset(F->wn, 0, sizeof(F->wn));
-    F->welem = F->wglobal = F->alloc = F->unkcall = F->thrw = F->wvarref = 0;
+    F->welem = F->wglobal = F->alloc = F->unkcall = F->thrw = F->wvarref = F->wdyn = 0;
   }
 }
 
@@ -2612,7 +2748,7 @@ static void compute_effects(const BRun *P) {
     BFn *F = &g_bfn[i];
     memcpy(F->twn, F->wn, sizeof(F->wn));
     F->twelem = F->welem; F->twglobal = F->wglobal; F->talloc = F->alloc; F->tunkcall = F->unkcall;
-    F->tthrw = F->thrw; F->twvarref = F->wvarref;
+    F->tthrw = F->thrw; F->twvarref = F->wvarref; F->twdyn = F->wdyn;
   }
   while (changed && guard++ < 64) {
     changed = 0;
@@ -2626,6 +2762,7 @@ static void compute_effects(const BRun *P) {
       if (T->tunkcall && !C->tunkcall) { C->tunkcall = 1; changed = 1; }
       if (T->tthrw && !C->tthrw) { C->tthrw = 1; changed = 1; }
       if (T->twvarref && !C->twvarref) { C->twvarref = 1; changed = 1; }
+      if (T->twdyn && !C->twdyn) { C->twdyn = 1; changed = 1; }
     }
   }
 }
@@ -3491,9 +3628,57 @@ int qjs_aot_bundle_class_targets(const JSAotGenFunc *g, int pc, int site, const 
 }
 
 /* How many times the bundle writes the global `name` (a function or class declaration counts as one); -1 if it is not a global the bundle knows. */
+static int qjs_aot_bundle_global_writes_scan(const char *name);
+/* Store counts per global name, filled by one pass over the program on the
+   first query: the generator asks about many names, each a full scan. */
+typedef struct { char *name; int n; } GwSlot;
+static GwSlot *g_gw;
+static size_t g_gw_cap;
+static size_t gw_hash(const char *s) {
+  uint64_t h = 1469598103934665603ull;
+  for (; *s; s++) h = (h ^ (uint8_t)*s) * 1099511628211ull;
+  return (size_t)h;
+}
+static GwSlot *gw_slot(const char *name, int add) {
+  size_t m = g_gw_cap - 1, i;
+  for (i = gw_hash(name) & m; g_gw[i].name; i = (i + 1) & m)
+    if (strcmp(g_gw[i].name, name) == 0) return &g_gw[i];
+  if (!add) return NULL;
+  g_gw[i].name = strdup(name);
+  g_gw[i].n = 0;
+  return g_gw[i].name ? &g_gw[i] : NULL;
+}
+static int gw_build(void) {
+  int i, k;
+  size_t total = 0;
+  for (i = 0; i < g_bnfuncs; i++)
+    if (g_bfn[i].ok) total += (size_t)g_bfn[i].q.ninsns;
+  for (g_gw_cap = 64; g_gw_cap < 2 * total + 2; g_gw_cap *= 2) {}
+  g_gw = calloc(g_gw_cap, sizeof(*g_gw));
+  if (!g_gw) return -1;
+  for (i = 0; i < g_bnfuncs; i++) {
+    if (!g_bfn[i].ok) continue;
+    for (k = 0; k < g_bfn[i].q.ninsns; k++) {
+      const Q2Insn *in = &g_bfn[i].q.insns[k];
+      char nm[64];
+      GwSlot *sl;
+      if ((in->rop == ROP_define_global_func || in->rop == ROP_put_global || in->rop == ROP_define_class || in->rop == ROP_define_class_computed) &&
+          bn_atom(in, NULL, nm, sizeof(nm), 0)) {
+        sl = gw_slot(nm, 1);
+        if (!sl) return -1;
+        sl->n++;
+      }
+    }
+  }
+  return 0;
+}
 int qjs_aot_bundle_global_writes(const char *name) {
-  int i, k, n = 0;
   if (bundle_prepare() != 0 || name == NULL) return -1;
+  if (g_gw == NULL && gw_build() != 0) return qjs_aot_bundle_global_writes_scan(name);
+  { GwSlot *sl = gw_slot(name, 0); return sl ? sl->n : 0; }
+}
+static int qjs_aot_bundle_global_writes_scan(const char *name) {
+  int i, k, n = 0;
   /* the stores of a value to the binding: a `var` declaration alone (define_global) gives none, its initialiser is a put_global */
   for (i = 0; i < g_bnfuncs; i++) {
     if (!g_bfn[i].ok) continue;
@@ -3537,6 +3722,55 @@ int qjs_aot_bundle_global_objonly(const char *name) {
   if (nid < 0 || P.globals == NULL || P.globals[nid] < 0) return 0;
   g = P.globals[nid];
   return P.nd[g].cls == K_OBJ && bs_count(&P.nd[g].pts) > 0 && !bs_has(&P.nd[g].pts, 0);
+}
+/* The function the bundle's one store to the global `name` stores: the hex of its digest. 0 when the global may hold anything else (zero or several
+   stores, a non-function, an unknown value). */
+int qjs_aot_bundle_global_func(const char *name, char hex[33]) {
+  int nid, g, t, fnx = -1, i;
+  if (bundle_prepare() != 0 || name == NULL) return 0;
+  nid = bn_lookup(name);
+  if (nid < 0 || P.globals == NULL || P.globals[nid] < 0) return 0;
+  g = P.globals[nid];
+  if (getenv("QJS_AOT_KDEBUG")) { int q_; fprintf(stderr, "kpts %s: n=%d unknown=%d:", name, bs_count(&P.nd[g].pts), bs_has(&P.nd[g].pts, 0)); BS_FOR(q_, &P.nd[g].pts) fprintf(stderr, " %d(kind %d)", q_, P.st[q_].kind); fprintf(stderr, "\n"); }
+  if (bs_count(&P.nd[g].pts) != 1 || bs_has(&P.nd[g].pts, 0)) return 0;
+  BS_FOR(t, &P.nd[g].pts) if (P.st[t].kind == SK_FUNC && P.st[t].fn >= 0 && P.st[t].fn < g_bnfuncs && g_bfn[P.st[t].fn].g) fnx = P.st[t].fn;
+  if (fnx < 0) return 0;
+  for (i = 0; i < 16; i++) snprintf(hex + 2 * i, 3, "%02x", g_bfn[fnx].g->digest[i]);
+  return 1;
+}
+
+/* Whether nothing the function can run (itself, and transitively every function it may call) stores through a computed key into an object the
+   analysis can not place, or calls code it can not see: such a store could be the one that rebinds a global the function holds as a constant. */
+int qjs_aot_bundle_fn_kok(const JSAotGenFunc *g) {
+  int i;
+  if (bundle_prepare() != 0 || g == NULL) return 0;
+  for (i = 0; i < g_bnfuncs; i++)
+    if (g_bfn[i].g == g) {
+      if (getenv("QJS_AOT_KDEBUG")) fprintf(stderr, "kfn %s:%d ok=%d twdyn=%d tunkcall=%d\n", g->file, g->line, g_bfn[i].ok, g_bfn[i].twdyn, g_bfn[i].tunkcall);
+      return g_bfn[i].ok && !g_bfn[i].twdyn && !g_bfn[i].tunkcall;
+    }
+  return 0;
+}
+
+/* Whether no store to the global `name` can be hidden from the bundle's own store count: no eval, with, or computed-key store anywhere; no static-key store
+   of that name on any object (`this.N = ...`, `o.N = ...`); and the global object is never named (globalThis, window, self, global) and no
+   Function/Reflect is read. A store of the same name is a binding the analysis can not tell from the global. */
+int qjs_aot_bundle_global_closed(const char *name) {
+  int i, k;
+  if (bundle_prepare() != 0 || name == NULL) return 0;
+  if (P.eval_ops || P.with_ops) return 0;
+  for (i = 0; i < g_bnfuncs; i++) {
+    if (!g_bfn[i].ok) continue;
+    for (k = 0; k < g_bfn[i].q.ninsns; k++) {
+      const Q2Insn *in = &g_bfn[i].q.insns[k];
+      char nm[64];
+      int j;
+      if (in->rop == ROP_put_field || in->rop == ROP_put_field_xfer || in->rop == ROP_define_field || in->rop == ROP_define_method) {
+        if (bn_atom(in, NULL, nm, sizeof(nm), 0) && strcmp(nm, name) == 0) { if (getenv("QJS_AOT_KDEBUG")) fprintf(stderr, "kclosed: field %s stored in %s\n", nm, fn_name(i)); return 0; }
+      }
+    }
+  }
+  return 1;
 }
 int qjs_aot_bundle_global_writes_exec(const char *name, unsigned long long *exec) {
   int i, k, n = 0;

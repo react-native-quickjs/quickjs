@@ -1344,7 +1344,7 @@ static int q2_fallback_writes(const Q2Insn *in, int m) {
 /* The roles of a decoded instruction: its canonical form, its definitions, uses and window. */
 static void q2_decode_roles(const JSAotGenFunc *g, Q2Insn *in) {
   const Q2RopInfo *ri;
-  int n;
+  int n, argc_special;
   q2_canon_cmp_branch(in);
   ri = q2_rop_info(in->rop);
   in->op = (int8_t)ri->op;
@@ -1363,7 +1363,16 @@ static void q2_decode_roles(const JSAotGenFunc *g, Q2Insn *in) {
       in->use[in->nuse++] = (Q2ValueId)q2_ri((int)in->arg[idx].val);
   }
   if (in->ndef == 0 && ri->ndef != 0) in->op = Q2_OP_FALLBACK;
-  if (in->op == Q2_OP_FALLBACK && ri->ndef == 0 && ri->nuse == 0) {
+  /* special_object ARG_COUNT ("rb": destination, kind 8) is `arguments.length` of an elided arguments object: it reads only the
+     call's argument count, so its destination is a definition like any other and nothing else is read or redefined. */
+  argc_special = in->rop == ROP_special_object && in->narg >= 2 && in->arg[0].kind == 'r' && in->arg[1].val == 8;
+  if (argc_special) {
+    in->op = Q2_OP_FALLBACK;
+    in->ndef = 1;
+    in->def[0] = (Q2ValueId)q2_ri((int)in->arg[0].val);
+    in->nuse = 0;
+  }
+  if (in->op == Q2_OP_FALLBACK && ri->ndef == 0 && ri->nuse == 0 && !argc_special) {
     /* Unknown roles: the step engine reads every register operand of the
        instruction, so every one of them is a use, and which is the
        destination is unknown, so the instruction redefines the whole live

@@ -1,0 +1,117 @@
+Subject: The young collection drains the zero list and protects live members; collections stay small and full ones rarer when unproductive
+
+What this does
+  - quickjs.c gc_young (fixes 0515): releasing a garbage object's references runs with gc_phase DECREF, where an object outside the set that reaches zero is put on gc_zero_ref_count_list for the caller to drain. 0515 never drained it, so those objects and everything they held leaked: typescript aborted at JS_FreeRuntime (`list_empty(&rt->gc_obj_list)`). The pass now calls free_zero_refcount after the cells are freed. Live members hold one extra count while the garbage is released, so an object outside the set that owned one of them cannot free it under the pass; the count is given back afterwards and a member left at zero is parked (js_drc_zero).
+  - quickjs.c js_gc_rearm_pace: the next collection is due after at most 8 MB of growth, doubled for each consecutive collection that freed little (gc_cyc_empty_streak). The set a young collection sweeps stays cache resident instead of being half the heap.
+  - quickjs.c js_gc_full_due: a full collection is due when the heap passed what the last one left by half, plus one more half for each consecutive unproductive collection (up to four).
+
+Why we need it
+  typescript (interpreter build, QJS_GC_STATS) aborted at teardown with 0515; deltablue and the corpus did not show it because their garbage is not released through objects outside the set. With a 50%-of-heap step a young set reached 737K objects at about 840 cycles per object; with the 8 MB cap the largest is 281K.
+
+Soundness
+  The zero-list drain and the extra count are the protocol free_zero_refcount users already follow. The pacing changes are policy.
+
+Failure modes
+  A program that builds a large live structure still pays one young pass over each 8 MB it allocates until the unproductive streak raises the step.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -3300,8 +3300,23 @@
+ static int gc_stat_on = -1;
+ #define GC_MIN_STEP ((size_t)4 << 20)
+ 
++/* The next collection is due after at most this much growth (doubled for each consecutive collection that freed little): the set a young collection sweeps
++   then stays small enough to be cache resident, which costs a fraction per object of a set that is a large share of the heap; a full collection is scheduled
++   separately, by the heap's growth over what the last full one left. */
++#define GC_YOUNG_STEP ((size_t)8 << 20)
++static void js_gc_rearm_pace0(JSRuntime *rt, size_t before, size_t after);
+ static void js_gc_rearm_pace(JSRuntime *rt, size_t before, size_t after)
+ {
++    js_gc_rearm_pace0(rt, before, after);
++    {
++        size_t cap = GC_YOUNG_STEP << rt->gc_cyc_empty_streak;
++
++        if (rt->malloc_gc_threshold > after + cap)
++            rt->malloc_gc_threshold = after + cap;
++    }
++}
++static void js_gc_rearm_pace0(JSRuntime *rt, size_t before, size_t after)
++{
+     size_t step = after >> 1, maxstep;
+     if (step < GC_MIN_STEP)
+         step = GC_MIN_STEP;
+@@ -13148,7 +13163,18 @@
+     while (sp)
+         gc_young_edges(rt, gc_y_stk[--sp], 1, &sp);
+     GC_PH(4);
+-    /* 4: free the garbage: release what it holds outside S, then the cells */
++    /* 4: free the garbage: release what it holds outside S, then the cells. Releasing can free an object outside S that was the only owner of a live member:
++       the live members hold one extra count meanwhile, given back (parking the member if it was the last) after the release. */
++    sp = 0;
++    if (gc_young_n > gc_y_stk_cap) {
++        gc_y_stk_cap = gc_young_n;
++        gc_y_stk = __builtin_realloc(gc_y_stk, gc_y_stk_cap * sizeof(JSObject *));
++        if (!gc_y_stk)
++            abort();
++    }
++    for (i = 0; i < gc_young_n; i++)
++        if (gc_y_set[i]->gc_live)
++            JS_REF_COUNT(gc_y_set[i])++;
+     rt->gc_phase = JS_GC_PHASE_DECREF;
+     for (i = 0; i < gc_young_n; i++) {
+         JSObject *o = gc_y_set[i];
+@@ -13179,11 +13205,20 @@
+         if (o->gc_live) {
+             o->gc_young = 0;
+             o->gc_live = 0;
++            gc_y_stk[sp++] = o;
+         } else {
+             remove_gc_object(&o->header);
+             js_free_rt(rt, o);
+         }
+     }
++    /* objects outside S that the release took to zero wait on the zero list */
++    if (!list_empty(&rt->gc_zero_ref_count_list))
++        free_zero_refcount(rt);
++    for (i = 0; i < sp; i++) {
++        if (--JS_REF_COUNT(gc_y_stk[i]) <= 0)
++            js_drc_zero(rt, JS_MKPTR(JS_TAG_OBJECT, gc_y_stk[i]));
++    }
++
+     GC_PH(6);
+     rt->gc_phase = JS_GC_PHASE_NONE;
+ }
+@@ -13367,6 +13402,15 @@
+ /* The collection an allocation threshold or a pending request asks for: a young one while the heap has not grown past what the last full one left,
+    a full one at least every 8 collections and whenever a young one leaves the heap more than half larger than the last full one did (older
+    garbage cycles are then the likely cause). QJS_NOYOUNGGC=1 always runs the full one. */
++/* A full collection is due when the heap has grown past what the last one left by half, and by one more half for each consecutive collection that freed
++   little (a program that builds a large live structure gains nothing from sweeping it again). */
++static bool js_gc_full_due(JSRuntime *rt)
++{
++    unsigned k = rt->gc_cyc_empty_streak > 4 ? 4 : rt->gc_cyc_empty_streak;
++
++    return rt->malloc_state.malloc_size > rt->gc_full_after + (rt->gc_full_after >> 1) * (1 + k);
++}
++
+ static bool js_gc_pick_young(JSRuntime *rt)
+ {
+     if (js_gc_young_on < 0)
+@@ -13384,7 +13428,7 @@
+     if (young)
+         rt->gc_young_streak++;
+     js_gc_passes(rt, young, unlikely(gc_stat_on) ? __builtin_ia32_rdtsc() : 0, sz0);
+-    if (young && rt->malloc_state.malloc_size > rt->gc_full_after + (rt->gc_full_after >> 1))
++    if (young && js_gc_full_due(rt))
+         rt->gc_need_full = true;
+     js_gc_rearm_pace(rt, sz0, rt->malloc_state.malloc_size);
+ }
+@@ -13400,7 +13444,7 @@
+     }
+     rt->gc_young_streak++;
+     js_run_gc(rt, true);
+-    if (rt->malloc_state.malloc_size > rt->gc_full_after + (rt->gc_full_after >> 1))
++    if (js_gc_full_due(rt))
+         rt->gc_need_full = true;
+ }
+ 

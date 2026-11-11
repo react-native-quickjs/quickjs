@@ -1943,13 +1943,177 @@
       "sha256": "d645ce9f67302799c6a6b7165400c8273c7bc394bfa15d52f082bd6826b7fb8b"
     },
     {
+      "name": "0493-aot-gen-short-string-constants.patch",
+      "sha256": "190fb1f98015dd42b97b818ba60c9a1485f7d9e08bc11738462ceb63fe6c11b0"
+    },
+    {
+      "name": "0494-regvm-promote-locals-of-parameterless-arguments-users.patch",
+      "sha256": "72cfee1c50927ede9539285f344077d210b8653d80dd9e062c0c85def58fa943"
+    },
+    {
+      "name": "0495-drc-reconcile-limit-256.patch",
+      "sha256": "f8ddfe425241a8d8ceda8b497c5ce856bc75b13f77ea87db4960e4bc751a7702"
+    },
+    {
+      "name": "0496-drc-born-dead-nursery.patch",
+      "sha256": "1a3f761cdd51eee1fdee9e4e1783dbe7f64bc49350e2f56d3123170c602bacce"
+    },
+    {
+      "name": "0497-drc-native-stack-roots.patch",
+      "sha256": "ce8e6bafaebee6e912e8c7b015eecadc41c3485d0231086f362a33715b114e43"
+    },
+    {
+      "name": "0498-weak-refs-in-runtime-table.patch",
+      "sha256": "dfa32b4bfa4f5404ca444985c42075d47869a99894e616affe4d809c02304ee5"
+    },
+    {
+      "name": "0499-final-collection-scans-no-native-stack.patch",
+      "sha256": "63d75df7ef6537e4ed965311a6733195d7861816f5b4d52f6dc07a0d0cd3f33b"
+    },
+    {
+      "name": "0500-stack-scan-sorted-word-table.patch",
+      "sha256": "5da18083ed3be05000dbd4f08026602823ea4ab04ba315463d2832aa70dfc463"
+    },
+    {
+      "name": "0501-add-transition-store-promotes-young-receiver.patch",
+      "sha256": "a690bdcb328a7dc9b371782fd431f5669166d3fb0bcb14ef9ab16df0b3b5471a"
+    },
+    {
+      "name": "0502-rat-frames-by-digest-field-direct-hook-opt-in.patch",
+      "sha256": "0b3579a837aa8341d8aa478172525c4aaf435e889a0af4a463b07c7b3fcfdb5f"
+    },
+    {
+      "name": "0503-nursery-gate-on-with-a-linked-unit.patch",
+      "sha256": "096fbee00564b781ab14ada0d1548845123ad931c6f7253bc77942e193a7b1c9"
+    },
+    {
+      "name": "0504-reconcile-timing-only-with-stats.patch",
+      "sha256": "fc1caa4312e40de05b9e2076a48e68d1d99cafec2a377996dcdc349e6f95e75b"
+    },
+    {
+      "name": "0505-regvm-argument-staging-index-in-the-baseline-tier.patch",
+      "sha256": "c5cfbdb75f50ded1ab82b0f0e24be5106324241f6d6ed2d05284c192313f30fa"
+    },
+    {
+      "name": "0506-interpreter-activation-counters-per-unit-function.patch",
+      "sha256": "1a7f66ba8cd787d0deac588dfefc38acc66f89b53f72afca20fd40c324081522"
+    },
+    {
+      "name": "0507-activation-counter-table-length.patch",
+      "sha256": "d80de71e2ba525178e44483662506bb9bd9f7c669d37eaa9b83e784714ded1d7"
+    },
+    {
+      "name": "0508-activation-counters-by-cause-and-unbind-report.patch",
+      "sha256": "0b6cd97f2761c5eb9fec94de7964665660b0d43636ca994dfb2433f0b4eb0eaa"
+    },
+    {
+      "name": "0510-prefetch-in-the-free-walk.patch",
+      "sha256": "f9ab6b61fe604ca1ce375c9cc73b9c81c4297b69995708b3ec5291e1e0c3e41d"
+    },
+    {
+      "name": "0511-young-cycle-collection.patch",
+      "sha256": "d0ecc687a9836c796bfb1fa862e5abcb9a6386f74886855a023a0f96d44bc7dc"
+    },
+    {
+      "name": "0512-gc-statistics.patch",
+      "sha256": "4334342c5f24968c86b7e306e968b57ede5217179ebb8d243be18137b8ffd0de"
+    },
+    {
+      "name": "0513-collect-cycles-at-the-safepoint.patch",
+      "sha256": "c2933d4eb09241b8119a1da7ba1ec304d886f55a379de9a83541ee722446c7f0"
+    },
+    {
+      "name": "0514-gc-threshold-follows-collections.patch",
+      "sha256": "0bbc7d8e6f5b3cb4611acb97712d1eb435b9c79a0aa5abe987c81ab18a4ad50f"
+    },
+    {
+      "name": "0515-young-collection-single-pass-free.patch",
+      "sha256": "e98945fdc6f97edc74effe52cd46ad355f331c6e3757209f014e4da5bb893128"
+    },
+    {
+      "name": "0516-fused-constructor-checks-prototype-chain.patch",
+      "sha256": "66bb69620f29d7e294df0e5dbd5876848978004c6774e2f961f669a9b975602d"
+    },
+    {
+      "name": "0517-young-collection-drains-the-zero-list.patch",
+      "sha256": "c49fc284e805119fb0043ec8895741be9fa5acaaaf12162b33fc6b709088d809"
+    },
+    {
+      "name": "0518-collections-admitted-by-yield.patch",
+      "sha256": "eb6e9f07c75e994612586001420aeeb13446c7505e2a468ad931758caab2e922"
+    },
+    {
+      "name": "0530-regexp-census-instrumentation.patch",
+      "sha256": "9a16ae96112b2fa3ae86123c94c76f8af671de8efc0046db9f898c35437d79ba"
+    },
+    {
+      "name": "0531-regexp-pristine-fast-paths.patch",
+      "sha256": "4a64772d5b1f2967e8a1cc4e4683928737a6d26a7d46ffeb63c97c0af8040596"
+    },
+    {
+      "name": "0532-regexp-required-literal-and-anchored-entry.patch",
+      "sha256": "edb9a877fd07d66623c8e933fd6ae557f360df08ba5cdd784a111db2717ab122"
+    },
+    {
+      "name": "0533-regexp-case-insensitive-literal-anchored-prefix-first-set.patch",
+      "sha256": "82b66b2a95b68964fb8d27cca68e02e37f3f869590baf77faf552e1979e96d16"
+    },
+    {
+      "name": "0534-regexp-bounded-literal-starts-and-inline-result-elements.patch",
+      "sha256": "24cbcd192dac289d633e2dc65612dccbdd94ffa8a369679ce252f74c571f7a42"
+    },
+    {
+      "name": "0535-regexp-capture-buffer-size-test-and-literal-compare.patch",
+      "sha256": "e2bd43c0f3fd7051d0c9c4e12d76fbd8c0d87b84dcbd864a57d237026396bf8f"
+    },
+    {
+      "name": "0536-regexp-single-character-loop-runs-and-ascii-case-fold.patch",
+      "sha256": "ed4f37cd8fa6a3f7b7946c81fe4191dd958a2483977842b1f2e6de0e5f3b9016"
+    },
+    {
+      "name": "0537-aot-layout-build-skips-the-heap-scan-when-the-shape-has-no-other-holder.patch",
+      "sha256": "1b13677333e16f52678af8f5de79d6fd579c47a24ab30b0366ee7f762c1eac0b"
+    },
+    {
+      "name": "0538-aot-string-append-outcome-counters.patch",
+      "sha256": "3acb691baad8b4e70adf2a161de1655417e6808badd43dbacc5eeec592f6fb29"
+    },
+    {
+      "name": "0539-free-stack-skips-unpromoted-young-cells.patch",
+      "sha256": "d0c62aa44af497b8d809c42b67581a497dc29f214d1c54d465df4b5b245c1c85"
+    },
+    {
+      "name": "0540-report-unpromoted-nursery-children-of-freed-objects.patch",
+      "sha256": "8aecb544e1f1ac27814804d9d551f60ada949b388f8cdaeb46e04040a33f5701"
+    },
+    {
+      "name": "0541-regexp-fast-path-validates-the-prototype-by-content-not-by-a-held-shape.patch",
+      "sha256": "6695894405e8980549972e3a7d4be648a329c27067b62ec1e834461cec041ea2"
+    },
+    {
+      "name": "0560-packed-arrays-build-compiles.patch",
+      "sha256": "8e08192f5ec453e83609c9c5ff691c12bf74bde4a46d575a8a644bbc3c753d6d"
+    },
+    {
+      "name": "0561-bind-twin-bytecodes.patch",
+      "sha256": "33545ffff1d6a0ecf0d111aed090859874c37fa854cb311b57174d99119ca0ed"
+    },
+    {
+      "name": "0562-profile-a-records.patch",
+      "sha256": "ed8394e862c62d349243551d15263fdeeb3dfa2d8d102ab3dbe7681a11cd4dcd"
+    },
+    {
+      "name": "0563-interpreter-nursery-plain-objects-and-small-arrays.patch",
+      "sha256": "00a7026c79d6ded457999eaa327be6c3e54c37d4ba97f441fb2bceea4a82bae0"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "3ca1bcc9757ee7e1b706050510a04c9b2817fb1b05ec96afacfe547e37247f95",
-    "libregexp.c": "98d43216a43bd02950168529fd8962558c9dda612eed7ce93d3cba40e1223232",
+    "quickjs.c": "a122f4bf0a88b5f0e7a937b91a101dbdc469274a8e8319c645bddae72d0db7f9",
+    "libregexp.c": "cb6a62b9e453cd5f13924aeb9ef874d923f80fed7909b5cbd29ad721c31790e3",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
     "builtin-array-fromasync.h": "f88d0ca977755819a17b6c611a64309ca230dd0cb2d5ce7c1f0ee2dfc689d27a",
@@ -1961,8 +2125,8 @@
     "cutils.h": "810709e35fe0ece09321ad4c207dba9973aa19f91fa909e00754896b39cc3201",
     "dtoa.h": "1c4a4540c0038632c8a4c225472fbc21bd476fb35c4da4a857a11965b58231b9",
     "libregexp-opcode.h": "2a98d646089f3a72f25480116297c5fdb5b28fd9f815447273951f4ade4a115e",
-    "libregexp-backtrack.c.inc": "c0048b115cb43a46f9e3688b962fd2c95188acc528d65cfd7191f73c787c861a",
-    "libregexp.h": "2e6fca80aace54a614b5a3f65912f2d6b03dd0d87a7ed3f25f064d997e6eb557",
+    "libregexp-backtrack.c.inc": "7ebca3788b6431265ca6a0da7a6cbe64cfc0d864b8c45109f4a179cff386c63e",
+    "libregexp.h": "932cd9cfc23e5b9580e8ad8c5569a69422707160cb2869cbced3fb4f51ad3026",
     "libunicode-table.h": "5840a921ac11664b505ee37b1219f518fff2a04972fe848b4bdf1e85c5a0bd83",
     "libunicode.h": "ad13f66aaea3fab1616e84b9c048f2a315e1bdbab628b966617a7a3e55bcba2b",
     "list.h": "cb6e24e8ee54bccdd66234fe54cd702d1160b9841db2b9b9adeb5003afe301d5",

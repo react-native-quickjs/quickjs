@@ -1,0 +1,751 @@
+Subject: Interpreter nursery: plain objects and small arrays are born young
+
+What this does
+  - The interpreter's construct handlers, object-literal templates, add-transition stores, own-slot stores and array literals (1..8 elements) allocate from the nursery chunks (negative count, no shape reference, edges uncounted). A young cell is promoted when anything can observe its count: a counted store into an old object, a shape update, a property add that needs the generic path, an element access through JS_ARR_VALS, a constant-folded literal kept in a constant pool, or a collection that finds it reachable.
+  - JS_ARR_VALS promotes a young array; JS_ARR_VALS_RD is the raw read used by the interpreter's own element loads and by the collector. y_promote_cell and the young collection count and traverse array elements.
+  - js_shape_prepare_update and convert_fast_array_to_array promote a young receiver; a cell promoted with count zero is parked like any object whose count reached zero.
+  - The stack scan runs in a young-words-only mode when only the interpreter nursery is on. QJS_NONURSERY=1 turns the interpreter nursery off; it is on whether or not a unit is linked (every generated unit carries the young-cell forms).
+  - The stack-scan vector is likewise owner-only: runtimes that do not own the nursery neither reset nor unpin it.
+
+Why we need it
+  Most interpreter-made objects and small arrays die within a few thousand allocations (earleyboyer 72%, deltablue 79%, pdfjs arrays 99%). A born-young cell costs no refcount traffic and no free; the plain interpreter gains 11% on earleyboyer, 5% on richards, 2.3x on an array-literal loop, with splay -3% and pdfjs -2%.
+
+Soundness
+  A young cell is reachable only from registers, other young cells and counted roots; the collector marks from the recorded roots and the pinned stack words, promotes what is reachable and drops the rest. The differential corpus and QJS_Y_STRICT=1 on all thirteen rows are clean.
+
+Failure modes
+  A unit generated before this change has no young-cell forms and must be regenerated.
+  Region code (typed loops) stores through a nursery receiver only after qjs_y_promote_v turned it into an ordinary object.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2739,10 +2739,22 @@
+     return (JSValue **)&p->u.array.u.values_raw;
+ }
+ #define JS_ARR_VALS(p) (*js_arr_valsp(p))
++#define JS_ARR_VALS_RD(p) (*js_arr_valsp(p))
+ #define JS_ARR_RAW(p) ((p)->u.array.u.values_raw)
+ #define JS_ARR_RAW_MEMBER u.array.u.values_raw
+ #else
+-#define JS_ARR_VALS(p) ((p)->u.array.u.values)
++/* The element pointer for code that may write or keep it. A nursery array holds its elements uncounted, so any access that is not one of the
++   interpreter's own young-aware paths first promotes it (counts the elements, joins the object list); JS_ARR_VALS_RD is for the paths that
++   only read and need no promotion. */
++static void y_promote_now(JSObject *p);
++static inline JSValue **js_arr_valsp_y(JSObject *p)
++{
++    if (unlikely((int)JS_REF_COUNT(p) < 0))
++        y_promote_now(p);
++    return &p->u.array.u.values;
++}
++#define JS_ARR_VALS(p) (*js_arr_valsp_y(p))
++#define JS_ARR_VALS_RD(p) ((p)->u.array.u.values)
+ #define JS_ARR_RAW(p) ((void *)(p)->u.array.u.values)
+ #define JS_ARR_RAW_MEMBER u.array.u.values
+ #endif
+@@ -4791,6 +4803,24 @@
+    reconcile; QJS_Y_GATE=0/1 in the environment fixes it either way. */
+ int qjs_y_force, qjs_y_gate = 0;
+ static int y_gate_fixed;
++/* Whether the engine's own allocation paths make nursery cells (QJS_NONURSERY=1 turns it off). */
++static int y_interp_on = 1;
++/* The nursery belongs to one runtime at a time (its chunks, free lists and roots are process-wide): the first runtime to refill claims it, every other runtime allocates old-form cells until the owner is freed. */
++static inline int y_mine(const JSContext *ctx) { JSRuntime *o = __atomic_load_n(&y_rt, __ATOMIC_ACQUIRE); return o == NULL || o == ctx->rt; }
++static unsigned long long js_plain_gcbyte_v;
++static inline unsigned long long JS_PLAIN_GCBYTE(void)
++{
++    if (unlikely(!js_plain_gcbyte_v)) {
++        JSMallocBlockHeader h;
++        const uint8_t *q = (const uint8_t *)&h;
++        size_t i;
++        memset(&h, 0, sizeof(h));
++        h.gc_obj_type = JS_GC_OBJ_TYPE_JS_OBJECT;
++        for (i = 0; i < offsetof(JSMallocBlockHeader, user_data); i++)
++            if (q[i] != 0) { js_plain_gcbyte_v = q[i]; break; }
++    }
++    return js_plain_gcbyte_v;
++}
+ static uint64_t y_cyc[8], y_cnt[16], y_pinr, y_pinv;
+ uint64_t qjs_y_ep48 = (uint64_t)1 << 48; static uint32_t y_epoch = 1;
+ static uint64_t ss_stat[8];
+@@ -4815,13 +4845,14 @@
+ #define Y_PAUSE_REQS (1u << 20)
+ static uint64_t y_win_a, y_win_p;
+ static uint32_t y_pause;
++static int y_gate_prev;
+ int qjs_y_refill(JSContext *ctx, unsigned idx, unsigned bsi, unsigned long long gcw)
+ {
+     YChunk *c;
+     JSRuntime *rt = ctx->rt;
+     YCls *k = &qjs_ycls[idx];
+     if (y_pause) {
+-        if (--y_pause == 0 && !y_gate_fixed) qjs_y_gate = 1;
++        if (--y_pause == 0 && !y_gate_fixed) qjs_y_gate = y_gate_prev;
+         return 0;
+     }
+     if (y_cnt[1] + y_abytes - y_win_a >= Y_WIN_CELLS) {
+@@ -4829,11 +4860,16 @@
+         y_win_a = y_cnt[1] + y_abytes; y_win_p = y_cnt[10] + y_cnt[2];
+         if (left * 100 >= made * 98) {
+             y_pause = Y_PAUSE_REQS;
++            y_gate_prev = qjs_y_gate;
+             if (!y_gate_fixed) qjs_y_gate = 0;
+             return 0;
+         }
+     }
+-    y_rt = rt;
++    if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) != rt) {
++        JSRuntime *exp = NULL;
++        if (!__atomic_compare_exchange_n(&y_rt, &exp, rt, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++            return 0;
++    }
+     if (!k->ready) {
+         k->stride = arena_block_sizes[bsi];
+         k->hdrw = (uint64_t)Y_CHUNK_IDX | ((uint64_t)bsi << 16) | (gcw << 24) | ((uint64_t)Y_RCB + 1ull) << 32; k->ready = 1;
+@@ -4945,6 +4981,8 @@
+ }
+ 
+ void qjs_y_mut(void) { y_cnt[9]++; }
++/* A compiled store that counts the receiver's edges first turns a nursery receiver into an ordinary object. */
++void qjs_y_promote_v(JSContext *ctx, JSValue v) { JSObject *p = JS_VALUE_GET_OBJ(v); (void)ctx; if ((int)JS_REF_COUNT(p) < 0) y_promote_now(p); }
+ static void y_chunk_release(YChunk *c) {
+     if (c->rec == 1) return;
+     c->ymode = 0; c->live = 0;
+@@ -4952,6 +4990,24 @@
+     y_pool[y_pool_n++] = c;
+     y_rt->malloc_state.malloc_count--; y_rt->malloc_state.malloc_size -= y_chunk_sz;
+ }
++/* The owner runtime is going away: every cell it still holds is garbage, its chunks go back to the pool and stop being counted against it, and the nursery is free for the next runtime. */
++static void y_runtime_free(JSRuntime *rt)
++{
++    uint32_t i, kb;
++    if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) != rt) return;
++    rt->malloc_state.malloc_count -= (y_region_next - y_pool_n);
++    rt->malloc_state.malloc_size -= (size_t)(y_region_next - y_pool_n) * y_chunk_sz;
++    y_pool_n = 0;
++    for (i = 0; i < y_region_next; i++) {
++        YChunk *c = (YChunk *)(Y_BASE + (uint64_t)i * y_chunk_sz);
++        c->live = 0; c->ymode = 0; c->rec = 0;
++        if (y_pool_n >= y_pool_cap) { y_pool_cap = y_pool_cap ? y_pool_cap * 2 : 64; y_pool = __builtin_realloc(y_pool, (size_t)y_pool_cap * sizeof(void *)); }
++        y_pool[y_pool_n++] = c;
++    }
++    for (kb = 0; kb < 16; kb++) { YCls *k = &qjs_ycls[kb]; k->cur = NULL; k->bump = (uint8_t *)1; k->end = NULL; k->rec_n = 0; }
++    y_nurs_n = 0; y_roots_n = 0; y_livecells = 0; y_budget = 0; y_abytes = 0; y_win_a = y_win_p = 0; y_pause = 0;
++    __atomic_store_n(&y_rt, NULL, __ATOMIC_RELEASE);
++}
+ static void y_chunk_free_cell(void *ptr) {
+     YChunk *c = Y_CHUNK_OF(ptr);
+     y_cnt[4]++;
+@@ -4969,6 +5025,16 @@
+             if ((int)++JS_REF_COUNT(JS_VALUE_GET_PTR(v)) < 0) y_dup_young(JS_VALUE_GET_PTR(v));
+         }
+     }
++    if (unlikely(p->class_id == JS_CLASS_ARRAY)) {
++        JSValue *e = p->u.array.u.values;
++        uint32_t n = p->u.array.count;
++        for (j = 0; j < (int)n; j++) {
++            JSValue v = e[j];
++            if (JS_VALUE_HAS_REF_COUNT(v)) {
++                if ((int)++JS_REF_COUNT(JS_VALUE_GET_PTR(v)) < 0) y_dup_young(JS_VALUE_GET_PTR(v));
++            }
++        }
++    }
+     JS_REF_COUNT(sh)++;
+     JS_REF_COUNT(p) = Y_RCN(JS_REF_COUNT(p));
+     js_rc(p)->mark = 0;
+@@ -4976,7 +5042,12 @@
+     Y_CHUNK_OF(p)->live++; y_livecells++;
+     Y_KIND(p) = 0x40;
+ }
+-static void y_promote_now(JSObject *p) { y_cnt[10]++; y_promote_cell(p); Y_CHUNK_OF(p)->ymode = 2; }
++/* A cell promoted while only a register names it has no counted reference: it is parked like any object whose count reached zero. */
++static void y_promote_now(JSObject *p)
++{
++    y_cnt[10]++; y_promote_cell(p); Y_CHUNK_OF(p)->ymode = 2;
++    if (JS_REF_COUNT(p) == 0) js_drc_zero(y_rt, JS_MKPTR(JS_TAG_OBJECT, p));
++}
+ static __attribute__((noinline, preserve_all)) void y_slot_touch_slow(JSValue *pval) {
+     int i;
+     for (i = 0; i < 4; i++) {
+@@ -5003,6 +5074,7 @@
+             qjs_y_gate = 1;
+     }
+ #endif
++    if (getenv("QJS_NONURSERY")) y_interp_on = 0;
+     if (getenv("QJS_Y_GATE")) { qjs_y_gate = atoi(getenv("QJS_Y_GATE")); y_gate_fixed = 1; }
+     if (getenv("QJS_DRC_MINLIM")) js_drc_minlim = (uint32_t)atoi(getenv("QJS_DRC_MINLIM"));
+     if (getenv("QJS_DRC_SLACK_MB")) js_drc_slack_min = (size_t)atoi(getenv("QJS_DRC_SLACK_MB")) << 20;
+@@ -5288,6 +5360,7 @@
+     }
+     assert(list_empty(&rt->gc_notrace_list));
+     assert(list_empty(&rt->gc_obj_list));
++    y_runtime_free(rt);
+ 
+     /* free the classes */
+     for(i = 0; i < rt->class_count; i++) {
+@@ -10322,7 +10395,7 @@
+     return p;
+ }
+ 
+-static inline __attribute__((always_inline)) JSValue js_new_plain_object(JSContext *ctx, JSShape *sh, uint32_t req_cap)
++static inline __attribute__((always_inline)) JSValue js_new_plain_object_ex(JSContext *ctx, JSShape *sh, uint32_t req_cap, int yok)
+ {
+     JSRuntime *rt = ctx->rt;
+     JSObject *p;
+@@ -10336,6 +10409,33 @@
+         cap = req_cap > JS_OBJ_LEARNED_INLINE_MAX ? JS_OBJ_LEARNED_INLINE_MAX : req_cap;
+     if (unlikely(cap == 0))
+         return JS_NewObjectFromShapeCapExtra(ctx, sh, JS_CLASS_OBJECT, NULL, req_cap, 0);
++    if (yok && likely(y_interp_on) && y_mine(ctx) && cap <= JS_OBJ_INLINE_PROPS) {
++        /* A nursery cell, as compiled code makes one: it owns no shape reference, counts none of its edges and is on no list until it is
++           promoted; a count of one (plus the young bias) is the creator's, and the collection that follows an allocation window finds it
++           dead when nothing noted or pinned it. */
++        YCls *yk_ = &qjs_ycls[cap];
++        if (unlikely((uintptr_t)yk_->bump + yk_->stride > (uintptr_t)yk_->end)) {
++            if (!qjs_y_refill(ctx, cap, js_plain_obj_bsi[cap], JS_PLAIN_GCBYTE()))
++                goto y_old;
++        }
++        {
++            uint8_t *c_ = yk_->bump;
++            p = (JSObject *)(c_ + 8);
++            yk_->bump = c_ + yk_->stride;
++            *(uint64_t *)c_ = yk_->hdrw;
++            memset((uint8_t *)p + offsetof(JSObject, class_id) - 2, 0, 8);
++            p->extensible = true;
++            p->prop_inline_cap = cap;
++            p->class_id = JS_CLASS_OBJECT;
++            p->arr_kind = 0x80;
++            *(uint16_t *)((uint8_t *)p + 22) = (uint16_t)(qjs_y_ep48 >> 48);
++            p->shape = sh;
++            JS_REF_COUNT(sh)--;
++            p->prop = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
++            return JS_MKPTR(JS_TAG_OBJECT, p);
++        }
++    }
++y_old:
+     /* The flat path: the collector trigger, the memory limit, the accounting and the arena pop in one place, with the slow work (a collection, the
+        limit, an arena refill, a large block) left to the general path below. The checks and the accounting are those of js_trigger_gc +
+        js_malloc_rt; they just run once, against the size class read from the table. */
+@@ -10403,6 +10503,12 @@
+     return JS_MKPTR(JS_TAG_OBJECT, p);
+ }
+ 
++/* The ordinary-object form: the caller fills the fields with counted stores, which a nursery cell does not take. */
++static inline __attribute__((always_inline)) JSValue js_new_plain_object(JSContext *ctx, JSShape *sh, uint32_t req_cap)
++{
++    return js_new_plain_object_ex(ctx, sh, req_cap, 0);
++}
++
+ static JSValue JS_NewObjectFromShapeCap(JSContext *ctx, JSShape *sh, JSClassID class_id,
+                                         JSProperty *props, uint32_t req_cap)
+ {
+@@ -10488,12 +10594,12 @@
+             JSProperty *pr;
+             p->is_exotic = 1;
+             p->fast_array = 1;
+-            JS_ARR_VALS(p) = NULL;
++            JS_ARR_VALS_RD(p) = NULL;
+             p->u.array.count = 0;
+             p->u.array.hole_count = 0;
+             p->u.array.u1.size = 0;
+             if (extra_values != 0) {
+-                JS_ARR_VALS(p) = (JSValue *)((JSProperty *)(p + 1) +
++                JS_ARR_VALS_RD(p) = (JSValue *)((JSProperty *)(p + 1) +
+                                                   p->prop_inline_cap);
+                 p->u.array.u1.size = extra_values;
+                 p->values_inline = 1;
+@@ -10575,7 +10681,7 @@
+     return JS_NewObjectFromShapeCap(ctx, sh, class_id, props, 0);
+ }
+ 
+-static JSValue js_new_object_from_template(JSContext *ctx, JSObjLitTemplate *tpl)
++static JSValue js_new_object_from_template_y(JSContext *ctx, JSObjLitTemplate *tpl, int yok)
+ {
+     JSObject *proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT]);
+     JSValue obj;
+@@ -10586,7 +10692,7 @@
+         if (unlikely(tpl->shape->proto != proto))
+             return JS_NewObject(ctx);
+         js_dbg_tpl_calls++;
+-        obj = js_new_plain_object(ctx, js_dup_shape(tpl->shape), 0);
++        obj = js_new_plain_object_ex(ctx, js_dup_shape(tpl->shape), 0, yok);
+         if (unlikely(JS_IsException(obj)))
+             return obj;
+         p = JS_VALUE_GET_OBJ(obj);
+@@ -10614,6 +10720,11 @@
+     return obj;
+ }
+ 
++static JSValue js_new_object_from_template(JSContext *ctx, JSObjLitTemplate *tpl)
++{
++    return js_new_object_from_template_y(ctx, tpl, 1);
++}
++
+ static JSAtom js_objlit_template_atom(JSObjLitTemplate *tpl, int index)
+ {
+     if (tpl->atoms)
+@@ -10790,6 +10901,58 @@
+     return JS_EXCEPTION;
+ }
+ 
++#if QJS_REGVM && !QJS_PACKED_ARRAYS
++#define JS_YARR_MAX 8
++static uint8_t js_young_arr_bsi[JS_YARR_MAX + 1];
++/* A nursery array of `count` elements (1..JS_YARR_MAX): the object, its length property and its elements in one cell, the elements and the
++   shape uncounted, the cell on no list. Any access that is not the interpreter's own young-aware read or in-bounds store goes through
++   JS_ARR_VALS and promotes it. JS_UNINITIALIZED when the nursery declines. */
++static JSValue js_new_young_array(JSContext *ctx, const JSValue *src, int count)
++{
++    YCls *yk = &qjs_ycls[4 + count];
++    JSObject *p;
++    JSValue *vals;
++    uint8_t *c_;
++
++    if (unlikely((uintptr_t)yk->bump + yk->stride > (uintptr_t)yk->end)) {
++        unsigned bsi = js_young_arr_bsi[count];
++        if (!bsi) {
++            size_t total = ((sizeof(JSObject) + sizeof(JSProperty) + (size_t)count * sizeof(JSValue) + JS_ARENA_ALIGN - 1) &
++                            ~(size_t)(JS_ARENA_ALIGN - 1)) + sizeof(JSMallocBlockHeader);
++            int idx = arena_get_size_index(total);
++            if (idx >= JS_ARENA_BLOCK_SIZE_COUNT)
++                return JS_MKVAL(JS_TAG_UNINITIALIZED, 0);
++            bsi = js_young_arr_bsi[count] = (uint8_t)(idx + 1);
++        }
++        if (!qjs_y_refill(ctx, 4 + count, bsi - 1, JS_PLAIN_GCBYTE()))
++            return JS_MKVAL(JS_TAG_UNINITIALIZED, 0);
++    }
++    c_ = yk->bump;
++    p = (JSObject *)(c_ + 8);
++    yk->bump = c_ + yk->stride;
++    *(uint64_t *)c_ = yk->hdrw;
++    memset((uint8_t *)p + offsetof(JSObject, class_id) - 2, 0, 8);
++    p->extensible = true;
++    p->is_exotic = 1;
++    p->fast_array = 1;
++    p->prop_inline_cap = 1;
++    p->class_id = JS_CLASS_ARRAY;
++    p->values_inline = 1;
++    p->arr_kind = 0x80;
++    *(uint16_t *)((uint8_t *)p + 22) = (uint16_t)(qjs_y_ep48 >> 48);
++    p->shape = ctx->array_shape;
++    p->prop = (JSProperty *)(p + 1);
++    vals = (JSValue *)((JSProperty *)(p + 1) + 1);
++    p->u.array.u.values = vals;
++    p->u.array.u1.size = count;
++    p->u.array.count = count;
++    p->u.array.hole_count = 0;
++    p->prop[0].u.value = js_int32(count);
++    memcpy(vals, src, (size_t)count * sizeof(JSValue));
++    return JS_MKPTR(JS_TAG_OBJECT, p);
++}
++#endif
++
+ /* Build an array from `count` registers, writing the values straight into the
+    array's storage rather than a temporary on the C stack. */
+ #if QJS_REGVM
+@@ -10800,6 +10963,13 @@
+     JSObject *p;
+     int i;
+ 
++#if !QJS_PACKED_ARRAYS
++    if (y_interp_on && y_mine(ctx) && count > 0 && count <= JS_YARR_MAX) {
++        obj = js_new_young_array(ctx, src, count);
++        if (JS_VALUE_GET_TAG(obj) != JS_TAG_UNINITIALIZED)
++            return obj;
++    }
++#endif
+     if (count > 0 && count <= JS_ARRAY_INLINE_MAX)
+         obj = JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->array_shape),
+                                             JS_CLASS_ARRAY, NULL, 0, count);
+@@ -12109,6 +12279,8 @@
+ 
+ 
+ /* ---- native-stack root discovery (scan build) ---- */
++/* 0: no native-stack scan; 1: the words are matched against nursery cells and parked blocks (roots found by scanning); 2: nursery cells only (the engine's own nursery cells held by C locals). */
++static _Thread_local int ss_on = -1;
+ static JSValue *ss_vec; static uint32_t ss_n, ss_cap;
+ static void *ss_set_key[1 << 16]; static JSValue ss_set_val[1 << 16]; static uint32_t ss_used[1 << 15];
+ static inline void ss_push(JSValue v) { if (ss_n >= ss_cap) { ss_cap = ss_cap ? ss_cap * 2 : 4096; ss_vec = __builtin_realloc(ss_vec, ss_cap * sizeof(JSValue)); } ss_vec[ss_n++] = v; }
+@@ -12207,13 +12379,13 @@
+                 }
+             }
+         }
+-        if (v - js_heap_lo < js_heap_hi - js_heap_lo || Y_REG((void *)v)) {
++        if (ss_on == 1 && (v - js_heap_lo < js_heap_hi - js_heap_lo || Y_REG((void *)v))) {
+             if (ss_sw_n >= ss_sw_cap) { ss_sw_cap = ss_sw_cap ? ss_sw_cap * 2 : 4096; ss_sw = __builtin_realloc(ss_sw, ss_sw_cap * sizeof(uintptr_t)); }
+             ss_sw[ss_sw_n++] = v; ss_stat[2]++;
+             if (ss_sw_n <= (1u << (SS_HT_BITS - 1))) ss_hadd(v);
+         }
+     }
+-    if (ss_sw_n == 0) return;
++    if (ss_sw_n == 0 || ss_on == 2) return;
+     ss_stat[7]++;
+     for (i = 0; i < rt->zpark_len; i++) __builtin_prefetch(rt->zpark[i]);
+     for (i = 0; i < rt->zct_len; i++) __builtin_prefetch(JS_VALUE_GET_PTR(rt->zct[i]));
+@@ -12228,13 +12400,12 @@
+ /* The unit tells the engine its root form: 1 = roots are found by scanning the native stack, 2 = frame records are found by their magic word. */
+ static int qjs_aot_form_v;
+ void qjs_aot_set_form(int f) { qjs_aot_form_v |= f; }
+-static int ss_on = -1;
+ static void js_drc_pin(JSRuntime *rt)
+ {
+     js_drc_pend_flush(rt);
+     regvm_for_each_root_range(rt, js_drc_pin_range, NULL);
+-    if (ss_on < 0) ss_on = (qjs_aot_form_v & 1) || getenv("QJS_STACKSCAN") != NULL;
+-    if (ss_on && !ss_final) ss_scan(rt); else ss_n = 0;
++    { static int envss = -1; if (envss < 0) envss = getenv("QJS_STACKSCAN") != NULL; ss_on = ((qjs_aot_form_v & 1) || envss) ? 1 : (y_interp_on && __atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ? 2 : 0; }
++    if (ss_on && !ss_final) ss_scan(rt); else if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ss_n = 0;
+ }
+ 
+ static void js_drc_unpin_range(void *opaque, JSValue *regs, uint32_t nregs)
+@@ -12255,7 +12426,7 @@
+ static void js_drc_unpin(JSRuntime *rt)
+ {
+     regvm_for_each_root_range(rt, js_drc_unpin_range, rt);
+-    if (ss_n) { uint32_t n = ss_n; ss_n = 0; js_drc_unpin_range(rt, ss_vec, n); }
++    if (ss_n && (ss_on == 1 || __atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt)) { uint32_t n = ss_n; ss_n = 0; js_drc_unpin_range(rt, ss_vec, n); }
+ }
+ 
+ /* Frees every parked value that no live register refers to. The caller must
+@@ -12360,6 +12531,23 @@
+                 }
+             }
+         }
++        if (unlikely(p->class_id == JS_CLASS_ARRAY)) {
++            JSValue *e = p->u.array.u.values;
++            uint32_t n = p->u.array.count;
++            for (j = 0; j < n; j++) {
++                JSValue v = e[j];
++                if (JS_VALUE_HAS_REF_COUNT(v)) {
++                    JS_REF_COUNT(JS_VALUE_GET_PTR(v))++;
++                    if (Y_VAL(v)) {
++                        JSObject *c = JS_VALUE_GET_OBJ(v);
++                        if (!js_rc(c)->mark) {
++                            if (sp >= y_stk_cap) { y_stk_cap *= 2; y_stk = __builtin_realloc(y_stk, (size_t)y_stk_cap * sizeof(void *)); }
++                            js_rc(c)->mark = 1; y_stk[sp++] = c;
++                        }
++                    }
++                }
++            }
++        }
+         JS_REF_COUNT(sh)++;
+         JS_REF_COUNT(p) = Y_RCN(JS_REF_COUNT(p));
+         js_rc(p)->mark = 0;
+@@ -12401,7 +12589,7 @@
+     rt->drc_in_reconcile = 1;
+ 
+     js_drc_pend_flush(rt);
+-    if (y_nurs_n) {
++    if (y_nurs_n && __atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) {
+         qjs_y_force = 0;
+         y_collect(rt);
+     }
+@@ -16565,7 +16753,7 @@
+                 return true;
+             }
+ #endif
+-            v = JS_ARR_VALS(p)[idx];
++            v = JS_ARR_VALS_RD(p)[idx];
+             if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED))
+                 return false;
+             if (js_lazy_marker_is(v))
+@@ -16878,6 +17066,8 @@
+     JSShape *sh;
+     uint32_t i, len, new_count;
+ 
++    if (Y_IS(p))
++        y_promote_now(p);
+     if (js_array_ensure_generic(ctx, p) < 0)
+         return -1;
+     /* track modification of Array.prototype */
+@@ -19570,6 +19760,8 @@
+     JSShape *sh;
+     uint32_t idx = 0;    /* prevent warning */
+ 
++    if (unlikely(Y_IS(p)))
++        y_promote_now(p);
+     /* Every in-place shape-property mutation passes through here. */
+     if (unlikely(p->gv_watched)) {
+         js_gv_cell_invalidate(ctx->rt);
+@@ -29341,7 +29533,7 @@
+    after an allocation threw. */
+ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
+                                    JSRegPIC *pic, JSObject *p, JSValue v,
+-                                   int site)
++                                   int site, int yok)
+ {
+     JSRegPIC *e;
+     JSShape *nsh, *osh;
+@@ -29362,11 +29554,24 @@
+     /* a nursery cell owns no shape reference and counts none of its edges until
+        it is promoted; the swap below moves counted references, so it is the
+        ordinary object's to make */
+-    if (Y_IS(p))
+-        y_promote_now(p);
+     nsh = b->regvm_pic_holder[b->regvm_pic_count + site];
+     off = e->slot_off / (uint32_t)sizeof(JSProperty);
+     osh = p->shape;
++    if (yok && Y_YOUNG(p)) {
++        if ((uint32_t)nsh->prop_size <= p->prop_inline_cap && !p->gv_watched) {
++            /* The cell takes the new shape without a reference and the value without a count; the value's own count is the caller's,
++               and a count that reaches zero only parks the value until the reconcile has looked at this cell. */
++            AOT_PROF_STORE(b, site, osh, nsh, (int)off, AOT_STORE_ADD);
++            js_aot_layout_leave(ctx->rt, osh);
++            p->shape = nsh;
++            js_aot_content_enter(ctx->rt, p);
++            p->prop[off].u.value = v;
++            js_aot_content_last(ctx->rt, p);
++            return 1;
++        }
++        y_promote_now(p);
++    } else if (Y_IS(p))
++        y_promote_now(p);
+     /* a watched object (the global objects) gaining a property invalidates
+        every cached cell, the same as the generic add paths do */
+     if (unlikely(p->gv_watched)) {
+@@ -32012,8 +32217,8 @@
+ static uint8_t *REGVM_CC regvm_t_apply_arguments_record(REGVM_ARGS);
+ static JSFunctionBytecode *js_new_target_bytecode(JSValueConst new_target);
+ static void js_learn_instance_cap(JSFunctionBytecode *nb, JSValueConst inst);
+-static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
+-                                       int class_id, uint32_t req_cap);
++static JSValue js_create_from_ctor_cap_y(JSContext *ctx, JSValueConst ctor,
++                                         int class_id, uint32_t req_cap, int yok);
+ static __attribute__((always_inline)) inline void
+ regvm_record_release(JSRuntime *rt, JSRegRun *rec);
+ #endif
+@@ -33280,8 +33485,8 @@
+         T_FAIL();
+     }
+     nb = js_new_target_bytecode(ntv);
+-    obj = js_create_from_ctor_cap(ctx, ntv, JS_CLASS_OBJECT,
+-                                  nb ? nb->inst_inline_cap : 0);
++    obj = js_create_from_ctor_cap_y(ctx, ntv, JS_CLASS_OBJECT,
++                                  nb ? nb->inst_inline_cap : 0, 1);
+     if (JS_IsException(obj))
+         T_FAIL();
+     regvm_light_seal(ctx->rt, f);
+@@ -33951,6 +34156,11 @@
+             return 1;
+         }
+ #endif
++        if (Y_YOUNG(p) && y_interp_on) {
++            /* a nursery array counts none of its elements */
++            JS_ARR_VALS_RD(p)[idx] = v;
++            return 1;
++        }
+         old = JS_ARR_VALS(p)[idx];
+         JS_ARR_VALS(p)[idx] = js_dup(v);
+         JS_FreeValue(ctx, old);
+@@ -34241,7 +34451,7 @@
+     JSRuntime *rt = ctx->rt;
+     JSRegRun *nf;
+ 
+-    obj = js_create_from_ctor_cap(ctx, cf, JS_CLASS_OBJECT, cb->inst_inline_cap);
++    obj = js_create_from_ctor_cap_y(ctx, cf, JS_CLASS_OBJECT, cb->inst_inline_cap, 1);
+     if (JS_IsException(obj))
+         T_FAIL();
+     nf = regvm_light_prepare(REGVM_PASS, co, cb, 10, FRP(ab), na, &regs);
+@@ -34573,16 +34783,16 @@
+ 
+         if (likely(p->class_id == JS_CLASS_ARRAY &&
+                    idx < p->u.array.count && JS_ARR_GENERIC(p) &&
+-                   !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
++                   !js_array_slot_is_hole(JS_ARR_VALS_RD(p)[idx]))) {
+ #ifdef QJS_REGVM_COUNT
+             js_regvm_elem[0]++;
+ #endif
+-            if (unlikely(js_lazy_marker_is(JS_ARR_VALS(p)[idx])))
++            if (unlikely(js_lazy_marker_is(JS_ARR_VALS_RD(p)[idx])))
+                 __attribute__((musttail))
+                     return regvm_t_get_element_lazy_slow(REGVM_PASS);
+-            AOT_PROF_ELEM(f->b, JS_ARR_VALS(p)[idx], 0);
++            AOT_PROF_ELEM(f->b, JS_ARR_VALS_RD(p)[idx], 0);
+             AOT_PROF_PACKED(f->b, p);
+-            T_SET_NEXT_B(d,JS_ARR_VALS(p)[idx], T_SZ_RRR);
++            T_SET_NEXT_B(d,JS_ARR_VALS_RD(p)[idx], T_SZ_RRR);
+         }
+ #if QJS_PACKED_ARRAYS
+         if (p->class_id == JS_CLASS_ARRAY && !JS_ARR_GENERIC(p) && idx < p->u.array.count) {
+@@ -35187,6 +35397,11 @@
+                 if (unlikely(p->is_prototype))
+                     ic_watchpoint_bump(ctx->rt);
+ #endif
++                if (Y_YOUNG(p)) {
++                    /* A nursery cell counts none of its edges: the slot takes the value uncounted and the old value was never counted. */
++                    *slot = FR(v);
++                    T_NEXT(T_SZ_RASR);
++                }
+                 js_aot_content_store(ctx->rt, p, e->slot_off / sizeof(JSProperty), FR(v));
+                 *slot = js_dup(FR(v));
+                 if (unlikely(JS_VALUE_HAS_REF_COUNT(old)) &&
+@@ -35199,7 +35414,7 @@
+             }
+             {
+                 int ah = regvm_put_field_add_hit(ctx, f->b, f->pic, p, FR(v),
+-                                                 site);
++                                                 site, 1);
+                 if (ah > 0) {
+ #ifdef QJS_REGVM_COUNT
+                     js_regvm_put_direct++;
+@@ -36070,6 +36285,13 @@
+ 
+         if (likely(!po->is_exotic && po->shape == tpl->shape &&
+                    (int)tpl->prop_count == n)) {
++            if (Y_YOUNG(po)) {
++                for (i2 = 0; i2 < n; i2++) {
++                    po->prop[i2].u.value = vals[i2];
++                    vals[i2] = JS_UNDEFINED;
++                }
++                T_NEXT(T_SZ_RBUU);
++            }
+             for (i2 = 0; i2 < n; i2++) {
+ #if QJS_DRC
+                 /* the slot still holds the template's undefined: nothing to free */
+@@ -38870,6 +39092,10 @@
+                             if (unlikely(p->is_prototype))
+                                 ic_watchpoint_bump(ctx->rt);
+ #endif
++                            if (Y_YOUNG(p)) {
++                                *slot = regs[v];
++                                REGVM_NEXT();
++                            }
+                             js_aot_content_store(ctx->rt, p, e->slot_off / sizeof(JSProperty), regs[v]);
+                             *slot = js_dup(regs[v]);
+                             JS_FreeValue(ctx, old);
+@@ -38879,7 +39105,7 @@
+                             int ah;
+                             REGVM_CAPTURE_IP_MONO(rpc - 1);
+                             ah = regvm_put_field_add_hit(ctx, b, pic, p,
+-                                                         regs[v], site);
++                                                         regs[v], site, 1);
+                             if (ah > 0)
+                                 REGVM_NEXT();
+                             if (ah < 0)
+@@ -38947,15 +39173,15 @@
+ 
+                     if (likely(p->class_id == JS_CLASS_ARRAY &&
+                                idx < p->u.array.count && JS_ARR_GENERIC(p) &&
+-                               !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
++                               !js_array_slot_is_hole(JS_ARR_VALS_RD(p)[idx]))) {
+ #ifdef QJS_REGVM_COUNT
+                         js_regvm_elem[0]++;
+ #endif
+-                        if (unlikely(js_lazy_marker_is(JS_ARR_VALS(p)[idx])))
++                        if (unlikely(js_lazy_marker_is(JS_ARR_VALS_RD(p)[idx])))
+                             val = js_lazy_materialize_slot(ctx,
+-                                    &JS_ARR_VALS(p)[idx], p);
++                                    &JS_ARR_VALS_RD(p)[idx], p);
+                         else
+-                            val = js_dup(JS_ARR_VALS(p)[idx]);
++                            val = js_dup(JS_ARR_VALS_RD(p)[idx]);
+                     } else if (js_get_fast_array_element(ctx, p, idx, &val)) {
+                         /* the remaining fast classes: arguments, mapped
+                            arguments and the typed arrays */
+@@ -46938,8 +47164,8 @@
+ /* The common case of the function above, with nothing to set up: a bytecode constructor whose shape still has the
+    `prototype` slot it cached, holding an object for which it keeps an instance shape. Anything else (a fact event to
+    report, a layout to build, any other constructor or class) takes the full path. */
+-static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
+-                                       int class_id, uint32_t req_cap)
++static JSValue js_create_from_ctor_cap_y(JSContext *ctx, JSValueConst ctor,
++                                         int class_id, uint32_t req_cap, int yok)
+ {
+     if (likely(class_id == JS_CLASS_OBJECT && JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT)) {
+         JSObject *cp = JS_VALUE_GET_OBJ(ctor);
+@@ -46959,7 +47185,7 @@
+                     for (k = 0; k < 4; k++) {
+                         JSShape *ish = fb->ctor_inst_shape[k];
+                         if (ish && ish->proto == po)
+-                            return js_new_plain_object(ctx, js_dup_shape(ish), req_cap);
++                            return js_new_plain_object_ex(ctx, js_dup_shape(ish), req_cap, yok);
+                     }
+                 }
+             }
+@@ -46968,6 +47194,12 @@
+     return js_create_from_ctor_cap_slow(ctx, ctor, class_id, req_cap);
+ }
+ 
++static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
++                                       int class_id, uint32_t req_cap)
++{
++    return js_create_from_ctor_cap_y(ctx, ctor, class_id, req_cap, 0);
++}
++
+ static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
+                                    int class_id)
+ {
+@@ -69950,7 +70182,7 @@
+     f->cap_ip = ip;
+     if (f->pic != NULL && JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+         int ah = regvm_put_field_add_hit(ctx, f->b, f->pic,
+-                                         JS_VALUE_GET_OBJ(recv), v, site);
++                                         JS_VALUE_GET_OBJ(recv), v, site, 0);
+         if (ah != 0)
+             return ah < 0 ? -1 : 0;
+     }
+@@ -70422,7 +70654,7 @@
+     p->fast_array = 1;
+     p->shape = js_dup_shape(sh);
+     p->prop = (JSProperty *)((uint8_t *)p + sizeof(JSObject));
+-    JS_ARR_VALS(p) = (JSValue *)((JSProperty *)(p + 1) + inline_cap);
++    JS_ARR_VALS_RD(p) = (JSValue *)((JSProperty *)(p + 1) + inline_cap);
+     p->u.array.count = 0;
+     p->u.array.hole_count = 0;
+     p->u.array.u1.size = n;
+@@ -70463,7 +70695,7 @@
+         a->u.array.count = 0;
+         if (!a->values_inline && JS_ARR_VALS(a) != NULL) {   /* a push past the inline room moved the elements to a heap block (expand_fast_array); the object stayed where it is */
+             js_free_rt(rt, JS_ARR_VALS(a));
+-            JS_ARR_VALS(a) = NULL;
++            JS_ARR_VALS_RD(a) = NULL;
+             a->values_inline = 1;
+             a->u.array.u1.size = 0;
+         }
+@@ -71397,7 +71629,7 @@
+     if (f->pic == NULL || JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT)
+         return 0;
+     return regvm_put_field_add_hit(ctx, f->b, f->pic, JS_VALUE_GET_OBJ(recv),
+-                                   v, site);
++                                   v, site, 0);
+ }
+ 
+ int qjs_aot_object_template_b(JSContext *ctx, JSFunctionBytecode *b, int index,
+@@ -71409,7 +71641,7 @@
+         JS_ThrowInternalError(ctx, "invalid object literal template");
+         return -1;
+     }
+-    val = js_new_object_from_template(ctx, &b->objlit_tab[index]);
++    val = js_new_object_from_template_y(ctx, &b->objlit_tab[index], 0);
+     if (JS_IsException(val))
+         return -1;
+     *out = val;
+@@ -71825,6 +72057,8 @@
+ 
+     if (JS_IsException(val))
+         return -1;
++    if (Y_YOUNG(JS_VALUE_GET_PTR(val)))
++        y_promote_now(JS_VALUE_GET_OBJ(val));
+     *out = val;
+     return 0;
+ }
+@@ -78185,6 +78419,8 @@
+         JS_FreeValue(ctx, JS_GetException(ctx));
+         return 0;
+     }
++    if (Y_YOUNG(JS_VALUE_GET_PTR(arr)))
++        y_promote_now(JS_VALUE_GET_OBJ(arr));
+     if (js_resize_array(ctx, (void *)&fd->cpool, sizeof(fd->cpool[0]),
+                         &fd->cpool_size, fd->cpool_count + 1)) {
+         JS_FreeValue(ctx, arr);
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -4683,7 +4683,7 @@
+                             int ah;
+                             REGVM_CAPTURE_IP_MONO(rpc - 1);
+                             ah = regvm_put_field_add_hit(ctx, b, pic, p,
+-                                                         regs[v], site);
++                                                         regs[v], site, 1);
+                             if (ah > 0)
+                                 REGVM_NEXT();
+                             if (ah < 0)

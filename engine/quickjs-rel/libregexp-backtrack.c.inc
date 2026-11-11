@@ -7,6 +7,7 @@ static intptr_t LRE_BT_FUNC(REExecContext *s, uint8_t **capture,
     uint32_t val, c, idx;
     const uint8_t *cbuf_end;
     StackElem *sp, *bp, *stack_end;
+    const uint8_t *run_atom, *run_exit;
 #ifdef DUMP_EXEC
     const uint8_t *pc_start = pc; /* TEST */
 #endif
@@ -117,6 +118,18 @@ static intptr_t LRE_BT_FUNC(REExecContext *s, uint8_t **capture,
                 pc = sp[-3].ptr;
                 cptr = sp[-2].ptr;
                 type = sp[-1].bp.type;
+                if (type == RE_EXEC_STATE_RUN) {
+                    /* give back one character of the run; the frame stays
+                       (sp == bp) until the run start is reached */
+                    PREV_CHAR(cptr, s->cbuf, cbuf_type);
+                    if (cptr > sp[-4].ptr) {
+                        sp[-2].ptr = (uint8_t *)cptr;
+                    } else {
+                        bp = s->stack_buf + sp[-1].bp.val;
+                        sp -= 4;
+                    }
+                    break;
+                }
                 bp = s->stack_buf + sp[-1].bp.val;
                 sp -= 3;
                 if (type != RE_EXEC_STATE_LOOKAHEAD)
@@ -142,6 +155,11 @@ static intptr_t LRE_BT_FUNC(REExecContext *s, uint8_t **capture,
                     type = sp[-1].bp.type;
                     bp = s->stack_buf + sp[-1].bp.val;
                     sp[-1].ptr = (void *)sp1; /* save the next value for the copy step */
+                    if (type == RE_EXEC_STATE_RUN) {
+                        /* mark the four slot frame for the copy step */
+                        sp[-4].ptr = (uint8_t *)&lre_run_frame_mark;
+                        sp -= 1;
+                    }
                     sp -= 3;
                     if (type == RE_EXEC_STATE_LOOKAHEAD)
                         break;
@@ -150,8 +168,13 @@ static intptr_t LRE_BT_FUNC(REExecContext *s, uint8_t **capture,
                     /* keep the undo info if there is a saved state */
                     sp1 = sp;
                     while (sp1 < sp_top) {
-                        next_sp = (void *)sp1[2].ptr;
-                        sp1 += 3;
+                        if (sp1[0].ptr == (uint8_t *)&lre_run_frame_mark) {
+                            next_sp = (void *)sp1[3].ptr;
+                            sp1 += 4;
+                        } else {
+                            next_sp = (void *)sp1[2].ptr;
+                            sp1 += 3;
+                        }
                         while (sp1 < next_sp)
                             *sp++ = *sp1++;
                     }
@@ -172,7 +195,7 @@ static intptr_t LRE_BT_FUNC(REExecContext *s, uint8_t **capture,
                 cptr = sp[-2].ptr;
                 type = sp[-1].bp.type;
                 bp = s->stack_buf + sp[-1].bp.val;
-                sp -= 3;
+                sp -= 3 + (type == RE_EXEC_STATE_RUN);
                 if (type == RE_EXEC_STATE_NEGATIVE_LOOKAHEAD)
                     break;
             }
@@ -191,7 +214,7 @@ static intptr_t LRE_BT_FUNC(REExecContext *s, uint8_t **capture,
                 goto no_match;
             GET_CHAR(c, cptr, cbuf_end, cbuf_type);
             if (opcode == REOP_char_i || opcode == REOP_char32_i) {
-                c = lre_canonicalize(c, s->is_unicode);
+                c = lre_canon_fast(c, s->is_unicode);
             }
             if (val != c)
                 goto no_match;
@@ -204,8 +227,27 @@ static intptr_t LRE_BT_FUNC(REExecContext *s, uint8_t **capture,
                 val = get_u32(pc);
                 pc += 4;
                 if (opcode == REOP_split_next_first) {
+                    /* greedy loop over one character: X* is
+                       split_next_first, X, goto back to the split */
+                    int alen = lre_simple_atom_len(pc);
+                    if (alen && pc[alen] == REOP_goto &&
+                        pc + alen + 5 + (int)get_u32(pc + alen + 1) == pc - 5) {
+                        run_atom = pc;
+                        run_exit = pc + (int)val;
+                        goto char_run;
+                    }
                     pc1 = pc + (int)val;
                 } else {
+                    if ((int)val < 0) {
+                        /* the tail of X+: X, split_goto_first back to X */
+                        const uint8_t *a = pc + (int)val;
+                        int alen = lre_simple_atom_len(a);
+                        if (alen && a + alen == pc - 5) {
+                            run_atom = a;
+                            run_exit = pc;
+                            goto char_run;
+                        }
+                    }
                     pc1 = pc;
                     pc = pc + (int)val;
                 }
@@ -216,6 +258,84 @@ static intptr_t LRE_BT_FUNC(REExecContext *s, uint8_t **capture,
                 sp[2].bp.type = RE_EXEC_STATE_SPLIT;
                 sp += 3;
                 bp = sp;
+            }
+            BREAK;
+        char_run:
+            {
+                const uint8_t *p = cptr, *e = cbuf_end;
+                uint32_t aop = run_atom[0], v;
+                const uint8_t *ra = run_atom + 3;
+                uint64_t bm[4];
+                int rn;
+
+#define LRE_RUN(COND)                                                   \
+    if (cbuf_type == 0) {                                               \
+        while (p < e) { c = *p; if (!(COND)) break; p++; }              \
+    } else {                                                            \
+        while (p < e) {                                                 \
+            const uint8_t *q = p;                                       \
+            GET_CHAR(c, q, e, cbuf_type);                               \
+            if (!(COND)) break;                                         \
+            p = q;                                                      \
+        }                                                               \
+    }
+                switch (aop) {
+                case REOP_space:
+                    LRE_RUN(lre_is_space(c));
+                    break;
+                case REOP_not_space:
+                    LRE_RUN(!lre_is_space(c));
+                    break;
+                case REOP_dot:
+                    LRE_RUN(!is_line_terminator(c));
+                    break;
+                case REOP_any:
+                    p = e;
+                    break;
+                case REOP_char:
+                    v = get_u16(run_atom + 1);
+                    LRE_RUN(c == v);
+                    break;
+                case REOP_char_i:
+                    v = get_u16(run_atom + 1);
+                    LRE_RUN(lre_canon_fast(c, s->is_unicode) == v);
+                    break;
+                case REOP_range:
+                    rn = get_u16(run_atom + 1);
+                    if (cbuf_type == 0) {
+                        /* test the first few characters directly; a run
+                           that goes on gets a bitmap of the class */
+                        const uint8_t *lim = (e - p > 8) ? p + 8 : e;
+                        while (p < lim && lre_range_has(ra, rn, *p))
+                            p++;
+                        if (p == lim && lim < e) {
+                            lre_range_bitmap(bm, ra, rn);
+                            LRE_RUN((bm[c >> 6] >> (c & 63)) & 1);
+                        }
+                    } else {
+                        LRE_RUN(lre_range_has(ra, rn, c));
+                    }
+                    break;
+                default: /* REOP_range_i */
+                    rn = get_u16(run_atom + 1);
+                    LRE_RUN(lre_range_has(ra, rn, lre_canon_fast(c, s->is_unicode)));
+                    break;
+                }
+#undef LRE_RUN
+                if (p > cptr) {
+                    CHECK_STACK_SPACE(4);
+                    sp[0].ptr = (uint8_t *)cptr;
+                    sp[1].ptr = (uint8_t *)run_exit;
+                    sp[2].ptr = (uint8_t *)p;
+                    sp[3].bp.val = bp - s->stack_buf;
+                    sp[3].bp.type = RE_EXEC_STATE_RUN;
+                    sp += 4;
+                    bp = sp;
+                    cptr = p;
+                }
+                pc = run_exit;
+                if (lre_poll_timeout(s))
+                    return LRE_RET_TIMEOUT;
             }
             BREAK;
         CASE(REOP_lookahead):
@@ -486,7 +606,6 @@ static intptr_t LRE_BT_FUNC(REExecContext *s, uint8_t **capture,
         CASE(REOP_range_i):
             {
                 int n;
-                uint32_t low, high, idx_min, idx_max, idx;
 
                 n = get_u16(pc); /* n must be >= 1 */
                 pc += 2;
@@ -494,32 +613,10 @@ static intptr_t LRE_BT_FUNC(REExecContext *s, uint8_t **capture,
                     goto no_match;
                 GET_CHAR(c, cptr, cbuf_end, cbuf_type);
                 if (opcode == REOP_range_i) {
-                    c = lre_canonicalize(c, s->is_unicode);
+                    c = lre_canon_fast(c, s->is_unicode);
                 }
-                idx_min = 0;
-                low = get_u16(pc + 0 * 4);
-                if (c < low)
+                if (!lre_range_has(pc, n, c))
                     goto no_match;
-                idx_max = n - 1;
-                high = get_u16(pc + idx_max * 4 + 2);
-                /* 0xffff in for last value means +infinity */
-                if (unlikely(c >= 0xffff) && high == 0xffff)
-                    goto range_match;
-                if (c > high)
-                    goto no_match;
-                while (idx_min <= idx_max) {
-                    idx = (idx_min + idx_max) / 2;
-                    low = get_u16(pc + idx * 4);
-                    high = get_u16(pc + idx * 4 + 2);
-                    if (c < low)
-                        idx_max = idx - 1;
-                    else if (c > high)
-                        idx_min = idx + 1;
-                    else
-                        goto range_match;
-                }
-                goto no_match;
-            range_match:
                 pc += 4 * n;
             }
             BREAK;

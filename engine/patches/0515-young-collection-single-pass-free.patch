@@ -1,0 +1,345 @@
+Subject: The young collection frees its garbage itself, in array passes, over a 4 MB window
+
+What this does
+  - quickjs.c gc_young: members are only plain objects and Arrays without weak references. Membership (gc_young), "reached from outside" (gc_live) and the survivor flag (gc_old) are bits of the object (new bits in the byte of gc_old, cleared at the creation sites); the header mark and the tmp_obj_list are no longer used by it. The passes run over the vector of members with prefetch ahead: take the member-to-member edges out of the counts; find the members still counted; put back the edges of the live ones while extending the live set; then free the garbage directly (release what it holds outside S, shape, property block, element block, cell). The garbage's edges into S were never counted back, so nothing is decremented twice and the old restore pass over all garbage is gone.
+  - The edge walk is one function for the three modes and reads the child's own flag byte instead of the child's header and type.
+  - quickjs.c: the growth step floor is 4 MB (was 16 MB) and so is the initial threshold, so the set a young collection sweeps stays cache resident.
+  - QJS_GC_STATS prints per-phase cycles of the young collection (list walk, edges out, roots, reach, release, free cells).
+
+Why we need it
+  The young pass cost about 240 cycles per examined object and the freeing 130 per garbage object (deltablue AOT). The trial deletion walked every object's children three times (decrement, restore, search) through the generic mark functions, then freed through the generic free, and the 16 MB sets did not fit in cache.
+
+Soundness
+  Same argument as 0511: only edges between members are removed from the counts, so members with outside references and everything they reach are kept. A property that is not plain data (accessor, closure cell, autoinit) is not an edge in any pass and is released with free_property when its owner is freed. Garbage is exactly the members not reached, and no reference from a live member or from outside points at it.
+
+Failure modes
+  Cycles through functions, Maps, bound functions or other classes are left to the full collection (they were members of the earlier young pass through the generic mark). A 4 MB step collects more often; the pin and reconcile part is a few thousand cycles.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2563,6 +2563,8 @@
+     uint8_t values_inline : 1;
+     uint8_t has_weak_ref : 1; /* the runtime's weak table holds this object's weak references */
+     uint8_t gc_old : 1; /* survived a collection: the young cycle collector does not look at it */
++    uint8_t gc_young : 1; /* a member of the set a young collection is processing */
++    uint8_t gc_live : 1;  /* ... found reachable from outside the set */
+     uint8_t arr_kind; /* JS_CLASS_ARRAY only: JS_ARR_KIND_* (see QJS_PACKED_ARRAYS); always 0 unless the flag is on */
+     /* byte offsets: 16/24 */
+     JSShape *shape; /* prototype and property names + flag */
+@@ -3296,7 +3298,7 @@
+ /* Where collections were asked for (QJS_GC_STATS): the allocation threshold path (calls, reconcile that was enough, collection run) and the safepoint path. */
+ static uint64_t gc_trig[4], gc_rec_n, gc_rec_peak, gc_rec_thr;
+ static int gc_stat_on = -1;
+-#define GC_MIN_STEP ((size_t)16 << 20)
++#define GC_MIN_STEP ((size_t)4 << 20)
+ 
+ static void js_gc_rearm_pace(JSRuntime *rt, size_t before, size_t after)
+ {
+@@ -10263,6 +10265,8 @@
+     p->arr_kind = JS_ARR_KIND_GENERIC;
+     p->has_weak_ref = 0;
+     p->gc_old = 0;
++    p->gc_young = 0;
++    p->gc_live = 0;
+     p->shape = sh;
+     p->prop = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
+     JS_REF_COUNT(p) = 1;
+@@ -10329,6 +10333,8 @@
+     p->is_prototype = 0;
+     p->has_weak_ref = 0;
+     p->gc_old = 0;
++    p->gc_young = 0;
++    p->gc_live = 0;
+     if (class_id != JS_CLASS_OBJECT)
+         p->u.opaque = NULL;
+     p->shape = sh;
+@@ -12995,64 +13001,97 @@
+ 
+ 
+ /* ---- young collection ------------------------------------------------------
+-   A trial deletion over the objects created since the previous collection instead of the whole heap. It is the same algorithm as gc_decref / gc_scan /
+-   gc_free_cycles run on a subset S of the plain heap objects: only edges between members of S are removed from the counts, so every reference from outside S
+-   (older objects, shapes, closure cells, registers, the native stack) keeps its member alive and everything reachable from it. Garbage that is a whole
+-   cycle of young objects is freed; a cycle with an older member waits for a full collection, which the policy in js_gc_auto runs when the heap has grown.
+-   S is the tail of gc_obj_list up to the first run of objects flagged gc_old (survivors of an earlier collection); objects of other kinds are never members.
+-   While S is processed, `mark` is 1 exactly for the members not yet found to be reachable from outside. */
++   A trial deletion over the objects created since the previous collection instead of the whole heap: the algorithm of gc_decref / gc_scan / gc_free_cycles run on a
++   subset S of the plain heap objects (class Object or Array, no weak references), so every reference from outside S (older objects, shapes, closure cells,
++   registers, the native stack) keeps its member alive and everything reachable from it. Garbage that is a whole cycle of young objects is freed; a cycle with an older
++   member, or through a function, waits for a full collection, which the policy in js_gc_auto runs when the heap has grown.
++   S is the tail of gc_obj_list up to the first run of objects flagged gc_old (survivors of an earlier collection). A member has gc_young set while S is processed.
++   The edges considered are the data properties and, for an Array, its elements, that hold a member. Pass 1 takes them out of the counts; the members still counted
++   are held from outside and are searched from (pass 2); the search puts back the edges of the live members (pass 3), flagging what it reaches gc_live; the rest is
++   garbage, and its edges into S stay out of the counts, so freeing it only releases what it holds outside S (pass 4). */
+ static JSObject **gc_y_set; static size_t gc_y_cap;
+ static JSObject **gc_y_stk; static size_t gc_y_stk_cap;
++static size_t gc_young_n, gc_young_g;
++static uint64_t gc_ph[6];
++#define GC_PH(i) do { if (unlikely(gc_stat_on > 0)) { uint64_t t_ = __builtin_ia32_rdtsc(); if (i) gc_ph[i - 1] += t_ - gc_ph_t; gc_ph_t = t_; } } while (0)
++static uint64_t gc_ph_t;
+ #define GC_YOUNG_OLD_RUN 256
+ 
+-static inline bool gc_young_member(JSGCObjectHeader *p)
+-{
+-    return JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT && JS_GC_MARK(p);
+-}
+-
+-static void gc_young_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
+-{
+-    if (gc_young_member(p))
+-        JS_REF_COUNT(p)--;
+-}
+-
+-static void gc_young_incref_child(JSRuntime *rt, JSGCObjectHeader *p)
++/* The values an S member holds: mode 0 takes the member-to-member edges out of the counts, 1 puts them back and extends the live set with the members they
++   reach, 2 releases everything the member holds except those edges. */
++static inline __attribute__((always_inline)) void
++gc_young_edges(JSRuntime *rt, JSObject *o, int mode, size_t *sp)
+ {
+-    if (gc_young_member(p))
+-        JS_REF_COUNT(p)++;
+-}
++    JSShape *sh = o->shape;
++    JSShapeProperty *pr = get_shape_prop(sh);
++    int i, n = sh->prop_count;
++    uint32_t k = 0, cnt = 0;
++    JSValue *av = NULL;
++    bool arr = o->class_id == JS_CLASS_ARRAY && JS_ARR_GENERIC(o);
++
++    if (arr) {
++        cnt = o->u.array.count;
++        av = JS_ARR_VALS(o);
++    }
++    for (i = 0; ; i++) {
++        JSValue v;
+ 
+-static size_t gc_young_n, gc_young_sp;
++        if (i < n) {
++            if (unlikely(pr->flags & JS_PROP_TMASK)) {
++                if (mode == 2)
++                    free_property(rt, &o->prop[i], pr->flags);
++                pr++;
++                continue;
++            }
++            v = o->prop[i].u.value;
++            pr++;
++        } else if (k < cnt) {
++            v = av[k++];
++        } else {
++            break;
++        }
++        if (!JS_VALUE_HAS_REF_COUNT(v))
++            continue;
++        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && ((JSObject *)JS_VALUE_GET_PTR(v))->gc_young) {
++            JSObject *c = JS_VALUE_GET_OBJ(v);
+ 
+-static void gc_young_reach_child(JSRuntime *rt, JSGCObjectHeader *p)
+-{
+-    if (gc_young_member(p)) {
+-        JSObject *o = (JSObject *)p;
+-        JS_GC_MARK(p) = 0;
+-        o->gc_old = 1;
+-        if (gc_young_sp >= gc_y_stk_cap) {
+-            gc_y_stk_cap = gc_y_stk_cap ? gc_y_stk_cap * 2 : 1024;
+-            gc_y_stk = __builtin_realloc(gc_y_stk, gc_y_stk_cap * sizeof(JSObject *));
+-            if (!gc_y_stk)
+-                abort();
++            if (mode == 0) {
++                JS_REF_COUNT(c)--;
++            } else if (mode == 1) {
++                JS_REF_COUNT(c)++;
++                if (!c->gc_live) {
++                    c->gc_live = 1;
++                    c->gc_old = 1;
++                    if (*sp >= gc_y_stk_cap) {
++                        gc_y_stk_cap = gc_y_stk_cap ? gc_y_stk_cap * 2 : 1024;
++                        gc_y_stk = __builtin_realloc(gc_y_stk, gc_y_stk_cap * sizeof(JSObject *));
++                        if (!gc_y_stk)
++                            abort();
++                    }
++                    gc_y_stk[(*sp)++] = c;
++                }
++            }
++            continue;
++        }
++        if (mode == 2 && --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0) {
++            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(v)))
++                continue;
++            js_free_value_rt(rt, v);
+         }
+-        gc_y_stk[gc_young_sp++] = o;
+     }
+ }
+ 
+-static inline void gc_young_children(JSRuntime *rt, JSGCObjectHeader *p, JS_MarkFunc *f)
+-{
+-    if (!mark_children_fast(rt, p, f))
+-        mark_children(rt, p, f);
+-}
++#define GC_YOUNG_PF 8
+ 
+ static void gc_young(JSRuntime *rt)
+ {
+     struct list_head *el;
+-    size_t i, run = 0;
++    size_t i, sp = 0, run = 0;
+ 
+     init_list_head(&rt->tmp_obj_list);
+     gc_young_n = 0;
++    gc_young_g = 0;
++    GC_PH(0);
+     for (el = rt->gc_obj_list.prev; el != &rt->gc_obj_list; el = el->prev) {
+         JSGCObjectHeader *p = list_entry(el, JSGCObjectHeader, link);
+         JSObject *o;
+@@ -13066,52 +13105,87 @@
+             continue;
+         }
+         run = 0;
+-        assert(JS_GC_MARK(p) == 0);
++        if (o->has_weak_ref || (o->class_id != JS_CLASS_OBJECT && o->class_id != JS_CLASS_ARRAY))
++            continue;
+         if (gc_young_n >= gc_y_cap) {
+             gc_y_cap = gc_y_cap ? gc_y_cap * 2 : 4096;
+             gc_y_set = __builtin_realloc(gc_y_set, gc_y_cap * sizeof(JSObject *));
+             if (!gc_y_set)
+                 abort();
+         }
++        o->gc_young = 1;
++        o->gc_live = 0;
+         gc_y_set[gc_young_n++] = o;
+     }
+-    for (i = 0; i < gc_young_n; i++)
+-        JS_GC_MARK(&gc_y_set[i]->header) = 1;
+-    /* remove the edges inside S from the counts */
+-    for (i = 0; i < gc_young_n; i++)
+-        gc_young_children(rt, &gc_y_set[i]->header, gc_young_decref_child);
+-    /* the members still counted are held from outside; collect them as the roots of the search before the counts are restored */
+-    gc_young_sp = 0;
++    GC_PH(1);
++    /* 1: take the edges inside S out of the counts */
++    for (i = 0; i < gc_young_n; i++) {
++        if (i + GC_YOUNG_PF < gc_young_n)
++            __builtin_prefetch(gc_y_set[i + GC_YOUNG_PF], 0, 3);
++        if (i + GC_YOUNG_PF / 2 < gc_young_n)
++            __builtin_prefetch(gc_y_set[i + GC_YOUNG_PF / 2]->prop, 0, 3);
++        gc_young_edges(rt, gc_y_set[i], 0, NULL);
++    }
++    GC_PH(2);
++    /* 2: what is still counted is held from outside */
+     for (i = 0; i < gc_young_n; i++) {
+         JSObject *o = gc_y_set[i];
++
+         if (JS_REF_COUNT(o) > 0) {
+-            if (gc_young_sp >= gc_y_stk_cap) {
++            o->gc_live = 1;
++            o->gc_old = 1;
++            if (sp >= gc_y_stk_cap) {
+                 gc_y_stk_cap = gc_y_stk_cap ? gc_y_stk_cap * 2 : 1024;
+                 gc_y_stk = __builtin_realloc(gc_y_stk, gc_y_stk_cap * sizeof(JSObject *));
+                 if (!gc_y_stk)
+                     abort();
+             }
+-            gc_y_stk[gc_young_sp++] = o;
++            gc_y_stk[sp++] = o;
+         }
+     }
+-    for (i = 0; i < gc_young_n; i++)
+-        gc_young_children(rt, &gc_y_set[i]->header, gc_young_incref_child);
+-    for (i = 0; i < gc_young_sp; i++) {
+-        JS_GC_MARK(&gc_y_stk[i]->header) = 0;
+-        gc_y_stk[i]->gc_old = 1;
+-    }
+-    while (gc_young_sp) {
+-        JSObject *o = gc_y_stk[--gc_young_sp];
+-        gc_young_children(rt, &o->header, gc_young_reach_child);
++    GC_PH(3);
++    /* 3: put back the edges of the live members, finding the rest of the live set */
++    while (sp)
++        gc_young_edges(rt, gc_y_stk[--sp], 1, &sp);
++    GC_PH(4);
++    /* 4: free the garbage: release what it holds outside S, then the cells */
++    rt->gc_phase = JS_GC_PHASE_DECREF;
++    for (i = 0; i < gc_young_n; i++) {
++        JSObject *o = gc_y_set[i];
++
++        if (i + GC_YOUNG_PF < gc_young_n)
++            __builtin_prefetch(gc_y_set[i + GC_YOUNG_PF], 1, 3);
++        if (i + GC_YOUNG_PF / 2 < gc_young_n)
++            __builtin_prefetch(gc_y_set[i + GC_YOUNG_PF / 2]->prop, 0, 3);
++        if (o->gc_live)
++            continue;
++        gc_young_g++;
++        gc_young_edges(rt, o, 2, NULL);
++        if (o->prop_inline_cap == 0)
++            js_free_rt(rt, o->prop);
++        if (unlikely(--JS_REF_COUNT(o->shape) <= 0))
++            js_free_shape0(rt, o->shape);
++        if (o->class_id == JS_CLASS_ARRAY && !o->values_inline)
++#if QJS_PACKED_ARRAYS
++            js_free_rt(rt, JS_ARR_RAW(o));
++#else
++            js_free_rt(rt, JS_ARR_VALS(o));
++#endif
+     }
+-    /* what is left marked is reachable only from itself */
++    GC_PH(5);
+     for (i = 0; i < gc_young_n; i++) {
+         JSObject *o = gc_y_set[i];
+-        if (JS_GC_MARK(&o->header)) {
+-            list_del(&o->header.link);
+-            list_add_tail(&o->header.link, &rt->tmp_obj_list);
++
++        if (o->gc_live) {
++            o->gc_young = 0;
++            o->gc_live = 0;
++        } else {
++            remove_gc_object(&o->header);
++            js_free_rt(rt, o);
+         }
+     }
++    GC_PH(6);
++    rt->gc_phase = JS_GC_PHASE_NONE;
+ }
+ 
+ static int js_gc_young_on = -1;
+@@ -13170,6 +13244,8 @@
+ 
+ static void gc_stat_report(void)
+ {
++    fprintf(stderr, "gc young phases (cyc): walk-list=%lu edges-out=%lu roots=%lu reach=%lu release=%lu free-cells=%lu\n", (unsigned long)gc_ph[0], (unsigned long)gc_ph[1],
++            (unsigned long)gc_ph[2], (unsigned long)gc_ph[3], (unsigned long)gc_ph[4], (unsigned long)gc_ph[5]);
+     fprintf(stderr, "gc reconciles=%lu peak_malloc_size_at_reconcile=%lu threshold_at_last=%lu\n", (unsigned long)gc_rec_n, (unsigned long)gc_rec_peak,
+             (unsigned long)gc_rec_thr);
+     fprintf(stderr, "gc trigger: allocation threshold calls=%lu reconcile_enough=%lu collections=%lu; safepoint collections=%lu\n", (unsigned long)gc_trig[0],
+@@ -13242,8 +13318,11 @@
+         int k = young;
+ 
+         tp = __builtin_ia32_rdtsc();
+-        for (e_ = rt->tmp_obj_list.next; e_ != &rt->tmp_obj_list; e_ = e_->next)
+-            g++;
++        if (young)
++            g = gc_young_g;
++        else
++            for (e_ = rt->tmp_obj_list.next; e_ != &rt->tmp_obj_list; e_ = e_->next)
++                g++;
+         if (young) {
+             ex = gc_young_n;
+         } else {
+@@ -69646,6 +69725,8 @@
+     p->is_prototype = 0;
+     p->has_weak_ref = 0;
+     p->gc_old = 0;
++    p->gc_young = 0;
++    p->gc_live = 0;
+     p->shape = js_dup_shape(sh);
+     pr = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
+     p->prop = pr;
+@@ -69952,6 +70033,8 @@
+     h->is_prototype = 0;
+     h->has_weak_ref = 0;
+     h->gc_old = 0;
++    h->gc_young = 0;
++    h->gc_live = 0;
+     pr = (JSProperty *)((uint8_t *)h + offsetof(JSObject, u));
+     h->prop = pr;
+     for (i = n; i < cap; i++)

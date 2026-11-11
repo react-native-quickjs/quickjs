@@ -159,6 +159,11 @@ typedef struct EFacts {
      that have locals. */
   uint8_t *elemreg;
   uint8_t *arrskip;
+  /* Per element access in a checked region: `bndskip` when the same index of the same array was already compared with the count in
+     this region (the compare is a function of two C locals that have not changed), and for a dense-array store `oldelem` = 1 + the value
+     an earlier load or store of the same element produced (the slot being overwritten is known to hold what that value is). */
+  uint8_t *bndskip;
+  int32_t *oldelem;
   uint8_t *arr_used;
   uint8_t *arr_pk;   /* the receiver's region is a packed one: keys the pkp/pkn locals */
   int narr_vals;
@@ -202,6 +207,7 @@ typedef struct EFacts {
   uint8_t *loop_calls; /* the loop's only safepoints are calls: only contracted-layout shape facts hold in it */
   int nhoist, hoist_cap;
   int *hoist_hdr, *hoist_pre, *hoist_val, *hoist_grp;
+  uint8_t *hoist_have; /* per hoisted check: the preheader's out-set already holds the fact, so no check is emitted on the edge */
   /* Runs of instructions that give one result at every iteration of their loop (see plan_invariants): `hvrun[i]` is 1 + the run
      of instruction i, else 0; a run's instructions are adjacent in one block; `hv_loop[r]` is its loop (index into loop_hdr). */
   int nhv, hv_cap;
@@ -229,6 +235,7 @@ typedef struct EFacts {
    whether this pass may use that (a framed speculative body). */
 extern int e_facts_pure_ok;
 extern int (*e_facts_pure_call)(const Q2Func *fn, const Q2Insn *in);
+extern int (*e_facts_pure_ctor)(const Q2Func *fn, const Q2Insn *in);
 /* Whether a function has no safepoint at all in its speculative form. */
 int e_facts_safepoint_free(const Q2Func *fn);
 int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit);

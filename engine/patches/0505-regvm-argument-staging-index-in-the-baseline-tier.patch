@@ -1,0 +1,23 @@
+Subject: Register VM: the argument staging index is built for the baseline tier too
+
+What this does
+  - quickjs.c js_regvm_encode: the staging index of call arguments (patch 0168, `aw_def` / `aw_reads`) is built whenever the function has values, baseline tier included. It was skipped for `regvm_baseline` functions.
+
+Why we need it
+  Without the index every call argument of a baseline-tier function falls back to `regvm_arg_retarget_scan`, a scan of the instructions already emitted, so a function with very many call arguments (mandreel's generated functions) takes time quadratic in its size: 350 s for the interpreter alone, 92% of it in that scan. With the index the same run takes 5.4 s and scores the same.
+
+Soundness
+  The index only answers the question the scan answers (the definition and the reads of a staged argument window); the baseline tier asks it the same way and gets the same answers. The index's arrays are sized by the function's value count.
+
+Failure modes
+  The two arrays use memory proportional to the value count of every baseline-tier function while it is encoded; they are freed with the encoder state as for the other tiers.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -79031,3 +79031,3 @@
+-    /* The baseline tier has no SSA or argument retargeting, and the staging
+-       index's arrays grow with the peak depth, so it is disabled there. */
+-    if (n_values > 0 && !fd->regvm_baseline) {
++    /* The staging index answers the retarget scan's questions without
++       scanning, so the baseline tier needs it as much as the others. */
++    if (n_values > 0) {

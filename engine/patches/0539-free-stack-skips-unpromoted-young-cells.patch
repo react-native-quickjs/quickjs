@@ -1,0 +1,25 @@
+Subject: free_plain_object does not stack a child that is an unpromoted nursery cell
+
+What this does
+  - quickjs.c free_plain_object: when releasing a field makes the child's count non-positive, the child is skipped if it is a nursery cell (Y_IS) or if its count is still negative (Y_NEGCHK: the nursery bias is still in it). Before, only Y_IS was tested, and Y_IS is false for a cell whose chunk was closed by y_collect (ymode 0); such a cell was stacked and freed as an ordinary object, which unlinks it from gc_obj_list (links null) and crashes.
+
+Why we need it
+  earleyboyer (fixed-work AOT build, .local/specs/v8-steady/earleyboyer_1.js) crashed with SIGSEGV in list_del <- remove_gc_object <- free_plain_object <- js_drc_reconcile_locked (<- js_drc_safepoint). The freed object was a kind-0x80 cell in a chunk with ymode 0, its parent an ordinary plain object freed from the park array. With QJS_NOFREESTACK=1 (the path through js_free_value_rt, which has the Y_NEGCHK test) the run is clean, as it is with QJS_NOYOUNGGC=1 or QJS_Y_GATE=0.
+
+Soundness
+  The skipped child is a young cell with no counted reference left; the nursery collection owns its lifetime, exactly as on the js_free_value_rt path (Y_NEGCHK at its entry). Counts that are not negative take the old route.
+
+Failure modes
+  None known; the added test is a sign test on a value already loaded for the decrement.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -11735,7 +11735,7 @@
+                 JSValue v = p->prop[i].u.value;
+                 if (JS_VALUE_HAS_REF_COUNT(v) && (SPL_K(7), 1) &&
+                     --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0) {
+-                    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(v))) {
++                    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && (Y_IS(JS_VALUE_GET_PTR(v)) || Y_NEGCHK(v))) {
+                         pr++;
+                         continue;
+                     }

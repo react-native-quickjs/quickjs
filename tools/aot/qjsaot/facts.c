@@ -101,6 +101,8 @@ unsigned long long qjs_aot_prof_site_calls(const uint8_t dg[16], int next_pc);
 /* An array fact's value in the same list: `rv` is a dense array whose base pointer and count
    are in locals. Group 0. */
 #define E_ARRV(rv) (0x20000000 + (rv))
+/* An in-bounds index of an array region: the array fact's group, offset by the index value (it dies with the array fact). */
+#define E_BNDGRP 0x100000
 
 /* ---- the fact set -------------------------------------------------------- */
 
@@ -277,6 +279,76 @@ static int kp_safepoint(void *arg, const EKey *k) {
 
 /* A register operand's value, or Q2_NO_VALUE when it is a destination or not a
    register. */
+/* The value an element key names: the old value of a post-increment of a number is the number itself, so `a[i++]` after `a[i]` reads
+   the same element. */
+static const Q2Func *g_fc_fn;
+
+/* Whether a value is a number (or an increment's result on a number). The types pass has not run
+   when the facts are computed, so a loop variable is proved from where it comes from: the profile,
+   a numeric constant, or an increment of a value that is itself such; a block parameter is a
+   number when every edge into it carries one (the parameter itself, met again on the way round, is
+   assumed to be). */
+static int fc_isnum(const Q2Func *fn, Q2ValueId v, Q2ValueId *stk, int depth) {
+  const Q2Value *val;
+  int i;
+  if (v == Q2_NO_VALUE || v >= (Q2ValueId)fn->nvalues || depth >= 8) return 0;
+  val = &fn->values[v];
+  if (val->type != 0 && (val->type & ~(uint32_t)(Q2_T_INT32 | Q2_T_NUM)) == 0) return 1;
+  if (val->ptypes != 0 && (val->ptypes & ~(uint32_t)(Q2_T_INT32 | Q2_T_NUM)) == 0) return 1;
+  if (val->is_const) return val->con_kind == Q2_CON_INT || val->con_kind == Q2_CON_DOUBLE;
+  if (val->insn >= 0) {
+    const Q2Insn *d = &fn->insns[val->insn];
+    if ((d->rop == ROP_post_inc || d->rop == ROP_post_dec || d->rop == ROP_inc || d->rop == ROP_dec) && d->nuse == 1)
+      return fc_isnum(fn, d->use[0], stk, depth + 1);
+    return 0;
+  }
+  if (val->param_of < 0 || val->block < 0 || val->block >= fn->nblocks) return 0;
+  for (i = 0; i < depth; i++)
+    if (stk[i] == v) return 1;
+  stk[depth] = v;
+  {
+    const Q2Block *bb = &fn->blocks[val->block];
+    int pi, pidx = -1;
+    for (pi = 0; pi < bb->nparams; pi++)
+      if (bb->param_val[pi] == v) pidx = pi;
+    if (pidx < 0 || bb->npreds <= 0) return 0;
+    for (pi = 0; pi < bb->npreds; pi++) {
+      const Q2Block *pb = &fn->blocks[bb->preds[pi]];
+      int k, found = 0;
+      for (k = 0; k < pb->nsucc; k++) {
+        if (pb->succ_block[k] != val->block) continue;
+        if (pb->edge_arg == NULL || pb->edge_arg[k] == NULL || pidx >= pb->nedge_args[k]) return 0;
+        found = 1;
+        if (!fc_isnum(fn, pb->edge_arg[k][pidx], stk, depth + 1)) return 0;
+      }
+      if (!found) return 0;
+    }
+  }
+  return 1;
+}
+
+static int fc_number(const Q2Func *fn, Q2ValueId v) {
+  Q2ValueId stk[8];
+  return fc_isnum(fn, v, stk, 0);
+}
+
+static Q2ValueId fcanon(Q2ValueId v) {
+  const Q2Func *fn = g_fc_fn;
+  int guard;
+  for (guard = 0; fn != NULL && v != Q2_NO_VALUE && v < (Q2ValueId)fn->nvalues && guard < 8; guard++) {
+    int ii = fn->values[v].insn;
+    const Q2Insn *d;
+    Q2ValueId u;
+    if (ii < 0) break;
+    d = &fn->insns[ii];
+    if ((d->rop != ROP_post_inc && d->rop != ROP_post_dec) || d->ndef != 2 || d->def[0] != v || d->nuse != 1) break;
+    u = d->use[0];
+    if (u >= (Q2ValueId)fn->nvalues || !fc_number(fn, u)) break;
+    v = u;
+  }
+  return v;
+}
+
 static Q2ValueId regval(const Q2Insn *in, int idx) {
   if (idx < 0 || idx >= in->narg) return Q2_NO_VALUE;
   if (in->arg[idx].kind != 'r') return Q2_NO_VALUE;
@@ -485,7 +557,7 @@ static int insn_load(const Q2Insn *in, Access *a) {
       a->kind = E_K_ELEM;
       a->key.kind = E_K_ELEM;
       a->key.a = (int64_t)obj;
-      a->key.b = (int64_t)idx;
+      a->key.b = (int64_t)fcanon(idx);
       break;
     }
     case ROP_get_length: {
@@ -567,7 +639,7 @@ static int insn_store(const Q2Insn *in, Access *a) {
       a->kind = E_K_ELEM;
       a->key.kind = E_K_ELEM;
       a->key.a = (int64_t)obj;
-      a->key.b = (int64_t)idx;
+      a->key.b = (int64_t)fcanon(idx);
       a->val = regval(in, 2);
       break;
     }
@@ -757,6 +829,15 @@ static void apply_store_kills(FactSet *s, const Access *stp) {
    miss is an exit and it is no safepoint. */
 int e_facts_pure_ok = 0;
 int (*e_facts_pure_call)(const Q2Func *fn, const Q2Insn *in) = NULL;
+
+/* A `new C(...)` of a field-fill constructor in a body whose construct exits on every miss (frameless and inlined bodies): its fast
+   arm takes a block from the cache and stores the fields, and the constructor it falls back to stores into the new object only, so
+   no JS that could change another object's shape runs. The loaded values die with it (the allocation may collect); the shape facts of
+   the live receivers stay. */
+int (*e_facts_pure_ctor)(const Q2Func *fn, const Q2Insn *in) = NULL;
+static int pure_ctor_ok(const Q2Func *fn, const Q2Insn *in) {
+  return e_facts_pure_ctor != NULL && in->rop == ROP_construct && e_facts_pure_ctor(fn, in);
+}
 
 static int pure_call_ok(const Q2Func *fn, const Q2Insn *in) {
   return e_facts_pure_ok && e_facts_pure_call != NULL &&
@@ -952,6 +1033,12 @@ int e_facts_group_layout(const Q2Func *fn, const EFacts *f, int g, int *pure) {
   if (pure != NULL) *pure = lay != 0 && nproto == 0;
   return lay;
 }
+int qjs_aot_store_xfer(const uint8_t dg[16], int site);
+static int xfer_site(const Q2Func *fn, int site) {
+  int osite;
+  const uint8_t *dg = e_site_dg(fn, site, &osite);
+  return dg != NULL && qjs_aot_store_xfer(dg, osite);
+}
 #define E_CLAIMG 4096
 static int group_layout(const Q2Func *fn, const EFacts *f, int g) {
   return e_facts_group_layout(fn, f, g >= E_CLAIMG ? g - E_CLAIMG : g, NULL);
@@ -1050,9 +1137,18 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
       }
       if (fs_has_shape(s, E_ARRV(rv), cls)) {
         f->arrskip[insn] = 1;
+        if (in->nuse > 1 && fs_has_shape(s, E_ARRV(rv), E_BNDGRP + (int)fcanon(in->use[1]))) f->bndskip[insn] = 1;
       } else {
         fs_drop_val(s, E_ARRV(rv));
         if (fs_add_shape(s, E_ARRV(rv), cls) < 0) return -1;
+      }
+      if (in->nuse > 1 && fs_add_shape(s, E_ARRV(rv), E_BNDGRP + (int)fcanon(in->use[1])) < 0) return -1;
+      if (cls == 0 && (in->rop == ROP_put_element || in->rop == ROP_put_element_xfer)) {
+        Access os;
+        if (insn_store(in, &os) && os.kind == E_K_ELEM) {
+          Q2ValueId w = fs_get_avail(s, &os.key);
+          if (w != Q2_NO_VALUE) f->oldelem[insn] = (int32_t)w + 1;
+        }
       }
       f->arr_used[rv] = 1;
       if (cls >= 101) f->arr_pk[rv] = 1;   /* a packed region: it has its own storage locals */
@@ -1071,6 +1167,11 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
     kind = E_SK_NOJS;
     f->purecall[insn] = 1;
     f->miss_exits[insn] = 1;
+    fs_kill(s, kp_safepoint, NULL);
+  }
+
+  if (grouped_exit && pure_ctor_ok(fn, in)) {
+    kind = E_SK_NOJS;
     fs_kill(s, kp_safepoint, NULL);
   }
 
@@ -1169,7 +1270,8 @@ static int transfer(const Q2Func *fn, EFacts *f, int insn, FactSet *s,
       } else if (fs_has_shape(s, rv, E_CLAIMG + g)) {
         f->claimskip[insn] |= (uint8_t)(1u << r);
       }
-      if (fs_add_shape(s, rv, g) < 0) return -1;
+      /* a transition store leaves the receiver in the shape of whichever branch ran (the group's overwrite or the cached add), so it proves nothing */
+      if (!(ref[r].is_store && ref[r].site >= 0 && xfer_site(fn, ref[r].site)) && fs_add_shape(s, rv, g) < 0) return -1;
       if (!ref[r].is_store && in->ndef == nr && r < in->ndef && in->def[r] != Q2_NO_VALUE &&
           in->def[r] < E_ARRV(0)) {
         int l = 0, sl = 0, osite, own = group_layout(fn, f, g), cl = 0, gg;
@@ -1809,6 +1911,7 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   e_facts_pm_exit_on = e_facts_pm_exit_scan(fn);
   FactSet cur;
   g_facts_fn = fn;
+  g_fc_fn = fn;
   FactSet *outs = NULL;
   int b, bi, i, k, rc = -1;
 
@@ -1828,6 +1931,8 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
   out->oldobj = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->elemreg = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->arrskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->bndskip = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
+  out->oldelem = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(int32_t));
   out->purecall = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
   out->laymask = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), sizeof(uint64_t));
   out->thislay = calloc((size_t)(fn->ninsns > 0 ? fn->ninsns : 1), 1);
@@ -1842,12 +1947,16 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
                        sizeof(*out->blocks));
   outs = calloc((size_t)(fn->nblocks > 0 ? fn->nblocks : 1), sizeof(*outs));
   if (out->fwd == NULL || out->access == NULL || out->skip == NULL || out->cellskip == NULL || out->claimskip == NULL || out->vclaim == NULL || out->oldval == NULL || out->oldobj == NULL || out->elemreg == NULL ||
-      out->arrskip == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL || out->thislay == NULL || out->noproto == NULL || out->cfwd == NULL ||
+      out->arrskip == NULL || out->bndskip == NULL || out->oldelem == NULL || out->arr_used == NULL || out->arr_pk == NULL || out->purecall == NULL || out->laymask == NULL || out->thislay == NULL || out->noproto == NULL || out->cfwd == NULL ||
       out->miss_exits == NULL || out->pmexit == NULL || out->blocks == NULL || outs == NULL)
     goto done;
   for (i = 0; i < fn->ninsns; i++) out->fwd[i] = Q2_NO_VALUE;
   if (build_groups(fn, out) < 0) goto done;
   if (plan_hoists(fn, out, grouped_exit) < 0) goto done;
+  if (out->nhoist > 0) {
+    out->hoist_have = calloc((size_t)out->nhoist, 1);
+    if (out->hoist_have == NULL) goto done;
+  }
 
   /* The blocks are visited in DFS reverse postorder, so every forward
      predecessor has been visited first and only a back edge can reach an
@@ -1918,6 +2027,25 @@ int e_facts_run(const Q2Func *fn, EFacts *out, int grouped_exit) {
         for (k = 0; k < out->nhoist; k++) {
           int pre = out->hoist_pre[k], j;
           if (out->hoist_hdr[k] != b) continue;
+          /* a receiver whose shape (or a cell) the preheader already established needs no check on the edge */
+          if (out->hoist_grp[k] <= -1000) {
+            if (fs_has_shape(&outs[pre], E_CELLV(out->hoist_val[k]), -1000 - out->hoist_grp[k])) out->hoist_have[k] = 1;
+          } else if (out->hoist_grp[k] >= 0 && out->hoist_grp[k] < E_CLAIMG &&
+                     (out->hoist_val[k] == E_THISV || out->hoist_val[k] < E_THISV)) {
+            int hv = out->hoist_val[k];
+            while (hv >= 0 && hv < E_THISV && hv < fn->nvalues && fn->values[hv].insn >= 0 &&
+                   out->fwd[fn->values[hv].insn] != Q2_NO_VALUE)
+              hv = (int)out->fwd[fn->values[hv].insn];
+            if (hv >= 0 && hv < E_THISV && hv < fn->nvalues && fn->values[hv].insn >= 0) {
+              const Q2Insn *di = &fn->insns[fn->values[hv].insn];
+              if ((di->rop == ROP_get_this_field || di->rop == ROP_get_this_field2) && di->ndef == 2 &&
+                  di->def[1] == (Q2ValueId)hv)
+                hv = E_THISV;
+            }
+            if (fs_has_shape(&outs[pre], out->hoist_val[k], out->hoist_grp[k]) ||
+                fs_has_shape(&outs[pre], hv, out->hoist_grp[k]))
+              out->hoist_have[k] = 1;
+          }
           for (j = 0; j < outs[pre].nshape; j++) {
             int lay_ok = !callsloop;
             if (callsloop && outs[pre].shape_val[j] < E_ARRV(0) && group_layout(fn, out, outs[pre].shape_grp[j]) != 0)
@@ -2054,6 +2182,7 @@ void e_facts_free(EFacts *f) {
   free(f->hoist_pre);
   free(f->hoist_val);
   free(f->hoist_grp);
+  free(f->hoist_have);
   free(f->fwd);
   free(f->access);
   free(f->skip);
@@ -2064,6 +2193,8 @@ void e_facts_free(EFacts *f) {
   free(f->oldobj);
   free(f->elemreg);
   free(f->arrskip);
+  free(f->bndskip);
+  free(f->oldelem);
   free(f->purecall);
   free(f->laymask);
   free(f->thislay);
@@ -2569,8 +2700,14 @@ static int plan_copy(
     if (*n >= 120) return 0;
     if (cg->len > inl_tiny() && *copied + cg->len > inl_budget() * (g_plan_poly ? 4 : 1)) return 0;
   } else if (*n >= (g_plan_poly ? 12 : 6) || *copied + cg->len > E_INLINE_COPY_BYTES * (g_plan_poly ? 4 : 1)) return 0;
-  for (k = 0; k < nchain; k++)
-    if (chain[k] == cg || memcmp(chain[k]->digest, cg->digest, 16) == 0) return 0;
+  {
+    /* a function already on the chain may be copied again up to QJS_AOT_INL_REC times (bounded unrolling of self and mutual recursion);
+       the copy at the bound keeps the call, which is the ordinary entry */
+    int seen = 0;
+    for (k = 0; k < nchain; k++)
+      if (chain[k] == cg || memcmp(chain[k]->digest, cg->digest, 16) == 0) seen++;
+    if (seen > (int)inl_knob("QJS_AOT_INL_REC", 1)) return 0;
+  }
   if (!inl_callee_ok(cg, has_recv, depth < 2 || inl_hot_on())) {
     if (getenv("QJS_AOT_DEBUG_INL")) fprintf(stderr, "  callee %s not ok: %s\n", cg->name, e_inl_why);
     return 0;

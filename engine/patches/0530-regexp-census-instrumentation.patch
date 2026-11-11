@@ -1,0 +1,665 @@
+Subject: RegExp census: per-regexp and per-builtin counters behind QJS_RE_STATS
+
+What this does
+  - quickjs.c: a statistics block before `js_string_match` and hooks in the RegExp and String builtins. With `QJS_RE_STATS=1` (report on stderr at exit) or `QJS_RE_STATS=<path>` the process counts, per regular expression (source + flags) and per builtin: calls, cycles, matcher attempts, hits, average match length, subject length, distance scanned before a hit or to the end on a miss, matcher strategy, capture groups, regexp objects created and `lre_compile` calls.
+  - `js_regexp_exec`, `test`, `[Symbol.match]`, `[Symbol.matchAll]`, `[Symbol.replace]`, `[Symbol.search]`, `[Symbol.split]` and `String.prototype.match/matchAll/search/replace/replaceAll/split` keep their names and addresses (the pristine-RegExp checks compare the function pointer) and become a wrapper over a `_body` function. `js_regexp_match` becomes a wrapper over `js_regexp_match_raw`.
+
+Why we need it
+  The regexp project orders its work by where the time goes per literal and per builtin; the interpreter profile only says "backtracking matcher 51%".
+
+Soundness
+  The variable is read once in a constructor function. With it unset every hook is one test of `re_st_on` and the behaviour is the original.
+
+Failure modes
+  Builtin cycle columns are inclusive (a replace that runs exec counts the exec time in both rows); the top-level total counts depth-0 calls only. A pattern with characters above 127 is keyed by UTF-8 bytes where it is compiled and by code units where the object is created, so those two counts land in different rows. More than 4096 distinct patterns share one overflow row.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -98165,9 +98165,333 @@
+     return 0;
+ }
+ 
++/* ==== RegExp census ====================================================== *
++ * Set QJS_RE_STATS=1 (report on stderr at exit) or QJS_RE_STATS=<path> to
++ * count, per regular expression (source + flags) and per builtin, the calls,
++ * the time (time-stamp counter), the matcher's work and the length of what it
++ * finds. Nothing is read or counted when the variable is unset: every hook is
++ * one test of 're_st_on'. Builtin cycle columns are inclusive: a replace that
++ * runs exec counts the exec time in both rows. */
++
++enum { RE_ST_EXEC, RE_ST_TEST, RE_ST_MATCH, RE_ST_MATCHALL, RE_ST_REPLACE,
++       RE_ST_SEARCH, RE_ST_SPLIT, RE_ST_NB };
++enum { RE_ST_S_MATCH, RE_ST_S_MATCHALL, RE_ST_S_SEARCH, RE_ST_S_REPLACE,
++       RE_ST_S_REPLACEALL, RE_ST_S_SPLIT, RE_ST_S_NB };
++static const char * const re_st_bname[RE_ST_NB] = {
++    "exec", "test", "@@match", "@@matchAll", "@@replace", "@@search", "@@split" };
++static const char * const re_st_sname[RE_ST_S_NB] = {
++    "match", "matchAll", "search", "replace", "replaceAll", "split" };
++
++typedef struct ReStEntry {
++    uint64_t hash;
++    uint8_t used;
++    uint16_t flags;
++    uint16_t capcnt;
++    uint16_t srclen;
++    char src[102];
++    uint64_t created, compiles, compile_cyc;
++    uint64_t bcalls[RE_ST_NB], bcyc[RE_ST_NB];
++    uint64_t mcalls, mcyc, mhits, mlen, mscan_hit, mscan_miss, mslen, mslen_max;
++    uint64_t mstrat[4];
++} ReStEntry;
++
++#define RE_ST_SLOTS 4096
++/* the flags a script can write: g i m s u y d v */
++#define RE_ST_FLAG_MASK 0x17f
++static int re_st_on;
++static int re_st_depth;
++static ReStEntry *re_st_tab;
++static uint32_t re_st_nent;
++static uint64_t re_st_ovf;
++static uint64_t re_st_top_cyc;
++static uint64_t re_st_gcalls[RE_ST_NB], re_st_gcyc[RE_ST_NB];
++static uint64_t re_st_scalls[RE_ST_S_NB][2], re_st_scyc[RE_ST_S_NB][2];
++static uint64_t re_st_compiles, re_st_compile_cyc, re_st_created;
++static char *re_st_path;
++
++static JSRegExp *js_get_regexp(JSContext *ctx, JSValueConst obj,
++                               bool throw_error);
++static void re_st_report(void);
++
++static inline uint64_t re_st_tsc(void)
++{
++#if defined(__x86_64__)
++    return __builtin_ia32_rdtsc();
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
++#endif
++}
++
++static __attribute__((constructor)) void re_st_init(void)
++{
++    const char *e = getenv("QJS_RE_STATS");
++    if (!e || !*e || (e[0] == '0' && !e[1]))
++        return;
++    re_st_on = 1;
++    if (!(e[0] == '1' && !e[1]))
++        re_st_path = strdup(e);
++    re_st_tab = calloc(RE_ST_SLOTS, sizeof(ReStEntry));
++    if (!re_st_tab)
++        re_st_on = 0;
++    else
++        atexit(re_st_report);
++}
++
++/* Entry for a pattern given as units of 8 or 16 bits plus its flag bits. */
++static ReStEntry *re_st_find(const void *s, size_t len, int wide, int flags)
++{
++    uint64_t h;
++    uint32_t i, probe;
++    size_t k;
++    ReStEntry *e;
++
++    flags &= RE_ST_FLAG_MASK;
++    h = 1469598103934665603ull ^ (uint64_t)flags;
++    for (k = 0; k < len; k++) {
++        h ^= wide ? ((const uint16_t *)s)[k] : ((const uint8_t *)s)[k];
++        h *= 1099511628211ull;
++    }
++    if (!h)
++        h = 1;
++    i = (uint32_t)(h >> 20) & (RE_ST_SLOTS - 1);
++    for (probe = 0; probe < RE_ST_SLOTS; probe++, i = (i + 1) & (RE_ST_SLOTS - 1)) {
++        e = &re_st_tab[i];
++        if (e->used) {
++            if (e->hash == h)
++                return e;
++            continue;
++        }
++        e->used = 1;
++        e->hash = h;
++        e->flags = (uint16_t)flags;
++        e->srclen = (uint16_t)(len > 0xffff ? 0xffff : len);
++        for (k = 0; k < len && k < sizeof(e->src) - 1; k++) {
++            unsigned c = wide ? ((const uint16_t *)s)[k] : ((const uint8_t *)s)[k];
++            e->src[k] = (c >= 32 && c < 127) ? (char)c : '?';
++        }
++        re_st_nent++;
++        return e;
++    }
++    re_st_ovf++;
++    return &re_st_tab[0];
++}
++
++static ReStEntry *re_st_entry(JSRegExp *re)
++{
++    const uint8_t *bc = str8(re->bytecode);
++    ReStEntry *e = re_st_find(strv(re->pattern), re->pattern->len,
++                              re->pattern->is_wide_char, lre_get_flags(bc));
++    e->capcnt = (uint16_t)lre_get_capture_count(bc);
++    return e;
++}
++
++/* one matcher attempt, called with the same arguments as the matcher */
++static int re_st_match_done(JSRegExp *re, JSString *str, int start_index,
++                            int strategy, int rc, uint8_t **capture,
++                            uint64_t t0)
++{
++    ReStEntry *e = re_st_entry(re);
++    uint64_t dt = re_st_tsc() - t0;
++    int shift = str->is_wide_char;
++
++    e->mcalls++;
++    e->mcyc += dt;
++    e->mslen += str->len;
++    if ((uint64_t)str->len > e->mslen_max)
++        e->mslen_max = str->len;
++    if (strategy >= 0 && strategy < 4)
++        e->mstrat[strategy]++;
++    if (rc == 1) {
++        size_t b = (size_t)(capture[0] - str8(str)) >> shift;
++        size_t n = (size_t)(capture[1] - capture[0]) >> shift;
++        e->mhits++;
++        e->mlen += n;
++        e->mscan_hit += b > (size_t)start_index ? b - (size_t)start_index : 0;
++    } else if (rc == 0) {
++        e->mscan_miss += str->len > start_index ? str->len - start_index : 0;
++    }
++    return rc;
++}
++
++static inline uint64_t re_st_begin(void)
++{
++    re_st_depth++;
++    return re_st_tsc();
++}
++
++static void re_st_end(int slot, uint64_t t0, JSRegExp *re)
++{
++    uint64_t dt = re_st_tsc() - t0;
++    re_st_depth--;
++    re_st_gcalls[slot]++;
++    re_st_gcyc[slot] += dt;
++    if (re_st_depth == 0)
++        re_st_top_cyc += dt;
++    if (re) {
++        ReStEntry *e = re_st_entry(re);
++        e->bcalls[slot]++;
++        e->bcyc[slot] += dt;
++    }
++}
++
++static void re_st_end_str(int slot, uint64_t t0, int arg_is_regexp)
++{
++    uint64_t dt = re_st_tsc() - t0;
++    re_st_depth--;
++    re_st_scalls[slot][arg_is_regexp]++;
++    re_st_scyc[slot][arg_is_regexp] += dt;
++    if (re_st_depth == 0)
++        re_st_top_cyc += dt;
++}
++
++static void re_st_note_created(JSRegExp *re)
++{
++    re_st_created++;
++    re_st_entry(re)->created++;
++}
++
++static void re_st_note_compile(const char *s, size_t len, int flags,
++                               uint64_t dt)
++{
++    ReStEntry *e = re_st_find(s, len, 0, flags);
++    re_st_compiles++;
++    re_st_compile_cyc += dt;
++    e->compiles++;
++    e->compile_cyc += dt;
++}
++
++static int re_st_cmp(const void *a, const void *b)
++{
++    const ReStEntry *x = a, *y = b;
++    uint64_t tx = x->mcyc + x->compile_cyc, ty = y->mcyc + y->compile_cyc;
++    uint64_t bx = 0, by = 0;
++    int i;
++    for (i = 0; i < RE_ST_NB; i++) { bx += x->bcyc[i]; by += y->bcyc[i]; }
++    if (bx > tx) tx = bx;
++    if (by > ty) ty = by;
++    return tx < ty ? 1 : tx > ty ? -1 : 0;
++}
++
++static void re_st_flagstr(int f, char *out)
++{
++    static const struct { int bit; char c; } m[] = {
++        { LRE_FLAG_GLOBAL, 'g' }, { LRE_FLAG_IGNORECASE, 'i' },
++        { LRE_FLAG_MULTILINE, 'm' }, { LRE_FLAG_DOTALL, 's' },
++        { LRE_FLAG_UNICODE, 'u' }, { LRE_FLAG_STICKY, 'y' },
++        { LRE_FLAG_INDICES, 'd' }, { LRE_FLAG_UNICODE_SETS, 'v' } };
++    size_t i, n = 0;
++    for (i = 0; i < countof(m); i++)
++        if (f & m[i].bit)
++            out[n++] = m[i].c;
++    out[n] = 0;
++}
++
++static void re_st_report(void)
++{
++    FILE *f = re_st_path ? fopen(re_st_path, "w") : stderr;
++    uint32_t i, n = 0;
++    ReStEntry *v;
++    double top = (double)re_st_top_cyc;
++    int k;
++    char fl[16];
++
++    if (!f)
++        f = stderr;
++    fprintf(f, "# regexp census (cycles are time-stamp counter ticks; builtin rows are inclusive)\n");
++    fprintf(f, "# top-level builtin cycles %llu, regexp objects created %llu, lre_compile %llu calls %llu cycles, table overflow %llu\n",
++            (unsigned long long)re_st_top_cyc, (unsigned long long)re_st_created,
++            (unsigned long long)re_st_compiles,
++            (unsigned long long)re_st_compile_cyc, (unsigned long long)re_st_ovf);
++    fprintf(f, "\n## RegExp.prototype builtins\n%-12s %12s %14s %8s\n",
++            "builtin", "calls", "cycles", "cyc/call");
++    for (k = 0; k < RE_ST_NB; k++)
++        if (re_st_gcalls[k])
++            fprintf(f, "%-12s %12llu %14llu %8llu\n", re_st_bname[k],
++                    (unsigned long long)re_st_gcalls[k],
++                    (unsigned long long)re_st_gcyc[k],
++                    (unsigned long long)(re_st_gcyc[k] / re_st_gcalls[k]));
++    fprintf(f, "\n## String.prototype builtins (arg: R = RegExp object, S = other)\n%-12s %3s %12s %14s %8s\n",
++            "builtin", "arg", "calls", "cycles", "cyc/call");
++    for (k = 0; k < RE_ST_S_NB; k++) {
++        int a;
++        for (a = 1; a >= 0; a--)
++            if (re_st_scalls[k][a])
++                fprintf(f, "%-12s %3s %12llu %14llu %8llu\n", re_st_sname[k],
++                        a ? "R" : "S", (unsigned long long)re_st_scalls[k][a],
++                        (unsigned long long)re_st_scyc[k][a],
++                        (unsigned long long)(re_st_scyc[k][a] / re_st_scalls[k][a]));
++    }
++    v = __builtin_malloc(sizeof(*v) * (re_st_nent ? re_st_nent : 1));
++    if (v) {
++        for (i = 0; i < RE_ST_SLOTS; i++)
++            if (re_st_tab[i].used)
++                v[n++] = re_st_tab[i];
++        qsort(v, n, sizeof(*v), re_st_cmp);
++        fprintf(f, "\n## per regexp (source + flags), by matcher+compile cycles; %u distinct\n", n);
++        fprintf(f, "# mcalls=matcher attempts, hit=found, mlen=avg match length, slen=avg subject length,\n"
++                   "# scan_hit/scan_miss=avg chars from start index to match / to end of subject,\n"
++                   "# strat=attempts by strategy generic/atom/prefix/first-set, caps=capture groups,\n"
++                   "# b:name=calls/cycles of each builtin on this regexp\n");
++        for (i = 0; i < n; i++) {
++            ReStEntry *e = &v[i];
++            re_st_flagstr(e->flags, fl);
++            fprintf(f, "\n/%s/%s%s len=%u caps=%u created=%llu compiles=%llu compile_cyc=%llu\n",
++                    e->src, fl, e->srclen >= sizeof(e->src) ? " (truncated)" : "",
++                    e->srclen, e->capcnt ? e->capcnt - 1 : 0,
++                    (unsigned long long)e->created,
++                    (unsigned long long)e->compiles,
++                    (unsigned long long)e->compile_cyc);
++            if (e->mcalls)
++                fprintf(f, "  mcalls=%llu hit=%llu cyc=%llu (%.1f%% of top) cyc/call=%llu mlen=%.1f slen=%.1f slen_max=%llu scan_hit=%.1f scan_miss=%.1f strat=%llu/%llu/%llu/%llu\n",
++                        (unsigned long long)e->mcalls, (unsigned long long)e->mhits,
++                        (unsigned long long)e->mcyc,
++                        top ? 100.0 * (double)e->mcyc / top : 0.0,
++                        (unsigned long long)(e->mcyc / e->mcalls),
++                        e->mhits ? (double)e->mlen / (double)e->mhits : 0.0,
++                        (double)e->mslen / (double)e->mcalls,
++                        (unsigned long long)e->mslen_max,
++                        e->mhits ? (double)e->mscan_hit / (double)e->mhits : 0.0,
++                        e->mcalls > e->mhits ? (double)e->mscan_miss / (double)(e->mcalls - e->mhits) : 0.0,
++                        (unsigned long long)e->mstrat[0], (unsigned long long)e->mstrat[1],
++                        (unsigned long long)e->mstrat[2], (unsigned long long)e->mstrat[3]);
++            for (k = 0; k < RE_ST_NB; k++)
++                if (e->bcalls[k])
++                    fprintf(f, "  b:%s calls=%llu cyc=%llu\n", re_st_bname[k],
++                            (unsigned long long)e->bcalls[k],
++                            (unsigned long long)e->bcyc[k]);
++        }
++        __builtin_free(v);
++    }
++    if (f != stderr)
++        fclose(f);
++}
++
++static JSValue js_string_match_body(JSContext *ctx, JSValueConst this_val,
++                                    int argc, JSValueConst *argv, int atom);
++
+ static JSValue js_string_match(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv, int atom)
+ {
++    uint64_t t0;
++    JSValue ret;
++    int slot, isre;
++
++    if (likely(!re_st_on))
++        return js_string_match_body(ctx, this_val, argc, argv, atom);
++    slot = atom == JS_ATOM_Symbol_match ? RE_ST_S_MATCH :
++           atom == JS_ATOM_Symbol_matchAll ? RE_ST_S_MATCHALL : RE_ST_S_SEARCH;
++    isre = js_get_regexp(ctx, argv[0], false) != NULL;
++    t0 = re_st_begin();
++    ret = js_string_match_body(ctx, this_val, argc, argv, atom);
++    re_st_end_str(slot, t0, isre);
++    return ret;
++}
++
++static JSValue js_string_match_body(JSContext *ctx, JSValueConst this_val,
++                               int argc, JSValueConst *argv, int atom)
++{
+     // match(rx), search(rx), matchAll(rx)
+     // atom is JS_ATOM_Symbol_match, JS_ATOM_Symbol_search, or JS_ATOM_Symbol_matchAll
+     JSValueConst O = this_val, regexp = argv[0], args[2];
+@@ -98323,10 +98647,31 @@
+     return JS_EXCEPTION;
+ }
+ 
++static JSValue js_string_replace_body(JSContext *ctx, JSValueConst this_val,
++                                      int argc, JSValueConst *argv,
++                                      int is_replaceAll);
++
+ static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv,
+                                  int is_replaceAll)
+ {
++    uint64_t t0;
++    JSValue ret;
++    int isre;
++
++    if (likely(!re_st_on))
++        return js_string_replace_body(ctx, this_val, argc, argv, is_replaceAll);
++    isre = js_get_regexp(ctx, argv[0], false) != NULL;
++    t0 = re_st_begin();
++    ret = js_string_replace_body(ctx, this_val, argc, argv, is_replaceAll);
++    re_st_end_str(is_replaceAll ? RE_ST_S_REPLACEALL : RE_ST_S_REPLACE, t0, isre);
++    return ret;
++}
++
++static JSValue js_string_replace_body(JSContext *ctx, JSValueConst this_val,
++                                 int argc, JSValueConst *argv,
++                                 int is_replaceAll)
++{
+     // replace(rx, rep)
+     JSValueConst O = this_val, searchValue = argv[0], replaceValue = argv[1];
+     JSValueConst args[6];
+@@ -98436,9 +98781,28 @@
+     return JS_EXCEPTION;
+ }
+ 
++static JSValue js_string_split_body(JSContext *ctx, JSValueConst this_val,
++                                    int argc, JSValueConst *argv);
++
+ static JSValue js_string_split(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+ {
++    uint64_t t0;
++    JSValue ret;
++    int isre;
++
++    if (likely(!re_st_on))
++        return js_string_split_body(ctx, this_val, argc, argv);
++    isre = js_get_regexp(ctx, argv[0], false) != NULL;
++    t0 = re_st_begin();
++    ret = js_string_split_body(ctx, this_val, argc, argv);
++    re_st_end_str(RE_ST_S_SPLIT, t0, isre);
++    return ret;
++}
++
++static JSValue js_string_split_body(JSContext *ctx, JSValueConst this_val,
++                               int argc, JSValueConst *argv)
++{
+     // split(sep, limit)
+     JSValueConst O = this_val, separator = argv[0], limit = argv[1];
+     JSValueConst args[2];
+@@ -99935,8 +100299,15 @@
+                            !(re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)));
+     if (!str)
+         return JS_EXCEPTION;
+-    re_bytecode_buf = lre_compile(&re_bytecode_len, error_msg,
+-                                  sizeof(error_msg), str, len, re_flags, ctx);
++    if (unlikely(re_st_on)) {
++        uint64_t t0 = re_st_tsc();
++        re_bytecode_buf = lre_compile(&re_bytecode_len, error_msg,
++                                      sizeof(error_msg), str, len, re_flags, ctx);
++        re_st_note_compile(str, len, re_flags, re_st_tsc() - t0);
++    } else {
++        re_bytecode_buf = lre_compile(&re_bytecode_len, error_msg,
++                                      sizeof(error_msg), str, len, re_flags, ctx);
++    }
+     JS_FreeCString(ctx, str);
+     if (!re_bytecode_buf) {
+         JS_ThrowSyntaxError(ctx, "%s", error_msg);
+@@ -100004,6 +100375,8 @@
+     re = &p->u.regexp;
+     js_regexp_set_compiled_data(re, JS_VALUE_GET_STRING(pattern),
+                                 JS_VALUE_GET_STRING(bc));
++    if (unlikely(re_st_on))
++        re_st_note_created(re);
+     return obj;
+ fail:
+     JS_FreeValue(ctx, bc);
+@@ -100944,8 +101317,8 @@
+ /* Run one match attempt starting at 'start_index', choosing the fastest
+    applicable strategy. Same return convention as lre_exec. */
+ static inline int
+-js_regexp_match(JSContext *ctx, uint8_t **capture, const JSRegExpExecData *d,
+-                JSRegExp *re, JSString *str, int start_index)
++js_regexp_match_raw(JSContext *ctx, uint8_t **capture, const JSRegExpExecData *d,
++                    JSRegExp *re, JSString *str, int start_index)
+ {
+     switch (d->strategy) {
+     case JS_REGEXP_MATCH_ATOM:
+@@ -100964,6 +101337,25 @@
+     }
+ }
+ 
++static int
++js_regexp_match_counted(JSContext *ctx, uint8_t **capture,
++                        const JSRegExpExecData *d, JSRegExp *re,
++                        JSString *str, int start_index)
++{
++    uint64_t t0 = re_st_tsc();
++    int rc = js_regexp_match_raw(ctx, capture, d, re, str, start_index);
++    return re_st_match_done(re, str, start_index, d->strategy, rc, capture, t0);
++}
++
++static inline int
++js_regexp_match(JSContext *ctx, uint8_t **capture, const JSRegExpExecData *d,
++                JSRegExp *re, JSString *str, int start_index)
++{
++    if (unlikely(re_st_on))
++        return js_regexp_match_counted(ctx, capture, d, re, str, start_index);
++    return js_regexp_match_raw(ctx, capture, d, re, str, start_index);
++}
++
+ /* Prepare the shared capture buffer and execution strategy. Callers retain
+    control over matching, lastIndex, and result construction. */
+ static inline bool
+@@ -100999,8 +101391,25 @@
+     return JS_ARR_VALS(p);
+ }
+ 
++static JSValue js_regexp_exec_body(JSContext *ctx, JSValueConst this_val,
++                                int argc, JSValueConst *argv);
++
+ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
+-                              int argc, JSValueConst *argv)
++                  int argc, JSValueConst *argv)
++{
++    uint64_t t0;
++    JSValue ret;
++
++    if (likely(!re_st_on))
++        return js_regexp_exec_body(ctx, this_val, argc, argv);
++    t0 = re_st_begin();
++    ret = js_regexp_exec_body(ctx, this_val, argc, argv);
++    re_st_end(RE_ST_EXEC, t0, js_get_regexp(ctx, this_val, false));
++    return ret;
++}
++
++static JSValue js_regexp_exec_body(JSContext *ctx, JSValueConst this_val,
++                       int argc, JSValueConst *argv)
+ {
+     int rc, capture_count, shift, index, i, re_flags, prop_flags;
+     JSRegExp *re = js_get_regexp(ctx, this_val, true);
+@@ -101442,8 +101851,25 @@
+     return js_regexp_exec(ctx, r, 1, &s);
+ }
+ 
++static JSValue js_regexp_test_body(JSContext *ctx, JSValueConst this_val,
++                                int argc, JSValueConst *argv);
++
+ static JSValue js_regexp_test(JSContext *ctx, JSValueConst this_val,
+-                              int argc, JSValueConst *argv)
++                  int argc, JSValueConst *argv)
++{
++    uint64_t t0;
++    JSValue ret;
++
++    if (likely(!re_st_on))
++        return js_regexp_test_body(ctx, this_val, argc, argv);
++    t0 = re_st_begin();
++    ret = js_regexp_test_body(ctx, this_val, argc, argv);
++    re_st_end(RE_ST_TEST, t0, js_get_regexp(ctx, this_val, false));
++    return ret;
++}
++
++static JSValue js_regexp_test_body(JSContext *ctx, JSValueConst this_val,
++                       int argc, JSValueConst *argv)
+ {
+     JSValue val;
+     bool ret;
+@@ -101470,8 +101896,25 @@
+     return js_bool(ret);
+ }
+ 
++static JSValue js_regexp_Symbol_match_body(JSContext *ctx, JSValueConst this_val,
++                                int argc, JSValueConst *argv);
++
+ static JSValue js_regexp_Symbol_match(JSContext *ctx, JSValueConst this_val,
+-                                      int argc, JSValueConst *argv)
++                  int argc, JSValueConst *argv)
++{
++    uint64_t t0;
++    JSValue ret;
++
++    if (likely(!re_st_on))
++        return js_regexp_Symbol_match_body(ctx, this_val, argc, argv);
++    t0 = re_st_begin();
++    ret = js_regexp_Symbol_match_body(ctx, this_val, argc, argv);
++    re_st_end(RE_ST_MATCH, t0, js_get_regexp(ctx, this_val, false));
++    return ret;
++}
++
++static JSValue js_regexp_Symbol_match_body(JSContext *ctx, JSValueConst this_val,
++                       int argc, JSValueConst *argv)
+ {
+     // [Symbol.match](str)
+     JSValueConst rx = this_val;
+@@ -101638,8 +102081,25 @@
+     return JS_EXCEPTION;
+ }
+ 
++static JSValue js_regexp_Symbol_matchAll_body(JSContext *ctx, JSValueConst this_val,
++                                int argc, JSValueConst *argv);
++
+ static JSValue js_regexp_Symbol_matchAll(JSContext *ctx, JSValueConst this_val,
+-                                         int argc, JSValueConst *argv)
++                  int argc, JSValueConst *argv)
++{
++    uint64_t t0;
++    JSValue ret;
++
++    if (likely(!re_st_on))
++        return js_regexp_Symbol_matchAll_body(ctx, this_val, argc, argv);
++    t0 = re_st_begin();
++    ret = js_regexp_Symbol_matchAll_body(ctx, this_val, argc, argv);
++    re_st_end(RE_ST_MATCHALL, t0, js_get_regexp(ctx, this_val, false));
++    return ret;
++}
++
++static JSValue js_regexp_Symbol_matchAll_body(JSContext *ctx, JSValueConst this_val,
++                       int argc, JSValueConst *argv)
+ {
+     // [Symbol.matchAll](str)
+     JSValueConst R = this_val;
+@@ -101784,8 +102244,25 @@
+     return res;
+ }
+ 
++static JSValue js_regexp_Symbol_replace_body(JSContext *ctx, JSValueConst this_val,
++                                int argc, JSValueConst *argv);
++
+ static JSValue js_regexp_Symbol_replace(JSContext *ctx, JSValueConst this_val,
+-                                        int argc, JSValueConst *argv)
++                  int argc, JSValueConst *argv)
++{
++    uint64_t t0;
++    JSValue ret;
++
++    if (likely(!re_st_on))
++        return js_regexp_Symbol_replace_body(ctx, this_val, argc, argv);
++    t0 = re_st_begin();
++    ret = js_regexp_Symbol_replace_body(ctx, this_val, argc, argv);
++    re_st_end(RE_ST_REPLACE, t0, js_get_regexp(ctx, this_val, false));
++    return ret;
++}
++
++static JSValue js_regexp_Symbol_replace_body(JSContext *ctx, JSValueConst this_val,
++                       int argc, JSValueConst *argv)
+ {
+     // [Symbol.replace](str, rep)
+     JSValueConst rx = this_val, rep = argv[1];
+@@ -101976,8 +102453,25 @@
+     return res;
+ }
+ 
++static JSValue js_regexp_Symbol_search_body(JSContext *ctx, JSValueConst this_val,
++                                int argc, JSValueConst *argv);
++
+ static JSValue js_regexp_Symbol_search(JSContext *ctx, JSValueConst this_val,
+-                                       int argc, JSValueConst *argv)
++                  int argc, JSValueConst *argv)
++{
++    uint64_t t0;
++    JSValue ret;
++
++    if (likely(!re_st_on))
++        return js_regexp_Symbol_search_body(ctx, this_val, argc, argv);
++    t0 = re_st_begin();
++    ret = js_regexp_Symbol_search_body(ctx, this_val, argc, argv);
++    re_st_end(RE_ST_SEARCH, t0, js_get_regexp(ctx, this_val, false));
++    return ret;
++}
++
++static JSValue js_regexp_Symbol_search_body(JSContext *ctx, JSValueConst this_val,
++                       int argc, JSValueConst *argv)
+ {
+     JSValueConst rx = this_val;
+     JSValue str, previousLastIndex, currentLastIndex, result, index;
+@@ -102172,8 +102666,25 @@
+ }
+ #endif /* JS_RE_PREFILTER -- js_regexp_split_fast */
+ 
++static JSValue js_regexp_Symbol_split_body(JSContext *ctx, JSValueConst this_val,
++                                int argc, JSValueConst *argv);
++
+ static JSValue js_regexp_Symbol_split(JSContext *ctx, JSValueConst this_val,
+-                                       int argc, JSValueConst *argv)
++                  int argc, JSValueConst *argv)
++{
++    uint64_t t0;
++    JSValue ret;
++
++    if (likely(!re_st_on))
++        return js_regexp_Symbol_split_body(ctx, this_val, argc, argv);
++    t0 = re_st_begin();
++    ret = js_regexp_Symbol_split_body(ctx, this_val, argc, argv);
++    re_st_end(RE_ST_SPLIT, t0, js_get_regexp(ctx, this_val, false));
++    return ret;
++}
++
++static JSValue js_regexp_Symbol_split_body(JSContext *ctx, JSValueConst this_val,
++                       int argc, JSValueConst *argv)
+ {
+     // [Symbol.split](str, limit)
+     JSValueConst rx = this_val;
