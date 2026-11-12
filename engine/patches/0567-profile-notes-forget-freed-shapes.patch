@@ -1,0 +1,223 @@
+Subject: Profile type notes forget freed and moved shapes
+
+What this does
+  - The profile build's type notes (aot_notes) name shapes by address without a reference. A shape that is freed (js_free_shape0), whose allocation is replaced (resize_properties) or compacted now marks its note dead and turns every note slot that named it as the value shape into "several" (aot_note_shape_freed). Two open-addressed tables find a shape's note and the shapes noted as value shapes; a dead note keeps its place in the probe chain, so a new shape at the same address starts a new note.
+
+Why we need it
+  In a 300 s typescript profile run the dump at JS_FreeRuntime (aot_dump_contents) read nt->sh->aot_prof_seen of a shape that was freed or moved: SIGSEGV, so octane.sh reported "typescript FAIL profile". Profile builds only (QJS_AOT_PROFILE).
+
+Soundness
+  No reference is taken, so shape copy-on-write behaviour in the profile run is unchanged. A shape edited or moved loses its notes (its facts are stale anyway); no address is read after its free, and address reuse cannot attribute a stale note to a new shape.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -3154,6 +3154,9 @@
+ static int JS_AddIntrinsicBasicObjects(JSContext *ctx);
+ static void js_free_shape(JSRuntime *rt, JSShape *sh);
+ static void js_free_shape_null(JSRuntime *rt, JSShape *sh);
++#if QJS_AOT_PROFILE
++static void aot_note_shape_freed(JSShape *sh);
++#endif
+ static inline JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p,
+                                                  JSAtom atom);
+ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
+@@ -9340,6 +9343,9 @@
+     js_aot_shape_stat[0]++;
+     if (sh->aot_observed) js_aot_shape_stat[1]++;
+ #endif
++#if QJS_AOT_PROFILE
++    aot_note_shape_freed(sh);
++#endif
+     if (sh->is_hashed)
+         js_shape_hash_unlink(rt, sh);
+     if (sh->proto != NULL) {
+@@ -10046,6 +10052,9 @@
+                 prop_hash_end(sh)[-h - 1] = i + 1;
+             }
+         }
++#if QJS_AOT_PROFILE
++        aot_note_shape_freed(old_sh);
++#endif
+         js_free(ctx, get_alloc_from_shape(old_sh));
+         /* A shape allocation was released outside js_free_shape0, so advance
+            shape_free_epoch too, or a stub cache entry keyed on this address
+@@ -10054,6 +10063,9 @@
+         ctx->rt->shape_obs_epoch++;
+     } else {
+         /* only resize the properties */
++#if QJS_AOT_PROFILE
++        aot_note_shape_freed(sh);
++#endif
+         list_del(&sh->header.link);
+         sh_alloc = js_realloc(ctx, get_alloc_from_shape(sh),
+                               get_shape_size(new_hash_size, new_size));
+@@ -10142,6 +10154,9 @@
+ 
+     js_aot_layout_leave(ctx->rt, p->shape);
+     p->shape = sh;
++#if QJS_AOT_PROFILE
++    aot_note_shape_freed(old_sh);
++#endif
+     js_free(ctx, get_alloc_from_shape(old_sh));
+     /* see resize_properties above */
+     ctx->rt->shape_free_epoch++;
+@@ -18878,15 +18893,127 @@
+ static int aot_nnotes, aot_capnotes;
+ static uint16_t aot_tag_class(JSValue v);
+ 
++/* The notes name shapes by address and hold no reference (a counted one would turn every in-place shape edit into a copy). A freed shape is
++   taken out at its free (aot_note_shape_freed): its note is marked dead, so a new shape at the same address starts a new note, and a note
++   slot that named it as the value shape becomes "several". Two open-addressed tables find a shape's note and the shapes that were ever noted
++   as a value shape; neither deletes (a dead note keeps its place in the probe chain). */
++#define AOT_NOTE_DEAD ((JSShape *)(uintptr_t)1)
++static int32_t *aot_nh;          /* shape -> note index + 1 */
++static uintptr_t *aot_vh;        /* shapes noted as a value shape */
++static uint32_t aot_nh_mask, aot_vh_mask, aot_vh_n;
++
++static uint32_t aot_ph(const void *p, uint32_t mask)
++{
++    return (uint32_t)(((uintptr_t)p >> 4) * 0x9E3779B1u >> 7) & mask;
++}
++
++static void aot_vh_add(JSShape *sh)
++{
++    uint32_t h;
++    if (aot_vh == NULL || (aot_vh_n + 1) * 2 > aot_vh_mask + 1) {
++        uintptr_t *old = aot_vh;
++        uint32_t om = aot_vh_mask, nm = old ? om * 2 + 1 : 1023, i;
++        uintptr_t *nt = (calloc)((size_t)nm + 1, sizeof(*nt));
++        if (nt == NULL)
++            return;
++        for (i = 0; old && i <= om; i++)
++            if (old[i]) {
++                h = aot_ph((void *)old[i], nm);
++                while (nt[h]) h = (h + 1) & nm;
++                nt[h] = old[i];
++            }
++        (free)(old);
++        aot_vh = nt;
++        aot_vh_mask = nm;
++    }
++    h = aot_ph(sh, aot_vh_mask);
++    while (aot_vh[h]) {
++        if (aot_vh[h] == (uintptr_t)sh)
++            return;
++        h = (h + 1) & aot_vh_mask;
++    }
++    aot_vh[h] = (uintptr_t)sh;
++    aot_vh_n++;
++}
++
++static int aot_vh_has(JSShape *sh)
++{
++    uint32_t h;
++    if (aot_vh == NULL)
++        return 0;
++    h = aot_ph(sh, aot_vh_mask);
++    while (aot_vh[h]) {
++        if (aot_vh[h] == (uintptr_t)sh)
++            return 1;
++        h = (h + 1) & aot_vh_mask;
++    }
++    return 0;
++}
++
++static int aot_nh_find(JSShape *sh)
++{
++    uint32_t h;
++    if (aot_nh == NULL)
++        return -1;
++    h = aot_ph(sh, aot_nh_mask);
++    while (aot_nh[h]) {
++        if (aot_notes[aot_nh[h] - 1].sh == sh)
++            return aot_nh[h] - 1;
++        h = (h + 1) & aot_nh_mask;
++    }
++    return -1;
++}
++
++static void aot_nh_insert(JSShape *sh, int idx)
++{
++    uint32_t h;
++    if (aot_nh == NULL || (uint32_t)(aot_nnotes + 1) * 2 > aot_nh_mask + 1) {
++        uint32_t nm = aot_nh ? aot_nh_mask * 2 + 1 : 1023, i;
++        int32_t *nt = (calloc)((size_t)nm + 1, sizeof(*nt));
++        if (nt == NULL)
++            return;
++        for (i = 0; i < (uint32_t)aot_nnotes; i++) {
++            if (i == (uint32_t)idx)
++                continue;
++            h = aot_ph(aot_notes[i].sh, nm);
++            while (nt[h]) h = (h + 1) & nm;
++            nt[h] = (int32_t)i + 1;
++        }
++        (free)(aot_nh);
++        aot_nh = nt;
++        aot_nh_mask = nm;
++    }
++    h = aot_ph(sh, aot_nh_mask);
++    while (aot_nh[h]) h = (h + 1) & aot_nh_mask;
++    aot_nh[h] = idx + 1;
++}
++
++static void aot_note_shape_freed(JSShape *sh)
++{
++    int i;
++    if (aot_nnotes == 0)
++        return;
++    if ((i = aot_nh_find(sh)) >= 0)
++        aot_notes[i].sh = AOT_NOTE_DEAD;
++    if (aot_vh_has(sh)) {
++        int k, sl;
++        for (k = 0; k < aot_nnotes; k++)
++            for (sl = 0; sl < AOT_NOTE_SLOTS; sl++)
++                if (aot_notes[k].vs[sl] == sh) {
++                    aot_notes[k].vs[sl] = NULL;
++                    aot_notes[k].multi[sl] = 1;
++                }
++    }
++}
++
+ static AotNote *aot_note_of(JSShape *sh)
+ {
+     static int last = -1;
+     int i;
+     if (last >= 0 && aot_notes[last].sh == sh)
+         return &aot_notes[last];
+-    for (i = 0; i < aot_nnotes; i++)
+-        if (aot_notes[i].sh == sh)
+-            goto found;
++    if ((i = aot_nh_find(sh)) >= 0)
++        goto found;
+     if (aot_nnotes == aot_capnotes) {
+         int nc = aot_capnotes ? aot_capnotes * 2 : 64;
+         AotNote *nn = (realloc)(aot_notes, sizeof(*nn) * (size_t)nc);
+@@ -18898,6 +19025,7 @@
+     memset(&aot_notes[aot_nnotes], 0, sizeof(aot_notes[0]));
+     aot_notes[aot_nnotes].sh = sh;
+     i = aot_nnotes++;
++    aot_nh_insert(sh, i);
+ found:
+     last = i;
+     return &aot_notes[i];
+@@ -18913,8 +19041,10 @@
+     n->types[slot] |= bit;
+     if (bit == AOT_TYPE_OBJECT) {
+         JSShape *vsh = JS_VALUE_GET_OBJ(v)->shape;
+-        if (n->vs[slot] == NULL)
++        if (n->vs[slot] == NULL) {
+             n->vs[slot] = vsh;
++            aot_vh_add(vsh);
++        }
+         else if (n->vs[slot] != vsh)
+             n->multi[slot] = 1;
+     }
+@@ -68940,7 +69070,7 @@
+     for (k = 0; k < aot_nnotes; k++) {
+         AotNote *nt = &aot_notes[k];
+         int sl;
+-        if (!nt->sh->aot_prof_seen || nt->sh->aot_prof_id >= nshapes)
++        if (nt->sh == AOT_NOTE_DEAD || !nt->sh->aot_prof_seen || nt->sh->aot_prof_id >= nshapes)
+             continue;
+         for (sl = 0; sl < AOT_NOTE_SLOTS && sl < AOT_PROF_MAX_SLOTS; sl++) {
+             AotCont *c = &tab[(size_t)nt->sh->aot_prof_id * AOT_PROF_MAX_SLOTS + (size_t)sl];

@@ -2786,8 +2786,7 @@ static int e_bodies_have_fused_site(const EmitBuf *eb, const EmitBuf *inl, const
 }
 static void e_nursery_decide(const EmitBuf *eb, const EmitBuf *inl, const char *sel, int n) {
   const char *e = getenv("QJS_AOT_NURSERY");
-  (void)eb; (void)inl; (void)sel; (void)n;
-  g_nursery_decided = (e == NULL || *e != '0');
+  g_nursery_decided = e != NULL && *e == '1' ? 1 : (e == NULL || *e != '0') && e_bodies_have_fused_site(eb, inl, sel, n);
 }
 static int e_nursery(void) { return g_nursery_decided > 0; }
 static uint8_t *g_inl_nx; /* the inline body exits through aot_nx_ */
@@ -3967,6 +3966,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.off_array_iter_obj, lay.off_array_iter_kind, lay.off_array_iter_idx,
           lay.array_iter_kind_value, lay.off_cfunc_cproto, lay.cfunc_cproto_iterator_next,
           lay.cfunc_cproto_generic_magic);
+      fprintf(lf, "#define QJS_AOT_OFF_SHAPE_YSITE %uu\n", lay.off_shape_ysite);
       /* Arrays that may hold int32 or double elements: every inline access of an array's elements
          refuses one whose kind byte is not zero. A holey array is the case the element path meets
          most often, so its byte is tested first and the kind byte only when that byte is clear:
@@ -6240,6 +6240,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define Q2_INC(v_) q2_inc_(v_)\n"
           "typedef struct { unsigned char *bump, *end; unsigned long long hdrw; unsigned stride, ready; unsigned char pad_[32]; } QjsYCls; extern QjsYCls qjs_ycls[16]; "
           "int qjs_y_refill(JSContext *, unsigned, unsigned, unsigned long long); void qjs_y_trip(JSContext *); void qjs_y_adopt(JSContext *, JSValue); void qjs_y_mut(void); void qjs_y_promote_v(JSContext *, JSValue);\n"
+          "typedef struct { unsigned char pre, tick; unsigned short pad_; unsigned made, surv, am_, as_, sp_[3]; } QjsYSite; extern QjsYSite qjs_ysite[4096]; unsigned qjs_y_site_assign(void *);\n"
           "extern JSObject **qjs_y_log; extern uint32_t qjs_y_n, qjs_y_cap, qjs_y_lim; void qjs_y_grow(void);\n"
           "#define Q2_YREG(p_) (((uintptr_t)(p_) >> 30) == (0x400000000000ull >> 30))\n"
           "static inline __attribute__((always_inline)) int q2_yis_(const unsigned char *p) { return Q2_YREG(p) && *(const int *)(p - QJS_AOT_RC_BACK) < 0; }\n"
@@ -6265,6 +6266,8 @@ int qjsaot_driver_main(int argc, char **argv) {
           f);
     else
       fputs(
+          "extern void qjs_aot_set_form(int);\n"
+          "static void __attribute__((constructor, unused)) qjs_aot_noyoung_reg(void) { qjs_aot_set_form(8); }\n"
           "#define q2_dupn(v_) q2_dup(v_)\n"
           "#define Q2_INC(v_) (++*(int *)((uint8_t *)JS_VALUE_GET_PTR(v_) - QJS_AOT_RC_BACK))\n"
           "#define Q2_YPRO(ctx_, recv_) ((void)0)\n"
@@ -6501,6 +6504,11 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (__builtin_expect(cap - 1u < QJS_AOT_OBJ_INLINE_PROPS, 1)) {\n"
         "    unsigned bsi_;\n"
         "    QjsYCls *yk_ = &qjs_ycls[cap];\n"
+        "    unsigned si_ = *(const unsigned short *)(sh + QJS_AOT_OFF_SHAPE_YSITE);\n"
+        "    QjsYSite *ys_;\n"
+        "    if (__builtin_expect(si_ == 0, 0)) si_ = qjs_y_site_assign((void *)sh);\n"
+        "    ys_ = &qjs_ysite[si_];\n"
+        "    if (__builtin_expect(ys_->pre, 0) && (++ys_->tick & 63)) goto y_old;\n"
         "    if (__builtin_expect((uintptr_t)yk_->bump + yk_->stride > (uintptr_t)yk_->end, 0)) {\n"
         "      bsi_ = q2_plain_bsi[cap]; if (!qjs_y_refill(ctx, cap, bsi_, QJS_AOT_PLAIN_GCBYTE)) goto y_old;\n"
         "    }\n"
@@ -6510,6 +6518,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      JSValue *pr = (JSValue *)(p + QJS_AOT_OFF_OBJECT_U);\n"
         "      yk_->bump += yk_->stride;\n"
         "      *(unsigned long long *)(p - 8) = yk_->hdrw;\n"
+        "      ys_->made++;\n"
+        "      *(unsigned *)p = si_;\n"
         "      *(unsigned long long *)(p + QJS_AOT_OFF_JSOBJECT_FLAGS_BYTE) = q2_plain_hdr[cap] | ((0x80ull << 40) | qjs_y_ep48);\n"
         "      *(const void **)(p + QJS_AOT_OFF_JSOBJECT_SHAPE) = sh;\n"
         "      *(unsigned char **)(p + QJS_AOT_OFF_JSOBJECT_PROP) = p + QJS_AOT_OFF_OBJECT_U;\n"

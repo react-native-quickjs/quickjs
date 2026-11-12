@@ -408,6 +408,12 @@ def main():
         args.cc += extra
         if args.hot_cc:
             args.hot_cc += extra
+    # Full debug info doubles the compile time of a unit part and multiplies its memory by up to six (the type and variable records of the engine
+    # headers are emitted per part); line tables keep profilers, backtraces and the frame names working. QJS_UNIT_FULLDEBUG=1 keeps -g as given.
+    if not os.environ.get('QJS_UNIT_FULLDEBUG'):
+        args.cc = re.sub(r'(?<=\s)-g(?=\s|$)', '-g1', args.cc)
+        if args.hot_cc:
+            args.hot_cc = re.sub(r'(?<=\s)-g(?=\s|$)', '-g1', args.hot_cc)
     # QJS_AOT_RAT: the unit's frames are named from return addresses. The objects carry line tables and keep frame pointers; calls are not
     # turned into jumps; rat-table.py reads the tables into a table object that is linked with the unit.
     head = open(args.unit, errors='replace').read(1 << 20)

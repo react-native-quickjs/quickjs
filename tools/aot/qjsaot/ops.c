@@ -9196,6 +9196,55 @@ static int emit_fl_alloc_op(
   return 1;
 }
 
+/* The local slot of `s += x` when the string comes from `get_local S` and goes only to `put_local S`: the variable then owns the string (a count of one)
+   and the store gives the same pointer back, so the append may extend it in place. -1 when the data flow is anything else. The old value must have
+   no other use (no copy in a register), the new one only the store. */
+static int e_local_slot_of_get(const Q2Insn *di) {
+  if (di->rop >= ROP_get_local_s0 && di->rop <= ROP_get_local_s3) return di->rop - ROP_get_local_s0;
+  if (di->rop == ROP_get_local && di->narg >= 2 && di->arg[1].kind == 'u') return (int)di->arg[1].val;
+  return -1;
+}
+static int e_local_slot_of_put(const Q2Insn *xi) {
+  if (xi->rop >= ROP_put_local_s0 && xi->rop <= ROP_put_local_s3) return xi->rop - ROP_put_local_s0;
+  if (xi->rop >= ROP_put_local_xfer_s0 && xi->rop <= ROP_put_local_xfer_s3) return xi->rop - ROP_put_local_xfer_s0;
+  if ((xi->rop == ROP_put_local || xi->rop == ROP_put_local_xfer) && xi->narg >= 2 && xi->arg[0].kind == 'u') return (int)xi->arg[0].val;
+  return -1;
+}
+static int e_append_varslot(const Q2Func *fn, const Q2Insn *in) {
+  Q2ValueId vo, vn;
+  const Q2Insn *di;
+  int slot, x, u, b, si, k, nput = 0;
+
+  if (in->nuse < 1 || in->ndef < 1) return -1;
+  vo = in->use[0];
+  vn = in->def[0];
+  if (vo >= (Q2ValueId)fn->nvalues || vn >= (Q2ValueId)fn->nvalues || fn->values[vo].insn < 0) return -1;
+  di = &fn->insns[fn->values[vo].insn];
+  slot = e_local_slot_of_get(di);
+  if (slot < 0) return -1;
+  for (x = 0; x < fn->ninsns; x++) {
+    const Q2Insn *xi = &fn->insns[x];
+    if (xi == in) continue;
+    for (u = 0; u < xi->nuse; u++) {
+      if (xi->use[u] == vo) return -1;
+      if (xi->use[u] == vn) {
+        if (e_local_slot_of_put(xi) != slot) return -1;
+        nput++;
+      }
+    }
+    for (u = 0; u < xi->win_n && xi->win_val != NULL; u++)
+      if (xi->win_val[u] == vo || xi->win_val[u] == vn) return -1;
+  }
+  if (nput != 1) return -1;
+  for (b = 0; b < fn->nblocks; b++) {
+    const Q2Block *p = &fn->blocks[b];
+    for (si = 0; si < p->nsucc && si < 2; si++)
+      for (k = 0; k < p->nedge_args[si]; k++)
+        if (p->edge_arg[si][k] == vo || p->edge_arg[si][k] == vn) return -1;
+  }
+  return slot;
+}
+
 /* Whether the string that `s += <constant>` extends can be held by no other register. Compiled
    code then tells the engine to skip its scan of the frame for another holder. The proof is
    about the data flow of the function:
@@ -9461,7 +9510,9 @@ static int emit_alloc_op(
       else
         snprintf(call, sizeof(call),
                  "qjs_aot_binary_rr(ctx, f, %d, AOT_REG(fr, %d), AOT_REG(fr, %d), %d, %d, &_o)",
-                 (int)in->sub, ao, bo, dreg, ao / 16);
+                 (int)in->sub | ((in->rop == ROP_add && in->sub == REG_BIN_ADD && dreg == ao / 16 && getenv("QJS_AOT_NOVARAPP") == NULL &&
+                                  e_append_varslot(fn, in) >= 0) ? 0x100 : 0),
+                 ao, bo, dreg, ao / 16);
       break;
     }
     case ROP_load_const:

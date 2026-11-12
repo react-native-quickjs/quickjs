@@ -1,0 +1,84 @@
+Subject: String append in place when the one count is the local slot that takes the result back
+
+What this does
+  - Compiled `s += x` whose left operand comes from `get_local S` (the old value used nowhere else, no window or edge copy) and whose result goes only to `put_local S` is emitted with a flag (0x100 in the sub argument of qjs_aot_binary_rr).
+  - regvm_accum_append_u takes a new argument own1: with it a string of count one is extended in place (or regrown), as the slot is the one holder and gets the same pointer back.
+
+Why we need it
+  pdfjs builds strings in variables (Type1Parser eexecStr += ...). The string is owned by the slot, so the in-place test (count 0 and parked) failed every time and each append copied the whole string. pdfjs AOT 7759 -> 10312.
+
+Soundness
+  Count one with the slot as the only user of the old value and of the new one: no other holder can see the longer string. Register and argument aliases are still scanned. QJS_AOT_NOVARAPP=1 in the generator turns the flag off.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -29933,7 +29933,7 @@
+    (compiled code proves it from the function's data flow), so the register scan is skipped. */
+ static int regvm_accum_append_u(JSContext *ctx, JSFunctionBytecode *b,
+                                 JSValue *fr, JSValue *arg_buf, int argc,
+-                                int d, int a, JSValue op2, int unique)
++                                int d, int a, JSValue op2, int unique, int own1)
+ {
+ #if QJS_DRC
+     JSString *p1, *p2;
+@@ -29958,8 +29958,8 @@
+         ACC_WHY(p1->atom_type != 0 ? AC_ATOM : AC_KIND);
+         return 0;
+     }
+-    /* No counted owner, and parked: a register-only value. */
+-    if (JS_REF_COUNT(p1) != 0 || !JS_GC_IN_ZCT(p1)) {
++    /* No counted owner and parked (a register-only value), or, when the caller says the one count is the local slot that takes the result back, that count. */
++    if (!(JS_REF_COUNT(p1) == 0 && JS_GC_IN_ZCT(p1)) && !(own1 && JS_REF_COUNT(p1) == 1)) {
+         ACC_WHY(AC_OWNED);
+         return 0;
+     }
+@@ -30046,7 +30046,7 @@
+     }
+ #else
+     (void)ctx; (void)b; (void)fr; (void)arg_buf; (void)argc;
+-    (void)d; (void)a; (void)op2; (void)unique;
++    (void)d; (void)a; (void)op2; (void)unique; (void)own1;
+     return 0;
+ #endif
+ }
+@@ -30055,7 +30055,7 @@
+                                      JSValue *fr, JSValue *arg_buf, int argc,
+                                      int d, int a, JSValue op2)
+ {
+-    return regvm_accum_append_u(ctx, b, fr, arg_buf, argc, d, a, op2, 0);
++    return regvm_accum_append_u(ctx, b, fr, arg_buf, argc, d, a, op2, 0, 0);
+ }
+ 
+ static __exception int js_regvm_unary(JSContext *ctx, int subop, JSValue v,
+@@ -73151,14 +73151,14 @@
+ 
+     if (kind == REG_CONST_CPOOL) {
+         r = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra,
+-                                 f->b->cpool[idx], unique);
++                                 f->b->cpool[idx], unique, 0);
+         ACC_NOTE();
+         return r;
+     }
+     cst = JS_AtomToValue(ctx, (JSAtom)idx);
+     if (JS_IsException(cst))
+         return -1;
+-    r = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra, cst, unique);
++    r = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra, cst, unique, 0);
+     ACC_NOTE();
+     JS_FreeValue(ctx, cst);
+     return r;
+@@ -73170,10 +73170,13 @@
+ QJS_AOT_STUB int qjs_aot_binary_rr(JSContext *ctx, JSRegRun *f, int sub, JSValue a,
+                                    JSValue b, int d, int ra, JSValue *out)
+ {
++    int own1 = (sub & 0x100) != 0;
++
++    sub &= 0xff;
+     if (regvm_num_fast(sub, a, b, out))
+         return 1;
+     if (sub == REG_BIN_ADD) {
+-        int ar = regvm_accum_append(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b);
++        int ar = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b, 0, own1);
+ 
+         ACC_NOTE();
+         if (ar > 0)

@@ -2601,6 +2601,7 @@ struct JSShape {
        table): freeing or editing it in place moves shape_obs_epoch, which those tables validate instead of shape_free_epoch, so the
        churn of unobserved shapes costs them nothing. Also set when a PIC cell holds the shape (the counters). */
     uint8_t aot_observed;
+    uint16_t y_site; /* index of this shape's allocation-site record in qjs_ysite (0: none yet) */
     uint32_t hash; /* current hash value */
     uint32_t prop_hash_mask;
     int prop_size; /* allocated properties */
@@ -3153,6 +3154,9 @@ static void async_func_mark(JSRuntime *rt, JSAsyncFunctionState *s,
 static int JS_AddIntrinsicBasicObjects(JSContext *ctx);
 static void js_free_shape(JSRuntime *rt, JSShape *sh);
 static void js_free_shape_null(JSRuntime *rt, JSShape *sh);
+#if QJS_AOT_PROFILE
+static void aot_note_shape_freed(JSShape *sh);
+#endif
 static inline JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p,
                                                  JSAtom atom);
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
@@ -3341,7 +3345,11 @@ static inline __attribute__((always_inline)) void y_note(void *p) { if (unlikely
 #endif
 #define Y_RCB 0x80000000u /* a young cell's count carries this bias until it is promoted: the sign bit marks it */
 #define Y_RCN(rc) ((int)((uint32_t)(rc) - Y_RCB))
-static __attribute__((noinline, preserve_all)) void y_dup_young(void *p) { if (Y_RCN(JS_REF_COUNT(p)) <= 2) y_note(p); }
+/* A linked unit without young-cell forms: the heap and compiled code never see a nursery cell. A counted reference promotes the cell, and the places a
+   register-held cell reaches compiled code (a call into a compiled body, the return of a call) promote it. */
+static int y_formless;
+static void y_promote_now(JSObject *p);
+static __attribute__((noinline, preserve_all)) void y_dup_young(void *p) { if (unlikely(y_formless)) { y_promote_now((JSObject *)p); return; } if (Y_RCN(JS_REF_COUNT(p)) <= 2) y_note(p); }
 static inline __attribute__((always_inline)) JSValue js_dup(JSValueConst v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
@@ -4821,6 +4829,9 @@ static inline unsigned long long JS_PLAIN_GCBYTE(void)
     }
     return js_plain_gcbyte_v;
 }
+typedef struct YSite { uint8_t pre, tick; uint16_t pad; uint32_t made, surv, am, as, sp[3]; } YSite; /* made/surv: this collection epoch; am/as: accumulated */
+YSite qjs_ysite[4096];
+static uint32_t y_site_n = 1;
 static uint64_t y_cyc[8], y_cnt[16], y_pinr, y_pinv;
 uint64_t qjs_y_ep48 = (uint64_t)1 << 48; static uint32_t y_epoch = 1;
 static uint64_t ss_stat[8];
@@ -4828,6 +4839,22 @@ static_assert(offsetof(JSObject, arr_kind) == 21, "young flag byte");
 #define Y_KIND(p) (((uint8_t *)(p))[21])
 static inline int y_is(const void *p) { unsigned m; if (!Y_REG(p)) return 0; m = ((YChunk *)((uintptr_t)p & ~(uintptr_t)65535))->ymode; return m == 1 || (m == 2 && Y_KIND(p) == 0x80); }
 #define Y_IS(p) y_is(p)
+static void y_formless_args_slow(JSValue this_obj, const JSValue *argv, int na)
+{
+    int k;
+    if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(this_obj)) && Y_YOUNG(JS_VALUE_GET_PTR(this_obj)))
+        y_promote_now(JS_VALUE_GET_OBJ(this_obj));
+    for (k = 0; k < na; k++)
+        if (JS_VALUE_GET_TAG(argv[k]) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(argv[k])) && Y_YOUNG(JS_VALUE_GET_PTR(argv[k])))
+            y_promote_now(JS_VALUE_GET_OBJ(argv[k]));
+}
+/* A call into compiled code that has no young-cell forms: the cells the caller's registers name are promoted first. */
+#define Y_FORMLESS_ARGS(this_, argv_, na_) do { \
+        if (unlikely(y_formless)) { \
+            JSValue ft_ = (this_); const JSValue *fa_ = (const JSValue *)(argv_); int fn_ = (na_), fk_, fo_ = JS_VALUE_GET_TAG(ft_) == JS_TAG_OBJECT; \
+            for (fk_ = 0; fk_ < fn_ && !fo_; fk_++) fo_ = JS_VALUE_GET_TAG(fa_[fk_]) == JS_TAG_OBJECT; \
+            if (fo_) y_formless_args_slow(ft_, fa_, fn_); \
+        } } while (0)
 #define Y_VAL(v) (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(v)))
 static int y_tsc_on = -1;
 static inline uint64_t y_tsc(void) { if (unlikely(y_tsc_on < 0)) y_tsc_on = getenv("QJS_Y_STATS") != NULL; return y_tsc_on ? __builtin_ia32_rdtsc() : 0; }
@@ -4841,30 +4868,13 @@ static void y_vec_push(YChunk ***v, uint32_t *n, uint32_t *cap, YChunk *c) {
    allocations the cells that left the nursery as ordinary objects are counted; when (nearly) all of them did (a program that builds a
    long-lived structure), the nursery hands out no chunk for a while, so compiled code allocates counted objects and the reconcile is
    count-paced again. A refused request costs the caller one old-form allocation; the next window is measured afresh. */
-#define Y_WIN_CELLS 32768ull
-#define Y_PAUSE_REQS (1u << 20)
-static uint64_t y_win_a, y_win_p;
-static uint32_t y_pause;
-static int y_gate_prev;
+static int y_gate_want;
+static uint32_t y_pre_n; /* sites whose cells are made old */
 int qjs_y_refill(JSContext *ctx, unsigned idx, unsigned bsi, unsigned long long gcw)
 {
     YChunk *c;
     JSRuntime *rt = ctx->rt;
     YCls *k = &qjs_ycls[idx];
-    if (y_pause) {
-        if (--y_pause == 0 && !y_gate_fixed) qjs_y_gate = y_gate_prev;
-        return 0;
-    }
-    if (y_cnt[1] + y_abytes - y_win_a >= Y_WIN_CELLS) {
-        uint64_t left = y_cnt[10] + y_cnt[2] - y_win_p, made = y_cnt[1] + y_abytes - y_win_a;
-        y_win_a = y_cnt[1] + y_abytes; y_win_p = y_cnt[10] + y_cnt[2];
-        if (left * 100 >= made * 98) {
-            y_pause = Y_PAUSE_REQS;
-            y_gate_prev = qjs_y_gate;
-            if (!y_gate_fixed) qjs_y_gate = 0;
-            return 0;
-        }
-    }
     if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) != rt) {
         JSRuntime *exp = NULL;
         if (!__atomic_compare_exchange_n(&y_rt, &exp, rt, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
@@ -4923,6 +4933,7 @@ void qjs_y_dump_sites(void) { for (int i = 0; i < 256; i++) if (y_site[i].n > 10
 static __attribute__((destructor)) void y_dump(void) {
     uint32_t i, ret = 0, retlive = 0;
     if (!getenv("QJS_Y_STATS")) return;
+    { unsigned q; for (q = 1; q < y_site_n; q++) if (qjs_ysite[q].am + qjs_ysite[q].made > 0) fprintf(stderr, "ysite %u pre=%u am=%u as=%u\n", q, qjs_ysite[q].pre, qjs_ysite[q].am, qjs_ysite[q].as); }
     for (i = 0; i < y_region_next; i++) if (((YChunk *)(Y_BASE + (uint64_t)i * y_chunk_sz))->live) { ret++; retlive += ((YChunk *)(Y_BASE + (uint64_t)i * y_chunk_sz))->live; }
     if (getenv("QJS_Y_LEAK")) {
         int shown = 0;
@@ -5005,7 +5016,7 @@ static void y_runtime_free(JSRuntime *rt)
         y_pool[y_pool_n++] = c;
     }
     for (kb = 0; kb < 16; kb++) { YCls *k = &qjs_ycls[kb]; k->cur = NULL; k->bump = (uint8_t *)1; k->end = NULL; k->rec_n = 0; }
-    y_nurs_n = 0; y_roots_n = 0; y_livecells = 0; y_budget = 0; y_abytes = 0; y_win_a = y_win_p = 0; y_pause = 0;
+    y_nurs_n = 0; y_roots_n = 0; y_livecells = 0; y_budget = 0; y_abytes = 0;
     __atomic_store_n(&y_rt, NULL, __ATOMIC_RELEASE);
 }
 static void y_chunk_free_cell(void *ptr) {
@@ -5014,9 +5025,39 @@ static void y_chunk_free_cell(void *ptr) {
     Y_KIND(ptr) = 0x20; y_livecells--;
     if (--c->live == 0 && !c->ymode) y_chunk_release(c);
 }
+/* Pretenuring. Each shape that nursery cells are made with owns a site record: how many young cells were made with it and how many were promoted. A
+   site whose cells almost all survive makes them old (one in 64 stays young to keep measuring); the nursery itself stays on for every other site. A
+   young cell keeps its site index in the first word of its (unused) list link. */
+uint32_t qjs_y_site_assign(JSShape *sh) {
+    if (!sh->y_site) sh->y_site = y_site_n < 4096 ? (uint16_t)y_site_n++ : 0;
+    return sh->y_site;
+}
+static inline void y_site_promoted(uint32_t si) { if (si) qjs_ysite[si].surv++; }
+/* At the end of a young collection every cell made in the epoch has either been promoted or died, so made/surv are exact; the decision is taken on the
+   accumulated counts. */
+static void y_site_eval(void) {
+    uint32_t q;
+    for (q = 1; q < y_site_n; q++) {
+        YSite *s = &qjs_ysite[q];
+        uint8_t was;
+        if (!s->made && !s->surv) continue;
+        s->am += s->made; s->as += s->surv; s->made = s->surv = 0;
+        if (s->am < 256) continue;
+        was = s->pre;
+        if ((uint64_t)s->as * 100 >= (uint64_t)s->am * 98) s->pre = 1;
+        else if ((uint64_t)s->as * 100 < (uint64_t)s->am * 95) s->pre = 0;
+        s->am >>= 1; s->as >>= 1;
+        if (s->pre != was) {
+            y_pre_n += s->pre ? 1 : -1;
+            /* With cells made old the parked garbage is freed in small batches (the reconcile gate is lifted), not in one large cold walk at a trip. */
+            if (y_gate_want && !y_gate_fixed) qjs_y_gate = y_pre_n == 0;
+        }
+    }
+}
 /* A young cell becomes an ordinary old object: its edges are counted, it takes its shape reference and joins the object list. */
 static inline void y_promote_cell(JSObject *p) {
-    JSShape *sh = p->shape; JSShapeProperty *pr = get_shape_prop(sh); int j;
+    JSShape *sh = p->shape;
+    y_site_promoted(*(uint32_t *)p); JSShapeProperty *pr = get_shape_prop(sh); int j;
     for (j = 0; j < sh->prop_count; j++, pr++) {
         JSValue v;
         if (pr->flags & JS_PROP_TMASK) continue;
@@ -5071,10 +5112,11 @@ __attribute__((constructor)) static void js_drc_repark_init(void)
     {
         extern const uint32_t qjs_aot_count __attribute__((weak));
         if (&qjs_aot_count != NULL && qjs_aot_count > 0 && !y_gate_fixed)
-            qjs_y_gate = 1;
+            qjs_y_gate = y_gate_want = 1;
     }
 #endif
     if (getenv("QJS_NONURSERY")) y_interp_on = 0;
+    if (getenv("QJS_FORMLESS")) y_formless = 1;
     if (getenv("QJS_Y_GATE")) { qjs_y_gate = atoi(getenv("QJS_Y_GATE")); y_gate_fixed = 1; }
     if (getenv("QJS_DRC_MINLIM")) js_drc_minlim = (uint32_t)atoi(getenv("QJS_DRC_MINLIM"));
     if (getenv("QJS_DRC_SLACK_MB")) js_drc_slack_min = (size_t)atoi(getenv("QJS_DRC_SLACK_MB")) << 20;
@@ -9186,6 +9228,7 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh->parent = NULL;
     sh->layout_id = 0;
     sh->aot_observed = 0;
+    sh->y_site = 0;
     return sh;
 }
 
@@ -9304,6 +9347,9 @@ static void js_free_shape0(JSRuntime *rt, JSShape *sh)
 #ifdef QJS_AOT_BUMPSTATS
     js_aot_shape_stat[0]++;
     if (sh->aot_observed) js_aot_shape_stat[1]++;
+#endif
+#if QJS_AOT_PROFILE
+    aot_note_shape_freed(sh);
 #endif
     if (sh->is_hashed)
         js_shape_hash_unlink(rt, sh);
@@ -10011,6 +10057,9 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
                 prop_hash_end(sh)[-h - 1] = i + 1;
             }
         }
+#if QJS_AOT_PROFILE
+        aot_note_shape_freed(old_sh);
+#endif
         js_free(ctx, get_alloc_from_shape(old_sh));
         /* A shape allocation was released outside js_free_shape0, so advance
            shape_free_epoch too, or a stub cache entry keyed on this address
@@ -10019,6 +10068,9 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
         ctx->rt->shape_obs_epoch++;
     } else {
         /* only resize the properties */
+#if QJS_AOT_PROFILE
+        aot_note_shape_freed(sh);
+#endif
         list_del(&sh->header.link);
         sh_alloc = js_realloc(ctx, get_alloc_from_shape(sh),
                               get_shape_size(new_hash_size, new_size));
@@ -10107,6 +10159,9 @@ static int compact_properties(JSContext *ctx, JSObject *p)
 
     js_aot_layout_leave(ctx->rt, p->shape);
     p->shape = sh;
+#if QJS_AOT_PROFILE
+    aot_note_shape_freed(old_sh);
+#endif
     js_free(ctx, get_alloc_from_shape(old_sh));
     /* see resize_properties above */
     ctx->rt->shape_free_epoch++;
@@ -10414,6 +10469,10 @@ static inline __attribute__((always_inline)) JSValue js_new_plain_object_ex(JSCo
            promoted; a count of one (plus the young bias) is the creator's, and the collection that follows an allocation window finds it
            dead when nothing noted or pinned it. */
         YCls *yk_ = &qjs_ycls[cap];
+        uint32_t si_ = sh->y_site ? sh->y_site : qjs_y_site_assign(sh);
+        YSite *ys_ = &qjs_ysite[si_];
+        if (unlikely(ys_->pre) && (++ys_->tick & 63))
+            goto y_old;
         if (unlikely((uintptr_t)yk_->bump + yk_->stride > (uintptr_t)yk_->end)) {
             if (!qjs_y_refill(ctx, cap, js_plain_obj_bsi[cap], JS_PLAIN_GCBYTE()))
                 goto y_old;
@@ -10423,6 +10482,8 @@ static inline __attribute__((always_inline)) JSValue js_new_plain_object_ex(JSCo
             p = (JSObject *)(c_ + 8);
             yk_->bump = c_ + yk_->stride;
             *(uint64_t *)c_ = yk_->hdrw;
+            ys_->made++;
+            *(uint32_t *)p = si_;
             memset((uint8_t *)p + offsetof(JSObject, class_id) - 2, 0, 8);
             p->extensible = true;
             p->prop_inline_cap = cap;
@@ -10931,6 +10992,7 @@ static JSValue js_new_young_array(JSContext *ctx, const JSValue *src, int count)
     p = (JSObject *)(c_ + 8);
     yk->bump = c_ + yk->stride;
     *(uint64_t *)c_ = yk->hdrw;
+    *(uint32_t *)p = 0;
     memset((uint8_t *)p + offsetof(JSObject, class_id) - 2, 0, 8);
     p->extensible = true;
     p->is_exotic = 1;
@@ -12399,7 +12461,7 @@ static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
 static void js_drc_pend_flush(JSRuntime *rt);
 /* The unit tells the engine its root form: 1 = roots are found by scanning the native stack, 2 = frame records are found by their magic word. */
 static int qjs_aot_form_v;
-void qjs_aot_set_form(int f) { qjs_aot_form_v |= f; }
+void qjs_aot_set_form(int f) { qjs_aot_form_v |= f; if (f & 8) y_formless = 1; }
 static void js_drc_pin(JSRuntime *rt)
 {
     js_drc_pend_flush(rt);
@@ -12515,6 +12577,7 @@ static void y_collect(JSRuntime *rt)
         JSShape *sh = p->shape;
         JSShapeProperty *pr = get_shape_prop(sh);
         ns++;
+        y_site_promoted(*(uint32_t *)p);
         for (j = 0; j < (uint32_t)sh->prop_count; j++, pr++) {
             JSValue v;
             if (pr->flags & JS_PROP_TMASK) continue;
@@ -12575,6 +12638,7 @@ static void y_collect(JSRuntime *rt)
     if (y_livecells > y_livepeak) y_livepeak = y_livecells;
     y_nurs_n = 0; for (kb = 0; kb < 16; kb++) { qjs_ycls[kb].cur = NULL; qjs_ycls[kb].bump = (uint8_t *)1; qjs_ycls[kb].end = NULL; } y_roots_n = 0; if (y_sites > 0) y_roots_cap = 0;
     y_cnt[1] += cells; y_cnt[2] += ns; y_cnt[3] += cells - ns;
+    y_site_eval();
     t2 = y_tsc();
     y_cyc[0] += t1 - t0; y_cyc[2] += t2 - t1;
     y_epoch++; if ((y_epoch & 0xffff) == 0) y_epoch++; qjs_y_ep48 = (uint64_t)(y_epoch & 0xffff) << 48;
@@ -18834,15 +18898,127 @@ static AotNote *aot_notes;
 static int aot_nnotes, aot_capnotes;
 static uint16_t aot_tag_class(JSValue v);
 
+/* The notes name shapes by address and hold no reference (a counted one would turn every in-place shape edit into a copy). A freed shape is
+   taken out at its free (aot_note_shape_freed): its note is marked dead, so a new shape at the same address starts a new note, and a note
+   slot that named it as the value shape becomes "several". Two open-addressed tables find a shape's note and the shapes that were ever noted
+   as a value shape; neither deletes (a dead note keeps its place in the probe chain). */
+#define AOT_NOTE_DEAD ((JSShape *)(uintptr_t)1)
+static int32_t *aot_nh;          /* shape -> note index + 1 */
+static uintptr_t *aot_vh;        /* shapes noted as a value shape */
+static uint32_t aot_nh_mask, aot_vh_mask, aot_vh_n;
+
+static uint32_t aot_ph(const void *p, uint32_t mask)
+{
+    return (uint32_t)(((uintptr_t)p >> 4) * 0x9E3779B1u >> 7) & mask;
+}
+
+static void aot_vh_add(JSShape *sh)
+{
+    uint32_t h;
+    if (aot_vh == NULL || (aot_vh_n + 1) * 2 > aot_vh_mask + 1) {
+        uintptr_t *old = aot_vh;
+        uint32_t om = aot_vh_mask, nm = old ? om * 2 + 1 : 1023, i;
+        uintptr_t *nt = (calloc)((size_t)nm + 1, sizeof(*nt));
+        if (nt == NULL)
+            return;
+        for (i = 0; old && i <= om; i++)
+            if (old[i]) {
+                h = aot_ph((void *)old[i], nm);
+                while (nt[h]) h = (h + 1) & nm;
+                nt[h] = old[i];
+            }
+        (free)(old);
+        aot_vh = nt;
+        aot_vh_mask = nm;
+    }
+    h = aot_ph(sh, aot_vh_mask);
+    while (aot_vh[h]) {
+        if (aot_vh[h] == (uintptr_t)sh)
+            return;
+        h = (h + 1) & aot_vh_mask;
+    }
+    aot_vh[h] = (uintptr_t)sh;
+    aot_vh_n++;
+}
+
+static int aot_vh_has(JSShape *sh)
+{
+    uint32_t h;
+    if (aot_vh == NULL)
+        return 0;
+    h = aot_ph(sh, aot_vh_mask);
+    while (aot_vh[h]) {
+        if (aot_vh[h] == (uintptr_t)sh)
+            return 1;
+        h = (h + 1) & aot_vh_mask;
+    }
+    return 0;
+}
+
+static int aot_nh_find(JSShape *sh)
+{
+    uint32_t h;
+    if (aot_nh == NULL)
+        return -1;
+    h = aot_ph(sh, aot_nh_mask);
+    while (aot_nh[h]) {
+        if (aot_notes[aot_nh[h] - 1].sh == sh)
+            return aot_nh[h] - 1;
+        h = (h + 1) & aot_nh_mask;
+    }
+    return -1;
+}
+
+static void aot_nh_insert(JSShape *sh, int idx)
+{
+    uint32_t h;
+    if (aot_nh == NULL || (uint32_t)(aot_nnotes + 1) * 2 > aot_nh_mask + 1) {
+        uint32_t nm = aot_nh ? aot_nh_mask * 2 + 1 : 1023, i;
+        int32_t *nt = (calloc)((size_t)nm + 1, sizeof(*nt));
+        if (nt == NULL)
+            return;
+        for (i = 0; i < (uint32_t)aot_nnotes; i++) {
+            if (i == (uint32_t)idx)
+                continue;
+            h = aot_ph(aot_notes[i].sh, nm);
+            while (nt[h]) h = (h + 1) & nm;
+            nt[h] = (int32_t)i + 1;
+        }
+        (free)(aot_nh);
+        aot_nh = nt;
+        aot_nh_mask = nm;
+    }
+    h = aot_ph(sh, aot_nh_mask);
+    while (aot_nh[h]) h = (h + 1) & aot_nh_mask;
+    aot_nh[h] = idx + 1;
+}
+
+static void aot_note_shape_freed(JSShape *sh)
+{
+    int i;
+    if (aot_nnotes == 0)
+        return;
+    if ((i = aot_nh_find(sh)) >= 0)
+        aot_notes[i].sh = AOT_NOTE_DEAD;
+    if (aot_vh_has(sh)) {
+        int k, sl;
+        for (k = 0; k < aot_nnotes; k++)
+            for (sl = 0; sl < AOT_NOTE_SLOTS; sl++)
+                if (aot_notes[k].vs[sl] == sh) {
+                    aot_notes[k].vs[sl] = NULL;
+                    aot_notes[k].multi[sl] = 1;
+                }
+    }
+}
+
 static AotNote *aot_note_of(JSShape *sh)
 {
     static int last = -1;
     int i;
     if (last >= 0 && aot_notes[last].sh == sh)
         return &aot_notes[last];
-    for (i = 0; i < aot_nnotes; i++)
-        if (aot_notes[i].sh == sh)
-            goto found;
+    if ((i = aot_nh_find(sh)) >= 0)
+        goto found;
     if (aot_nnotes == aot_capnotes) {
         int nc = aot_capnotes ? aot_capnotes * 2 : 64;
         AotNote *nn = (realloc)(aot_notes, sizeof(*nn) * (size_t)nc);
@@ -18854,6 +19030,7 @@ static AotNote *aot_note_of(JSShape *sh)
     memset(&aot_notes[aot_nnotes], 0, sizeof(aot_notes[0]));
     aot_notes[aot_nnotes].sh = sh;
     i = aot_nnotes++;
+    aot_nh_insert(sh, i);
 found:
     last = i;
     return &aot_notes[i];
@@ -18869,8 +19046,10 @@ static void aot_note_slot(JSShape *sh, uint32_t slot, JSValue v)
     n->types[slot] |= bit;
     if (bit == AOT_TYPE_OBJECT) {
         JSShape *vsh = JS_VALUE_GET_OBJ(v)->shape;
-        if (n->vs[slot] == NULL)
+        if (n->vs[slot] == NULL) {
             n->vs[slot] = vsh;
+            aot_vh_add(vsh);
+        }
         else if (n->vs[slot] != vsh)
             n->multi[slot] = 1;
     }
@@ -29889,7 +30068,7 @@ static void js_accum_stats_dump(void)
    (compiled code proves it from the function's data flow), so the register scan is skipped. */
 static int regvm_accum_append_u(JSContext *ctx, JSFunctionBytecode *b,
                                 JSValue *fr, JSValue *arg_buf, int argc,
-                                int d, int a, JSValue op2, int unique)
+                                int d, int a, JSValue op2, int unique, int own1)
 {
 #if QJS_DRC
     JSString *p1, *p2;
@@ -29914,8 +30093,8 @@ static int regvm_accum_append_u(JSContext *ctx, JSFunctionBytecode *b,
         ACC_WHY(p1->atom_type != 0 ? AC_ATOM : AC_KIND);
         return 0;
     }
-    /* No counted owner, and parked: a register-only value. */
-    if (JS_REF_COUNT(p1) != 0 || !JS_GC_IN_ZCT(p1)) {
+    /* No counted owner and parked (a register-only value), or, when the caller says the one count is the local slot that takes the result back, that count. */
+    if (!(JS_REF_COUNT(p1) == 0 && JS_GC_IN_ZCT(p1)) && !(own1 && JS_REF_COUNT(p1) == 1)) {
         ACC_WHY(AC_OWNED);
         return 0;
     }
@@ -30002,7 +30181,7 @@ static int regvm_accum_append_u(JSContext *ctx, JSFunctionBytecode *b,
     }
 #else
     (void)ctx; (void)b; (void)fr; (void)arg_buf; (void)argc;
-    (void)d; (void)a; (void)op2; (void)unique;
+    (void)d; (void)a; (void)op2; (void)unique; (void)own1;
     return 0;
 #endif
 }
@@ -30011,7 +30190,7 @@ static inline int regvm_accum_append(JSContext *ctx, JSFunctionBytecode *b,
                                      JSValue *fr, JSValue *arg_buf, int argc,
                                      int d, int a, JSValue op2)
 {
-    return regvm_accum_append_u(ctx, b, fr, arg_buf, argc, d, a, op2, 0);
+    return regvm_accum_append_u(ctx, b, fr, arg_buf, argc, d, a, op2, 0, 0);
 }
 
 static __exception int js_regvm_unary(JSContext *ctx, int subop, JSValue v,
@@ -32913,6 +33092,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_aot(REGVM_ARGS)
     REGVM_CAPTURE_IP();
     if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
         __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
+    Y_FORMLESS_ARGS(JS_UNDEFINED, FRP(ab), na);
     r = aot_call_light_impl(ctx, f, na, FR(c), JS_UNDEFINED, FRP(ab), &rv);
     if (r == 0)
         __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
@@ -32931,6 +33111,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_aot(REGVM
     REGVM_CAPTURE_IP();
     if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
         __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
+    Y_FORMLESS_ARGS(FR(t), FRP(ab), na);
     r = aot_call_light_impl(ctx, f, na, FR(c), FR(t), FRP(ab), &rv);
     if (r == 0)
         __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
@@ -37787,6 +37968,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     aot_entry_pc =
                         (uint32_t)(regvm_resume_marker - b->regvm_code);
                 js_aot_enter_count++;
+                if (unlikely(y_formless) && aot_entry_pc == 0) {
+                    int nr = regvm_frame_regs(b), k;
+                    for (k = 0; k < nr; k++)
+                        if (JS_VALUE_GET_TAG(regs[k]) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(regs[k])) && Y_YOUNG(JS_VALUE_GET_PTR(regs[k])))
+                            y_promote_now(JS_VALUE_GET_OBJ(regs[k]));
+                }
                 run.resume_marker = regvm_resume_marker;
                 ret_val = ((JSAotFn)b->aot_fn)(ctx, &run, regs, aot_entry_pc);
                 regvm_resume_marker = run.resume_marker;
@@ -41250,6 +41437,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             js_closcyc_frame(rt, sf, true);
         rt->regvm_cur = sf->rv_light;
         rt->current_stack_frame = sf->prev_frame;
+        if (unlikely(y_formless) && JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(ret_val)) && Y_YOUNG(JS_VALUE_GET_PTR(ret_val)))
+            y_promote_now(JS_VALUE_GET_OBJ(ret_val));
         return ret_val;
     }
 }
@@ -43344,6 +43533,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         {
             JSValue aot_ret;
             js_aot_enter_count++;
+            Y_FORMLESS_ARGS(this_obj, argv, argc);
             aot_ret = ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
                                              (JSValue *)argv, argc);
             return aot_ret;
@@ -46955,6 +47145,7 @@ JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                        !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1))) {
                 if (js_poll_interrupts(ctx))
                     return JS_EXCEPTION;
+                Y_FORMLESS_ARGS(this_obj, argv, argc);
                 res = ((JSAotNFn)b->aot_nfn)(ctx, rt->regvm_cur, p, this_obj, (JSValue *)argv, argc);
                 if (rt->current_stack_frame == NULL && regvm_light_head(rt->regvm_cur) == NULL)
                     js_drc_safepoint(rt);
@@ -67289,6 +67480,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_rt_layout_count = (uint32_t)offsetof(JSRuntime, aot_layout_count);
     out->off_rt_htmldda = (uint32_t)offsetof(JSRuntime, aot_htmldda);
     out->off_shape_layout_id = (uint32_t)offsetof(JSShape, layout_id);
+    out->off_shape_ysite = (uint32_t)offsetof(JSShape, y_site);
     out->class_proxy = JS_CLASS_PROXY;
     out->off_ctx_interrupt_counter =
         (uint32_t)offsetof(JSContext, interrupt_counter);
@@ -68883,7 +69075,7 @@ static void aot_dump_contents(FILE *f, JSRuntime *rt, int nshapes)
     for (k = 0; k < aot_nnotes; k++) {
         AotNote *nt = &aot_notes[k];
         int sl;
-        if (!nt->sh->aot_prof_seen || nt->sh->aot_prof_id >= nshapes)
+        if (nt->sh == AOT_NOTE_DEAD || !nt->sh->aot_prof_seen || nt->sh->aot_prof_id >= nshapes)
             continue;
         for (sl = 0; sl < AOT_NOTE_SLOTS && sl < AOT_PROF_MAX_SLOTS; sl++) {
             AotCont *c = &tab[(size_t)nt->sh->aot_prof_id * AOT_PROF_MAX_SLOTS + (size_t)sl];
@@ -73094,14 +73286,14 @@ QJS_AOT_STUB int qjs_aot_append_const(JSContext *ctx, JSRegRun *f, int kind, uin
 
     if (kind == REG_CONST_CPOOL) {
         r = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra,
-                                 f->b->cpool[idx], unique);
+                                 f->b->cpool[idx], unique, 0);
         ACC_NOTE();
         return r;
     }
     cst = JS_AtomToValue(ctx, (JSAtom)idx);
     if (JS_IsException(cst))
         return -1;
-    r = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra, cst, unique);
+    r = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra, cst, unique, 0);
     ACC_NOTE();
     JS_FreeValue(ctx, cst);
     return r;
@@ -73113,10 +73305,13 @@ QJS_AOT_STUB int qjs_aot_append_const(JSContext *ctx, JSRegRun *f, int kind, uin
 QJS_AOT_STUB int qjs_aot_binary_rr(JSContext *ctx, JSRegRun *f, int sub, JSValue a,
                                    JSValue b, int d, int ra, JSValue *out)
 {
+    int own1 = (sub & 0x100) != 0;
+
+    sub &= 0xff;
     if (regvm_num_fast(sub, a, b, out))
         return 1;
     if (sub == REG_BIN_ADD) {
-        int ar = regvm_accum_append(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b);
+        int ar = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b, 0, own1);
 
         ACC_NOTE();
         if (ar > 0)

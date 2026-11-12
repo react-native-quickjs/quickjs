@@ -2107,12 +2107,28 @@
       "sha256": "00a7026c79d6ded457999eaa327be6c3e54c37d4ba97f441fb2bceea4a82bae0"
     },
     {
+      "name": "0564-formless-unit-promote-at-boundaries.patch",
+      "sha256": "9b0db9e405ac7f8979cdf39d44700ec5896ff401864a9b76c203c7cdcd9d7ddd"
+    },
+    {
+      "name": "0565-nursery-per-shape-pretenuring-no-pause.patch",
+      "sha256": "d6f8b17be49d0eec4e08b455bd4dd160a9facf4ee2510b58d4aff059197ec581"
+    },
+    {
+      "name": "0566-string-append-in-place-on-a-local-slot-owner.patch",
+      "sha256": "b501006d64911b3d2e141552a5eea54cea9e47a4c187e2667f85600d4dcaca56"
+    },
+    {
+      "name": "0567-profile-notes-forget-freed-shapes.patch",
+      "sha256": "9b0f6685e5b78481a04a5aa33ecf5a96a7210a37fc3b5ac237ec6f3bdee957e7"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "a122f4bf0a88b5f0e7a937b91a101dbdc469274a8e8319c645bddae72d0db7f9",
+    "quickjs.c": "a5faff594676aa50353ae8e266967d5143eecbc5992acf79cc0640b221206c9f",
     "libregexp.c": "cb6a62b9e453cd5f13924aeb9ef874d923f80fed7909b5cbd29ad721c31790e3",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
     "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",

@@ -48,5 +48,15 @@ if [ -z "$jobs" ]; then
   case "$slice" in ''|*[!0-9]*) ;; *) smax=$((slice / 3000000000)); [ "$smax" -lt "$jobs" ] && jobs=$smax ;; esac
   [ "$jobs" -lt 1 ] && jobs=1
 fi
-python3 "$here/unit-build.py" "$src" --out "$work" --cc "$real ${flags[*]} -I$(dirname "$src")" --jobs "$jobs" --cache "$cache" > "$work/split.log" 2>&1 || { cat "$work/split.log" >&2; exit 1; }
+# Tiered optimisation: CCSPLIT_REPORT=<generator report> CCSPLIT_COLD="-O1" compiles the parts that hold no function with a profile share of at
+# least CCSPLIT_HOT_MIN percent (default 0.5) with the cold flag instead of the -O level given on the command line.
+tier=()
+if [ -n "$CCSPLIT_REPORT" ] && [ -n "$CCSPLIT_COLD" ] && [ -f "$CCSPLIT_REPORT" ]; then
+  coldflags=(); for f in "${flags[@]}"; do case $f in -O?|-Os|-Oz) ;; *) coldflags+=("$f") ;; esac; done
+  tier=(--hot-cc "$real ${flags[*]} -I$(dirname "$src")" --report "$CCSPLIT_REPORT" --hot-min "${CCSPLIT_HOT_MIN:-0.5}")
+  cccold="$real ${coldflags[*]} $CCSPLIT_COLD -I$(dirname "$src")"
+else
+  cccold="$real ${flags[*]} -I$(dirname "$src")"
+fi
+python3 "$here/unit-build.py" "$src" --out "$work" --cc "$cccold" "${tier[@]}" --jobs "$jobs" --cache "$cache" > "$work/split.log" 2>&1 || { cat "$work/split.log" >&2; exit 1; }
 ld -r -o "$out" $(cat "$work/objs.txt") || exit 1
