@@ -39,7 +39,8 @@ jobs:
           node <<'NODE'
             const fs = require('fs');
             const engine = fs.readFileSync('engine/quickjs-ng/quickjs.c', 'utf8');
-            const version = Number(/^#define BC_VERSION (\d+)/m.exec(engine)[1]);
+            // The stack build's value: the committed compilers are stack builds.
+            const version = Number(/^#define BC_VERSION (\d+) \/\* stack bytecode \*\//m.exec(engine)[1]);
             const path = 'bin/qjsc/manifest.json';
             const built = fs.existsSync(path)
               ? JSON.parse(fs.readFileSync(path, 'utf8')).bcVersion

@@ -116,7 +116,7 @@ def parse_file(path, verbose=False):
             if not line:
                 continue
             if line.startswith("qjsprof "):
-                # qjsprof 1 abi=N fmt=N drc=N thr=N rec=N
+                # qjsprof 1 abi=N bc=N drc=N thr=N rec=N
                 toks = line.split()
                 for t in toks:
                     if t.startswith("abi="):
@@ -126,13 +126,13 @@ def parse_file(path, verbose=False):
                         elif ABI != abi:
                             raise SystemExit(
                                 "%s: ABI %d does not match %d" % (path, abi, ABI))
-                    elif t.startswith("fmt="):
-                        fmt = int(t[4:])
+                    elif t.startswith("bc="):
+                        fmt = int(t[3:])
                         if FORMAT is None:
                             FORMAT = fmt
                         elif FORMAT != fmt:
                             raise SystemExit(
-                                "%s: register format %d does not match %d"
+                                "%s: bytecode version %d does not match %d"
                                 % (path, fmt, FORMAT))
                 continue
             kind, _, rest = line.partition(" ")
@@ -378,7 +378,7 @@ def merge(into, fr):
 
 
 def write(out, funcs):
-    out.write("qjsprof 1 abi=%s fmt=%s\n"
+    out.write("qjsprof 1 abi=%s bc=%s\n"
               % (ABI if ABI is not None else "?",
                  FORMAT if FORMAT is not None else "?"))
     for fr in funcs.values():

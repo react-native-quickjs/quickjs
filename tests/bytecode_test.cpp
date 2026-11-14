@@ -62,6 +62,20 @@ uint32_t crc32cReference(const uint8_t *data, size_t size) {
   return crc ^ 0xffffffffu;
 }
 
+// The engine's BC_VERSION (one value per VM build): the first byte JS_WriteObject writes. Hand-built
+// inputs start with it, so they reach the part of the reader they are written for in either build.
+uint8_t engineBcVersion() {
+  JSRuntime *rt = JS_NewRuntime();
+  JSContext *ctx = JS_NewContext(rt);
+  size_t size = 0;
+  uint8_t *buf = JS_WriteObject(ctx, &size, JS_NULL, 0);
+  const uint8_t version = buf != nullptr && size > 0 ? buf[0] : 0;
+  js_free(ctx, buf);
+  JS_FreeContext(ctx);
+  JS_FreeRuntime(rt);
+  return version;
+}
+
 // JS_ReadObject validates the checksum before it parses the body. Supplying a
 // deliberately malformed body therefore lets this test check the private
 // engine checksum without adding a public checksum API. The body starts at an
@@ -657,13 +671,14 @@ TEST(Bytecode, ModuleLoaderRejectsMalformedEntryCounts) {
   // Module sections whose declared entry count is above INT32_MAX or negative. The loader used to record the count before it
   // allocated the table, so freeing the half-built module walked entries nothing backed. Each input must fail with an exception
   // and leave a runtime that frees cleanly (an assertion build or a sanitizer shows the old behaviour).
-  const std::vector<std::vector<uint8_t>> inputs = {
+  std::vector<std::vector<uint8_t>> inputs = {
       {0x1c, 0x27, 0x9e, 0x68, 0x09, 0x00, 0x0d, 0x7f, 0xff, 0xff, 0xff, 0x7f,
        0x2c, 0x00, 0x00, 0x00, 0x00, 0x0d, 0x7f},
       {0x1c, 0x74, 0x61, 0x89, 0xba, 0x00, 0x0d, 0xbb, 0xff, 0xff, 0xff, 0x32,
        0xb7, 0xfe, 0xff, 0xff, 0x7f, 0x00, 0x00, 0x00, 0x00, 0x32, 0xb7},
   };
-  for (const auto &input : inputs) {
+  for (auto &input : inputs) {
+    input[0] = engineBcVersion();
     JSRuntime *rt = JS_NewRuntime();
     ASSERT_NE(rt, nullptr);
     // The count is rejected against the input that is left before a table is allocated (F49: the loader used to touch gigabytes first):
@@ -690,7 +705,7 @@ TEST(Bytecode, ModuleLoaderRejectsNonFunctionBody) {
   // definition owns that object but the collector does not trace the definition, so the object counted as an outside reference
   // and kept the realm alive: the context was never released and JS_FreeRuntime found objects left on the collector's list (an
   // assertion build aborts, a sanitizer build reports the leak). The loader must reject the container.
-  const std::vector<uint8_t> input = {
+  std::vector<uint8_t> input = {
       0x1c, 0x96, 0x64, 0x86, 0xc8, 0x00, 0x0d, 0x01, 0x00, 0x00, 0x00, 0x02,
       0x15, 0x0d, 0x0d, 0x00, 0x08, 0x7f, 0x00, 0x08, 0x7f, 0x00, 0x08, 0x00,
       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
@@ -716,6 +731,7 @@ TEST(Bytecode, ModuleLoaderRejectsNonFunctionBody) {
       0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
       0x01, 0x01, 0x01,
   };
+  input[0] = engineBcVersion();
   JSRuntime *rt = JS_NewRuntime();
   ASSERT_NE(rt, nullptr);
   JSContext *ctx = JS_NewContext(rt);
@@ -898,8 +914,8 @@ TEST(Bytecode, RegisterFunctionFromBytecodeKeepsTheCompilersVariableArea) {
 TEST(Bytecode, RegisterFunctionVariableAreaBelowWhatTheProgramNamesIsRejected) {
   // The writer records the compiler's variable area in the register program's flag byte; the reader accepts it only if it covers every slot the
   // program names and every slot an inner closure captures. A function with a try/catch keeps its three locals in the frame (no promotion),
-  // so its area is 4 slots (a, b, c, e): the byte is 1 | (4 + 1) << 1 = 11, followed by REGVM_FORMAT_VERSION. Lowering it must fail the load, not leave slots
-  // the program reads outside the area the frame fills.
+  // so its area is 4 slots (a, b, c, e): the byte is 1 | (4 + 1) << 1 = 11, after the local count 5 (n, a, b, c, e). Lowering it must fail the load, not leave
+  // slots the program reads outside the area the frame fills.
   static const char *src =
       "function f(n) { var a = n, b = 2, c = 3; try { a = b + c; } catch (e) { "
       "a = 0; } return a + b + c; } f(1);";
@@ -918,8 +934,8 @@ TEST(Bytecode, RegisterFunctionVariableAreaBelowWhatTheProgramNamesIsRejected) {
   js_free(ctx, buf);
   int tried = 0, rejected = 0;
   for (size_t off = 5; off + 1 < valid.size(); ++off) {
-    // a flag byte with a recorded area of 1 or more slots, followed by the format version byte
-    if (valid[off + 1] != 19 || (valid[off] & 1) == 0 || (valid[off] >> 1) < 2)
+    // f's flag byte: the local count 5, then the flag with a recorded area of 4 slots
+    if (valid[off - 1] != 5 || valid[off] != 11)
       continue;
     std::vector<uint8_t> blob = valid;
     blob[off] = 1 | (1 << 1);  // area 0: below what the program names

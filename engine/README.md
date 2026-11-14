@@ -25,9 +25,25 @@ file the build needs is missing from the tarball.
 
 ## Bytecode version
 
-`BC_VERSION` in `quickjs.c` changes only in a fork commit of its own, with the subject
-`bump bytecode version to N`. The committed `bin/qjsc` compilers are rebuilt by the
-`bytecode compilers` workflow when it differs from `bin/qjsc/manifest.json`.
+`BC_VERSION` in `quickjs.c` is the only bytecode version: the byte `JS_WriteObject` writes
+first and `JS_ReadObject` checks, and the `bc=` key of an AOT profile header. It has one
+value per VM build, since the two builds write different function bodies:
+
+```c
+#if QJS_REGVM
+#define BC_VERSION (0x80 + 20) /* register bytecode */
+#else
+#define BC_VERSION 28 /* stack bytecode */
+#endif
+```
+
+A file compiled by one build is refused by the other with "invalid version". When a
+build's bytecode format changes, bump that build's value in a fork commit of its own,
+with the subject `bump <stack|register> bytecode version to N`, and regenerate the
+built-in blobs (`node scripts/regenerate-builtin-blobs.js` writes both `builtin-*.h` and
+`builtin-*.regvm.h`). The committed `bin/qjsc` compilers are stack builds; the
+`bytecode compilers` workflow rebuilds them when the stack value differs from
+`bin/qjsc/manifest.json`.
 
 ## Syncing upstream
 

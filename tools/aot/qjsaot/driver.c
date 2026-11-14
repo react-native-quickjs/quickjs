@@ -578,7 +578,7 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
   if (fgets(line, sizeof(line), f)) {
     if (strncmp(line, "qjsprof ", 8) == 0) {
       const char *p = strstr(line, "abi=");
-      const char *fp = strstr(line, "fmt=");
+      const char *bp = strstr(line, " bc=");
       if (p && strtoul(p + 4, NULL, 10) != (unsigned long)QJS_AOT_ABI) {
         fprintf(
             stderr,
@@ -588,13 +588,22 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         fclose(f);
         return NULL;
       }
-      if (fp &&
-          strtoul(fp + 4, NULL, 10) != (unsigned long)REGVM_FORMAT_VERSION) {
+      if (bp && strtoul(bp + 4, NULL, 10) != (unsigned long)js_aot_gen_bc_version()) {
         fprintf(
             stderr,
-            "qjsaot: %s: register-format mismatch (profile %lu, "
+            "qjsaot: %s: bytecode version mismatch (profile %lu, "
             "engine %u); collect the profile with this engine build\n",
-            path, strtoul(fp + 4, NULL, 10), (unsigned)REGVM_FORMAT_VERSION);
+            path, strtoul(bp + 4, NULL, 10), js_aot_gen_bc_version());
+        fclose(f);
+        return NULL;
+      }
+      /* `fmt=` without `bc=` is the header of an engine that versioned the
+         register program separately; that number is not comparable. */
+      if (!bp && strstr(line, " fmt=")) {
+        fprintf(stderr,
+                "qjsaot: %s: profile from an older engine (fmt=, no bc=); "
+                "collect the profile with this engine build\n",
+                path);
         fclose(f);
         return NULL;
       }

@@ -31,8 +31,9 @@ const COMPILERS = path.join(ROOT, 'bin', 'qjsc');
 /** The BC_VERSION the shipped engine sources define. */
 function engineBytecodeVersion() {
   const engine = fs.readFileSync(path.join(ROOT, 'engine', 'quickjs-ng', 'quickjs.c'), 'utf8');
-  const found = /^#define BC_VERSION (\d+)/m.exec(engine);
-  if (!found) throw new Error('no BC_VERSION in engine/quickjs-ng/quickjs.c');
+  /* The stack build's value: the shipped compilers and the device engine are stack builds. */
+  const found = /^#define BC_VERSION (\d+) \/\* stack bytecode \*\//m.exec(engine);
+  if (!found) throw new Error('no stack BC_VERSION in engine/quickjs-ng/quickjs.c');
   return Number(found[1]);
 }
 

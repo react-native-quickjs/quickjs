@@ -4,10 +4,11 @@
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * Rebuilds QuickJS's embedded bytecode (the builtin-*.h blobs) in
- * engine/quickjs-ng with the qjsc built from it, and smoke-tests the result.
- * The blobs are loadable only by the BC_VERSION they were compiled with, so run
- * this after a bytecode-format change or an upstream sync, then commit the
+ * Rebuilds QuickJS's embedded bytecode in engine/quickjs-ng with the qjsc built
+ * from it, once per VM build, and smoke-tests each result: the stack build
+ * writes builtin-*.h, the register build (QJS_REGVM=1, clang) builtin-*.regvm.h.
+ * A blob is loadable only by the build and BC_VERSION it was compiled with, so
+ * run this after a bytecode-format change or an upstream sync, then commit the
  * changed blobs in the fork (see engine/README.md).
  */
 
@@ -20,12 +21,21 @@ const {spawnSync} = require('child_process');
 
 const root = path.join(__dirname, '..');
 const engine = path.join(root, 'engine', 'quickjs-ng');
-const buildDir = path.join(engine, 'build-builtin-blobs');
 const ccacheDir = path.join(root, '.local', 'ccache');
 const builtins = [
-  'builtin-array-fromasync.h',
-  'builtin-iterator-zip.h',
-  'builtin-iterator-zip-keyed.h',
+  'builtin-array-fromasync',
+  'builtin-iterator-zip',
+  'builtin-iterator-zip-keyed',
+];
+// One entry per VM build: its build directory, configure flags and blob suffix.
+const vms = [
+  {name: 'stack', dir: 'build-builtin-blobs', flags: [], suffix: '.h'},
+  {
+    name: 'register',
+    dir: 'build-builtin-blobs-regvm',
+    flags: ['-DCMAKE_C_COMPILER=clang', '-DCMAKE_C_FLAGS=-DQJS_REGVM=1'],
+    suffix: '.regvm.h',
+  },
 ];
 
 function fail(message) {
@@ -61,52 +71,49 @@ const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'rnqjs-builtins-'));
 try {
   fs.mkdirSync(ccacheDir, {recursive: true});
   const buildEnvironment = {...process.env, CCACHE_DIR: ccacheDir};
-  run(
-    'cmake',
-    ['-S', engine, '-B', buildDir, '-DCMAKE_BUILD_TYPE=Release'],
-    {env: buildEnvironment},
-  );
-  run('cmake', [
-    '--build',
-    buildDir,
-    '--target',
-    'qjsc',
-    '--parallel',
-  ], {env: buildEnvironment});
-
-  const qjsc = path.join(buildDir, 'qjsc');
-  for (const name of builtins) {
-    const source = name.replace(/\.h$/, '.js');
+  const changed = [];
+  for (const vm of vms) {
+    const buildDir = path.join(engine, vm.dir);
     run(
-      qjsc,
-      ['-C', '-ss', '-o', path.join(scratch, name), source],
-      {cwd: engine},
+      'cmake',
+      ['-S', engine, '-B', buildDir, '-DCMAKE_BUILD_TYPE=Release', ...vm.flags],
+      {env: buildEnvironment},
     );
-  }
+    run('cmake', ['--build', buildDir, '--target', 'qjsc', '--parallel'], {
+      env: buildEnvironment,
+    });
 
-  const changed = builtins.filter(
-    name =>
-      !fs
-        .readFileSync(path.join(engine, name))
-        .equals(fs.readFileSync(path.join(scratch, name))),
-  );
-  for (const name of changed) {
-    writeAtomic(path.join(engine, name), fs.readFileSync(path.join(scratch, name)));
-  }
+    const qjsc = path.join(buildDir, 'qjsc');
+    const names = builtins.map(base => base + vm.suffix);
+    for (const name of names) {
+      run(
+        qjsc,
+        ['-C', '-ss', '-o', path.join(scratch, name), name.replace(vm.suffix, '.js')],
+        {cwd: engine},
+      );
+    }
+    // Whitespace is ignored, so a blob whose bytes are unchanged is kept as committed.
+    const content = file => fs.readFileSync(file, 'utf8').replace(/\s+/g, '');
+    for (const name of names) {
+      if (content(path.join(engine, name)) !== content(path.join(scratch, name))) {
+        writeAtomic(path.join(engine, name), fs.readFileSync(path.join(scratch, name)));
+        changed.push(name);
+      }
+    }
 
-  run(
-    'cmake',
-    ['--build', buildDir, '--target', 'qjs_exe', '--parallel'],
-    {env: buildEnvironment},
-  );
-  run(path.join(buildDir, 'qjs'), [
-    '-e',
-    'const actual = [typeof Array.fromAsync, typeof Iterator.zip, ' +
-      'typeof Iterator.zipKeyed, JSON.stringify([...Iterator.zip(' +
-      '[[1, 2], [3, 4]])])].join("|"); ' +
-      'if (actual !== "function|function|function|[[1,3],[2,4]]") ' +
-      'throw new Error(actual);',
-  ]);
+    // The engine embeds the blobs, so qjs is rebuilt after they are written.
+    run('cmake', ['--build', buildDir, '--target', 'qjs_exe', '--parallel'], {
+      env: buildEnvironment,
+    });
+    run(path.join(buildDir, 'qjs'), [
+      '-e',
+      'const actual = [typeof Array.fromAsync, typeof Iterator.zip, ' +
+        'typeof Iterator.zipKeyed, JSON.stringify([...Iterator.zip(' +
+        '[[1, 2], [3, 4]])])].join("|"); ' +
+        'if (actual !== "function|function|function|[[1,3],[2,4]]") ' +
+        'throw new Error(actual);',
+    ]);
+  }
   console.log(
     changed.length === 0
       ? '[regenerate-builtin-blobs] built-in blobs are up to date'
