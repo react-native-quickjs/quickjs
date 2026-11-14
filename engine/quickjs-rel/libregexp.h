@@ -113,6 +113,8 @@ int lre_exec_at(uint8_t **capture,
                 const uint8_t *bc_buf, uint32_t bytecode_offset,
                 const uint8_t *cbuf, int cindex, int clen,
                 int cbuf_type, void *opaque);
+/* frees the backtrack stack the calling thread keeps between matches */
+void lre_scratch_release(void);
 
 /* A matcher generated ahead of time from one pattern's bytecode (see libregexp-exec.h). It runs the same machine as the
    interpreter from the entry at byte offset 'off' of the code (0, or the anchored entry after the scan prologue) and returns what

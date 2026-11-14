@@ -1,0 +1,25 @@
+Subject: A suspended coroutine's registers note the nursery objects they hold
+
+What this does
+  js_regvm_drc_suspend takes its counted reference on each register with js_dup instead of a bare increment, so a nursery cell held by a suspended async function or generator is noted as referenced from the heap (y_dup_young), as every other counted store of a young cell is.
+
+Why we need it
+  The bare increment left the cell out of the young collection's roots: a collection while the coroutine waited freed it, the resume (js_regvm_drc_resume) dropped the stale reference and parked the freed slot, and the nursery handed the slot out again while it was still parked; the next reconcile freed a live object. JetStream 3 doxbee-async crashed on the register VM (assertion `JS_REF_COUNT(p) == 0 && JS_GC_IN_ZCT(p)` in js_drc_reconcile_locked in a debug build, a segfault in release). Repro: tests/differential/corpus/async-suspend-young-object.js.
+
+Soundness
+  js_dup is the counted reference every other owner takes: for an ordinary value it is the same increment; for a nursery cell it also records the cell so the young collection keeps (and promotes) it. The resume side (REG_ADOPT) is unchanged, and a cell promoted while the coroutine waited is an ordinary object when the resume drops the reference.
+
+diff --git a/quickjs.c b/quickjs.c
+index d2fdd4d..a012267 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -12961,5 +12961,4 @@ static void js_regvm_drc_suspend(JSRuntime *rt, JSValue *regs, uint32_t nregs)
+-    for (i = 0; i < nregs; i++) {
+-        JSValue v = regs[i];
+-        if (JS_VALUE_HAS_REF_COUNT(v))
+-            JS_REF_COUNT(JS_VALUE_GET_PTR(v))++;
+-    }
++    /* js_dup, not a bare increment: a nursery cell must be noted as referenced from the heap, or a young collection while the
++       coroutine is suspended frees it under the register that still names it. */
++    for (i = 0; i < nregs; i++)
++        js_dup(regs[i]);

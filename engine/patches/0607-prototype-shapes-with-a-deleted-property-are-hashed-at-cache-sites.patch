@@ -1,0 +1,48 @@
+Subject: Prototype shapes with a deleted property are hashed at cache sites
+
+What this does
+  regvm_shape_hashify leaves a shape with a deleted property unhashed (0606) only for a receiver that is an ordinary object. The holder, middle and receiver shapes of prototype objects are hashed as before 0606.
+
+Why we need it
+  0606 targeted ordinary objects, where every delete makes a fresh copy of the shape. A prototype that lost a property keeps one long-lived shape, and leaving it unhashed sent every site reading through it to the uncached path: the kit kernel protochange (`delete Q.prototype.extra`, then calls through instances) went from 280.2 to 411.2 M instructions compiled. Now 275.9 M (94.5 M cycles, was 131.3). dispatch_delete_shape keeps 0606's gain (303 M cycles compiled, 395 M interpreted).
+
+Soundness
+  Hashing a prototype's shape is what the code did before 0606, so these sites work as they did then; only ordinary objects' deleted-property copies stay unhashed, which their sites already handle (need_mega).
+
+diff --git a/quickjs.c b/quickjs.c
+index 348ba2b..5b8486f 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -29503,4 +29503,6 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
+- * only maintained while `is_hashed`. A shape with a deleted property is left
+- * as it is: every delete makes its own copy, which no transition reaches, so
+- * hashing them puts one more equal shape in the same bucket per object and
+- * each free walks the chain. Its sites take the uncached path.
++ * only maintained while `is_hashed`. An ordinary object's shape with a deleted
++ * property (`copy`) is left as it is: every delete makes the object its own
++ * copy, which no transition reaches, so hashing them puts one more equal shape
++ * in the same bucket per object and each free walks the chain. Its sites take
++ * the uncached path. A prototype's shape is one long-lived shape however many
++ * objects read through it, so it is hashed even with a deleted property.
+@@ -29508 +29510 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
+-static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh)
++static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh, bool copy)
+@@ -29512 +29514 @@ static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh)
+-    if (sh->is_hashed || sh->deleted_prop_count != 0)
++    if (sh->is_hashed || (copy && sh->deleted_prop_count != 0))
+@@ -29597 +29599 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+-        regvm_shape_hashify(rt, rsh);
++        regvm_shape_hashify(rt, rsh, !p->is_prototype);
+@@ -29599 +29601 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+-            regvm_shape_hashify(rt, hsh);
++            regvm_shape_hashify(rt, hsh, false);
+@@ -29601,3 +29603,3 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+-        regvm_shape_hashify(rt, rsh);
+-        regvm_shape_hashify(rt, mid);
+-        regvm_shape_hashify(rt, holder->shape);
++        regvm_shape_hashify(rt, rsh, !p->is_prototype);
++        regvm_shape_hashify(rt, mid, false);
++        regvm_shape_hashify(rt, holder->shape, false);
+@@ -70554 +70556 @@ QJS_AOT_STUB JSValue qjs_aot_gated_call(JSContext *ctx, JSObject *co, JSValue th
+-static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh);
++static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh, bool copy);

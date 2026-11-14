@@ -1,0 +1,47 @@
+Subject: Compiled array literals are built as ordinary objects
+
+What this does
+  qjs_aot_array_from (compiled code's array literal) builds the array with regvm_array_from_regs_old, the counted-object half of regvm_array_from_regs, instead of building a nursery cell and promoting it at once. The interpreter keeps the nursery path.
+
+Why we need it
+  Since 0563 the compiled literal was allocated young and promoted on the spot. A promoted cell stays in its nursery chunk, and the young allocation runs no collection trigger, so in a compiled loop without a safepoint (a region) every dead array stayed parked until the end of the run: corpus alloc_array_lit ran no reconcile at all (400,952 parked objects, 64 MB heap against a 4 MB threshold, 15.8 k page faults), and the final reconcile took 28% of the run. alloc_array_lit 190.0 -> 137.6 M cycles (interpreter 172.5 M), 66.2 -> 37.0 ms; alloc_array_nested 193.4 -> 107.0 ms; page faults 15.8 k -> 2.7 k.
+
+Soundness
+  This is the allocation the literal used before 0563: an ordinary counted object, allocated through js_malloc with its collection and reconcile triggers. The promotion it replaces turned the cell into the same kind of object, so nothing that holds the array sees a difference; the elements are taken the same way (regvm_array_from_regs_old is the unchanged old path).
+
+diff --git a/quickjs.c b/quickjs.c
+index 7883355..cc3c961 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -11119,0 +11120,2 @@ static JSValue js_new_young_array(JSContext *ctx, const JSValue *src, int count)
++static JSValue regvm_array_from_regs_old(JSContext *ctx, const JSValue *src, int count);
++
+@@ -11123,4 +11124,0 @@ static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
+-    JSValue obj;
+-    JSObject *p;
+-    int i;
+-
+@@ -11129 +11127 @@ static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
+-        obj = js_new_young_array(ctx, src, count);
++        JSValue obj = js_new_young_array(ctx, src, count);
+@@ -11133,0 +11132,10 @@ static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
++    return regvm_array_from_regs_old(ctx, src, count);
++}
++
++/* The array as an ordinary counted object, never a nursery cell. */
++static JSValue regvm_array_from_regs_old(JSContext *ctx, const JSValue *src, int count)
++{
++    JSValue obj;
++    JSObject *p;
++    int i;
++
+@@ -72768,0 +72777,3 @@ int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v)
++/* Compiled code keeps the array where no nursery collection can see it, so it is built as an ordinary object. A nursery cell
++   promoted on the spot cost the promotion, and its death went unnoticed: the young allocation runs no collection trigger, so a
++   compiled loop without a safepoint parked every dead array until the end of the run. */
+@@ -72771 +72782 @@ int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)
+-    JSValue val = regvm_array_from_regs(ctx, argv, na);
++    JSValue val = regvm_array_from_regs_old(ctx, argv, na);
+@@ -72775,2 +72785,0 @@ int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)
+-    if (Y_YOUNG(JS_VALUE_GET_PTR(val)))
+-        y_promote_now(JS_VALUE_GET_OBJ(val));

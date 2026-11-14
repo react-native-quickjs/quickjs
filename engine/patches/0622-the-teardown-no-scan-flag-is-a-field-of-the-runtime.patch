@@ -1,0 +1,31 @@
+Subject: The teardown's no-scan flag is a field of the runtime
+
+What this does
+  The flag that makes JS_FreeRuntime's final collection skip the conservative native-stack scan is now a field of the runtime (rt->ss_final), set before that collection. It replaces the process-wide pointer ss_final_rt from 0618, which named the runtime being torn down.
+
+Why we need it
+  With several threads, each tearing down its own runtime (run-test262 -t 2: one runtime per test on each thread), the second JS_FreeRuntime overwrote the pointer the first had set. The first runtime's final collection then scanned its native stack, all of whose words are stale at that point: exactly the scan 0499 rules out, which can keep a dead object alive or count a stale word as a reference. Found by the AOT acceptance run's ASan stage: the scan reported a stack-buffer-underflow in ss_scan, under JS_FreeRuntime on a worker thread (the scan reads every stack word, and no scan had run in a teardown under ASan before 0618).
+
+Soundness
+  The rule 0618 states is unchanged: the runtime being torn down scans no stack in its final collection and in any reconcile until its memory is released, and every other runtime scans as before. Each runtime now reads only its own flag, so no other thread can set or clear it. The runtime is allocated zeroed, so the flag starts false; nothing reads it after the runtime's memory is released, so it is not cleared.
+
+diff --git a/quickjs.c b/quickjs.c
+index a15f2e0..7f3f175 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -979,0 +980,3 @@ struct JSRuntime {
++    /* Set by JS_FreeRuntime for its final collection: this runtime scans no native stack (every word on it is stale). A field of the runtime, not a
++       process-wide variable: two threads tearing down their runtimes at once must not see each other's flag. */
++    bool ss_final;
+@@ -5280,3 +5282,0 @@ static void drc_st_site_dump(void)
+-/* The runtime being torn down: its final collection scans no native stack (every word on it is stale). Only that runtime: a runtime made
+-   after it, or running on another thread meanwhile, still scans its stack. */
+-static JSRuntime *ss_final_rt;
+@@ -5398 +5398 @@ void JS_FreeRuntime(JSRuntime *rt)
+-    ss_final_rt = rt;
++    rt->ss_final = true;
+@@ -5690 +5689,0 @@ void JS_FreeRuntime(JSRuntime *rt)
+-    ss_final_rt = NULL;
+@@ -12692 +12691 @@ static void js_drc_pin(JSRuntime *rt)
+-    if (ss_on && ss_final_rt != rt) ss_scan(rt); else if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ss_n = 0;
++    if (ss_on && !rt->ss_final) ss_scan(rt); else if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ss_n = 0;

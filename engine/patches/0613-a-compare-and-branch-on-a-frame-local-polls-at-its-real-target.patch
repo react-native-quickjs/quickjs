@@ -1,0 +1,22 @@
+Subject: A compare-and-branch on a frame local polls at its real target
+
+What this does
+  regvm_t_branch_cmp_loc_reg no longer calls REGVM_DRC_BACKEDGE itself before T_NEXT: T_NEXT already runs the back-edge poll, on the full offset (the instruction's size plus the branch offset).
+
+Why we need it
+  The extra call used the bare branch offset, which this instruction counts from its end, so when the poll fired (the interrupt countdown reaching zero, or the deferred-count safepoint) the loop resumed ten bytes before its target, in the middle of an earlier instruction, and the dispatch loop met a 0 byte: "InternalError: register VM: unimplemented opcode 0" on JetStream 3 typescript-lib (forEachChildRecursively: `for (let t = e.length - 1; t >= 0; --t)`). It also counted the interrupt down twice per taken back edge. Repro: tests/differential/corpus/backedge-poll-local-compare.js.
+
+Soundness
+  Every other threaded branch polls only through T_NEXT/T_BR_NEXT, with the offset they continue at; this handler now does the same, so the poll and the continuation agree on the target.
+
+diff --git a/quickjs.c b/quickjs.c
+index a012267..b0bb73c 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -34597,4 +34597,2 @@ static uint8_t *REGVM_CC regvm_t_branch_cmp_loc_reg(REGVM_ARGS)
+-        if (unlikely(r ^ ((sub & REG_CMP_INVERT) != 0))) {
+-            REGVM_DRC_BACKEDGE(ctx, off);
+-            T_NEXT(T_SZ_BURT + off);
+-        }
++        if (unlikely(r ^ ((sub & REG_CMP_INVERT) != 0)))
++            T_NEXT(T_SZ_BURT + off); /* T_NEXT runs the back-edge poll on the target it continues at */

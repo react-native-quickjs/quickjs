@@ -164,11 +164,24 @@ typedef struct JSRegRCC JSRegRCC;
 #define QJS_DRC_VALIDATE 0
 #endif
 
+/* QJS_GC_STRESS (a debug build option; nothing of it is compiled otherwise) forces collections where a missed root shows at once: a reconcile
+   (with its young collection) every QJS_DRC_STRESS_EVERY-th allocation (default 61), before every pending job, and at every interrupt poll
+   (each back edge and call when QJS_GC_STRESS_POLL is set; every JS_INTERRUPT_COUNTER_INIT-th otherwise). Allocation sites are never
+   pretenured, and QJS_Y_CHECK is on with an unrecorded young root fatal. The two poll settings catch different misses: run both. */
+#if defined(QJS_GC_STRESS) && !defined(QJS_DRC_STRESS_ALLOC)
+#define QJS_DRC_STRESS_ALLOC 1
+#endif
 #if QJS_DRC
 static void js_drc_reconcile(JSRuntime *rt);
 #ifdef QJS_DRC_STRESS_ALLOC
 /* A reconcile at every QJS_DRC_STRESS_EVERY-th allocation (default every one): the validation mode of the conservative stack roots. */
+#ifdef QJS_GC_STRESS
+/* Not every allocation: a cell collected at the next allocation is still in a live register and is promoted at once, so it never reaches a
+   suspended frame or a store young, where a missed root is. */
+static uint32_t js_drc_stress_every = 61;
+#else
 static uint32_t js_drc_stress_every = 1;
+#endif
 static uint32_t js_drc_stress_ctr;
 __attribute__((constructor)) static void js_drc_stress_init(void)
 {
@@ -176,6 +189,14 @@ __attribute__((constructor)) static void js_drc_stress_init(void)
     if (js_drc_stress_every == 0) js_drc_stress_every = 1;
 }
 #define JS_DRC_STRESS_POINT(rt_) do { if (!(rt_)->drc_in_reconcile && (rt_)->gc_phase == JS_GC_PHASE_NONE && ++js_drc_stress_ctr >= js_drc_stress_every) { js_drc_stress_ctr = 0; js_drc_reconcile(rt_); } } while (0)
+#endif
+#ifdef QJS_GC_STRESS
+#define JS_GC_STRESS_FORCE(rt_) do { if (!(rt_)->drc_in_reconcile && (rt_)->gc_phase == JS_GC_PHASE_NONE) js_drc_reconcile(rt_); } while (0)
+static int js_gc_stress_poll;
+__attribute__((constructor)) static void js_gc_stress_init(void)
+{
+    js_gc_stress_poll = getenv("QJS_GC_STRESS_POLL") != NULL;
+}
 #endif
 #if QJS_DRC
 static void js_closcyc_resolve(JSRuntime *rt);
@@ -956,6 +977,9 @@ struct JSRuntime {
     uint64_t gc_t0, gc_spent;
     size_t gc_after_last;
     bool gc_yield_ok;
+    /* Set by JS_FreeRuntime for its final collection: this runtime scans no native stack (every word on it is stale). A field of the runtime, not a
+       process-wide variable: two threads tearing down their runtimes at once must not see each other's flag. */
+    bool ss_final;
 };
 
 #if QJS_REGVM_RECORD
@@ -1464,6 +1488,20 @@ struct JSContext {
     int re_snap_n;
     int re_species_idx;
     JSValue re_species;
+
+    /* The legacy RegExp statics of this realm (RegExp.$1, lastMatch, ...): the subject of the last match by a
+       regexp of this realm's %RegExp%, its group count and the matcher's capture pointers into the subject for the
+       match and $1..$9 (re_legacy_cap) and for the last group (re_legacy_last); a NULL pointer is a group that did
+       not take part. The getters turn them into substrings. re_input is RegExp.input once it is assigned (a string;
+       JS_UNINITIALIZED while RegExp.input is the subject, which a match restores).
+       re_legacy_valid is false after a match by a subclass instance or a regexp of another realm: the getters throw. */
+    uint32_t realm_id;
+    bool re_legacy_valid;
+    int re_legacy_n;
+    JSValue re_input;
+    JSValue re_subject;
+    const uint8_t *re_legacy_cap[20];
+    const uint8_t *re_legacy_last[2];
 
     /* LAST FIELD ON PURPOSE: 8 KB, allocated once per context. */
     JSGVCell gv_cells[JS_GV_CELL_SETS][JS_GV_CELL_WAYS]; /* zeroed */
@@ -2417,10 +2455,12 @@ typedef struct JSForInIterator {
 typedef struct JSRegExp {
     JSString *pattern;
     JSString *bytecode; /* also contains the flags */
-    /* borrowed pointer into 'bytecode' at the start of the optimization
-       metadata header, or NULL if the pattern has no metadata. Always
-       re-derived from 'bytecode' by js_regexp_set_compiled_data(). */
-    const uint8_t *metadata;
+    /* offset in 'bytecode' of the optimization metadata header, or 0 if the
+       pattern has no metadata. Always re-derived from 'bytecode' by
+       js_regexp_set_compiled_data(). */
+    uint32_t meta_off;
+    uint32_t realm_id : 31; /* JSContext.realm_id of the realm that made it ([[Realm]]) */
+    uint32_t legacy : 1;    /* made by that realm's %RegExp%, not a subclass ([[LegacyFeaturesEnabled]]) */
 } JSRegExp;
 
 typedef struct JSProxyData {
@@ -4401,6 +4441,10 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
         return NULL;
 #endif
 
+#ifdef QJS_GC_STRESS
+    /* Each runtime starts at the same phase of the allocation count, so a failure reproduces from its own script alone. */
+    js_drc_stress_ctr = 0;
+#endif
     memset(&ms, 0, sizeof(ms));
     ms.opaque = opaque;
     ms.malloc_limit = 0;
@@ -4681,6 +4725,11 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
         return 0;
     }
 
+#ifdef QJS_GC_STRESS
+    /* Between jobs every coroutine is parked, and the native stack is shallow: no stale copy of a parked frame's registers is
+       scanned, so a cell the frame holds only through a register stays young unless the suspend path noted it. */
+    JS_GC_STRESS_FORCE(rt);
+#endif
     /* get the first pending job and execute it */
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
@@ -4883,6 +4932,13 @@ static void y_formless_args_slow(JSValue this_obj, const JSValue *argv, int na)
         if (JS_VALUE_GET_TAG(argv[k]) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(argv[k])) && Y_YOUNG(JS_VALUE_GET_PTR(argv[k])))
             y_promote_now(JS_VALUE_GET_OBJ(argv[k]));
 }
+/* The nursery cells named by a parked coroutine frame's live values (arguments, variables, operand stack) are noted as roots. */
+static __attribute__((noinline)) void js_frame_note_young(const JSValue *v, const JSValue *end)
+{
+    for (; v < end; v++)
+        if (JS_VALUE_GET_TAG(*v) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(*v)) && Y_YOUNG(JS_VALUE_GET_PTR(*v)))
+            y_note(JS_VALUE_GET_PTR(*v));
+}
 /* A call into compiled code that has no young-cell forms: the cells the caller's registers name are promoted first. */
 #define Y_FORMLESS_ARGS(this_, argv_, na_) do { \
         if (unlikely(y_formless)) { \
@@ -5076,6 +5132,11 @@ static void y_site_eval(void) {
         YSite *s = &qjs_ysite[q];
         uint8_t was;
         if (!s->made && !s->surv) continue;
+#ifdef QJS_GC_STRESS
+        /* Forced collections make every site look long-lived; a pretenured site would keep its cells out of the nursery the stress is for. */
+        s->made = s->surv = 0;
+        continue;
+#endif
         s->am += s->made; s->as += s->surv; s->made = s->surv = 0;
         if (s->am < 256) continue;
         was = s->pre;
@@ -5219,8 +5280,6 @@ static void drc_st_site_dump(void)
 #define DRC_ST(x) ((void)0)
 #endif
 
-/* Set while the runtime is torn down: the final collection scans no native stack (every word on it is stale). */
-static int ss_final;
 void JS_FreeRuntime(JSRuntime *rt)
 {
 #ifdef QJS_DRC_STATS
@@ -5336,7 +5395,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     js_gc_promote_all_code(rt);
 
     /* Nothing is live on the machine stack any more: a stale word in a frame slot must not pin an object (and its cycle) through the collection below. */
-    ss_final = 1;
+    rt->ss_final = true;
     JS_RunGC(rt);
 
 #if QJS_DRC
@@ -5627,6 +5686,8 @@ void JS_FreeRuntime(JSRuntime *rt)
     leak &= check_dump_flag(rt, JS_ABORT_ON_LEAKS);
 
     js_arena_free_all(rt);
+    /* the regexp backtrack stack this thread keeps between matches: a runtime is freed on its thread, and a thread that ends keeps nothing */
+    lre_scratch_release();
 
     {
         JSMallocState *ms = &rt->malloc_state;
@@ -5668,6 +5729,19 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->iterator_ctor = JS_NULL;
     ctx->iterator_ctor_getset = JS_NULL;
     ctx->regexp_ctor = JS_NULL;
+    {
+        static uint32_t realm_id_next;
+        uint32_t id;
+        do
+            id = __atomic_add_fetch(&realm_id_next, 1, __ATOMIC_RELAXED) & 0x7fffffff;
+        while (id == 0);
+        ctx->realm_id = id;
+    }
+    ctx->re_legacy_valid = true;
+    ctx->re_input = JS_UNINITIALIZED;
+    ctx->re_subject = JS_AtomToString(ctx, JS_ATOM_empty_string);
+    ctx->re_legacy_n = 1;
+    ctx->re_legacy_cap[0] = ctx->re_legacy_cap[1] = str8(JS_VALUE_GET_STRING(ctx->re_subject));
     ctx->promise_ctor = JS_NULL;
     ctx->error_ctor = JS_NULL;
     ctx->error_back_trace = JS_UNDEFINED;
@@ -6446,6 +6520,8 @@ void JS_FreeContext(JSContext *ctx)
     JS_FreeValue(ctx, ctx->promise_ctor);
     JS_FreeValue(ctx, ctx->array_ctor);
     JS_FreeValue(ctx, ctx->regexp_ctor);
+    JS_FreeValue(ctx, ctx->re_input);
+    JS_FreeValue(ctx, ctx->re_subject);
     JS_FreeValue(ctx, ctx->function_ctor);
     JS_FreeValue(ctx, ctx->function_proto);
 
@@ -10817,7 +10893,9 @@ static JSValue JS_NewObjectFromShapeCapExtra(JSContext *ctx, JSShape *sh,
     case JS_CLASS_REGEXP:
         p->u.regexp.pattern = NULL;
         p->u.regexp.bytecode = NULL;
-        p->u.regexp.metadata = NULL;
+        p->u.regexp.meta_off = 0;
+        p->u.regexp.realm_id = 0;
+        p->u.regexp.legacy = 0;
         goto set_exotic;
     default:
     set_exotic:
@@ -11117,20 +11195,28 @@ static JSValue js_new_young_array(JSContext *ctx, const JSValue *src, int count)
 /* Build an array from `count` registers, writing the values straight into the
    array's storage rather than a temporary on the C stack. */
 #if QJS_REGVM
+static JSValue regvm_array_from_regs_old(JSContext *ctx, const JSValue *src, int count);
+
 static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
                                      int count)
+{
+#if !QJS_PACKED_ARRAYS
+    if (y_interp_on && y_mine(ctx) && count > 0 && count <= JS_YARR_MAX) {
+        JSValue obj = js_new_young_array(ctx, src, count);
+        if (JS_VALUE_GET_TAG(obj) != JS_TAG_UNINITIALIZED)
+            return obj;
+    }
+#endif
+    return regvm_array_from_regs_old(ctx, src, count);
+}
+
+/* The array as an ordinary counted object, never a nursery cell. */
+static JSValue regvm_array_from_regs_old(JSContext *ctx, const JSValue *src, int count)
 {
     JSValue obj;
     JSObject *p;
     int i;
 
-#if !QJS_PACKED_ARRAYS
-    if (y_interp_on && y_mine(ctx) && count > 0 && count <= JS_YARR_MAX) {
-        obj = js_new_young_array(ctx, src, count);
-        if (JS_VALUE_GET_TAG(obj) != JS_TAG_UNINITIALIZED)
-            return obj;
-    }
-#endif
     if (count > 0 && count <= JS_ARRAY_INLINE_MAX)
         obj = JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->array_shape),
                                             JS_CLASS_ARRAY, NULL, 0, count);
@@ -12510,7 +12596,58 @@ static void ss_rng_of(void *ptr, JSValue val)
         ss_hit(p - 8, p + 64, val);
     }
 }
-static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
+/* A word that names a nursery cell of this epoch pins it: the cell is noted as a root, and the count taken here goes back at unpin. */
+static inline int ss_young_word(uintptr_t v)
+{
+    YChunk *c = (YChunk *)(v & ~(uintptr_t)65535);
+    uintptr_t off, idx, p;
+    uint32_t k;
+    for (k = 0; k < y_nurs_n; k++) if (y_nurs[k] == c) break;
+    if (k < y_nurs_n && v >= (uintptr_t)c + 64) {
+        off = v - ((uintptr_t)c + 64); idx = off / c->stride;
+        p = (uintptr_t)c + 64 + idx * c->stride + 8;
+        if (idx * c->stride + c->stride <= 65536 - 64 && Y_KIND((void *)p) == 0x80 && *(uint16_t *)(p + 22) == (uint16_t)(qjs_y_ep48 >> 48)) {
+            ss_stat[1]++;
+            ++JS_REF_COUNT((void *)p); y_note((void *)p);
+            ss_push(JS_MKPTR(JS_TAG_OBJECT, (void *)p));
+            return 1;
+        }
+    }
+    return 0;
+}
+#if !QJS_REGVM
+/* A running coroutine's frame lives in its heap state, not on the native stack, and its stack pointer is a local of the interpreter: the whole value area
+   is scanned like the native stack. A frame outside [lo, hi) is such a frame (every other frame is a local of its caller; C function frames do not set
+   cur_gc_obj, so it cannot tell them apart). */
+static void ss_scan_coro_frames(JSRuntime *rt, uintptr_t lo, uintptr_t hi)
+{
+    JSStackFrame *sf;
+    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
+        JSFunctionBytecode *b;
+        const JSValue *v, *end;
+        if ((uintptr_t)sf - lo < hi - lo || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+            continue;
+        b = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode;
+        end = sf->var_buf + b->var_count + b->stack_size;
+        for (v = sf->arg_buf; v < end; v++)
+            if (JS_VALUE_GET_TAG(*v) == JS_TAG_OBJECT && Y_REG(JS_VALUE_GET_PTR(*v)))
+                ss_young_word((uintptr_t)JS_VALUE_GET_PTR(*v));
+    }
+}
+#endif
+/* The scan reads every word of the native stack between its own frame and the stack top, including the redzones AddressSanitizer puts around
+   locals: the reads are the point of a conservative scan, so the function is not instrumented. */
+#if defined(__SANITIZE_ADDRESS__)
+#define SS_NO_ASAN __attribute__((no_sanitize_address))
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define SS_NO_ASAN __attribute__((no_sanitize_address))
+#endif
+#endif
+#ifndef SS_NO_ASAN
+#define SS_NO_ASAN
+#endif
+static __attribute__((noinline)) SS_NO_ASAN void ss_scan(JSRuntime *rt)
 {
     uintptr_t lo, hi = rt->stack_top, *w;
     uint32_t i, k;
@@ -12534,27 +12671,17 @@ static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
     for (w = (uintptr_t *)(lo & ~(uintptr_t)7); (uintptr_t)w < hi; w++) {
         uintptr_t v = *w;
         ss_stat[0]++;
-        if (Y_REG((void *)v)) {
-            YChunk *c = (YChunk *)(v & ~(uintptr_t)65535);
-            uintptr_t off, idx, p;
-            for (k = 0; k < y_nurs_n; k++) if (y_nurs[k] == c) break;
-            if (k < y_nurs_n && v >= (uintptr_t)c + 64) {
-                off = v - ((uintptr_t)c + 64); idx = off / c->stride;
-                p = (uintptr_t)c + 64 + idx * c->stride + 8;
-                if (idx * c->stride + c->stride <= 65536 - 64 && Y_KIND((void *)p) == 0x80 && *(uint16_t *)(p + 22) == (uint16_t)(qjs_y_ep48 >> 48)) {
-                    ss_stat[1]++;
-                    ++JS_REF_COUNT((void *)p); y_note((void *)p);
-                    ss_push(JS_MKPTR(JS_TAG_OBJECT, (void *)p));
-                    continue;
-                }
-            }
-        }
+        if (Y_REG((void *)v) && ss_young_word(v))
+            continue;
         if (ss_on == 1 && (v - js_heap_lo < js_heap_hi - js_heap_lo || Y_REG((void *)v))) {
             if (ss_sw_n >= ss_sw_cap) { ss_sw_cap = ss_sw_cap ? ss_sw_cap * 2 : 4096; ss_sw = __builtin_realloc(ss_sw, ss_sw_cap * sizeof(uintptr_t)); }
             ss_sw[ss_sw_n++] = v; ss_stat[2]++;
             if (ss_sw_n <= (1u << (SS_HT_BITS - 1))) ss_hadd(v);
         }
     }
+#if !QJS_REGVM
+    ss_scan_coro_frames(rt, lo, hi);
+#endif
     if (ss_sw_n == 0 || ss_on == 2) return;
     ss_stat[7]++;
     for (i = 0; i < rt->zpark_len; i++) __builtin_prefetch(rt->zpark[i]);
@@ -12575,7 +12702,7 @@ static void js_drc_pin(JSRuntime *rt)
     js_drc_pend_flush(rt);
     regvm_for_each_root_range(rt, js_drc_pin_range, NULL);
     { static int envss = -1; if (envss < 0) envss = getenv("QJS_STACKSCAN") != NULL; ss_on = ((qjs_aot_form_v & 1) || envss) ? 1 : (y_interp_on && __atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ? 2 : 0; }
-    if (ss_on && !ss_final) ss_scan(rt); else if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ss_n = 0;
+    if (ss_on && !rt->ss_final) ss_scan(rt); else if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ss_n = 0;
 }
 
 static void js_drc_unpin_range(void *opaque, JSValue *regs, uint32_t nregs)
@@ -12645,6 +12772,9 @@ static void y_collect(JSRuntime *rt)
     y_rt = rt;
     y_cnt[0]++;
     for (kb = 0; kb < 16; kb++) { YCls *k = &qjs_ycls[kb]; if (k->cur) { k->cur->bump = k->bump; y_abytes += (uint64_t)(k->bump - k->run0) / k->stride; } }
+#ifdef QJS_GC_STRESS
+    if (y_check_on < 0) y_check_on = 1;
+#endif
     if (y_check_on < 0) y_check_on = getenv("QJS_Y_CHECK") != NULL;
     if (y_stk_cap < y_roots_n + 64) { y_stk_cap = y_roots_n + 4096; y_stk = __builtin_realloc(y_stk, (size_t)y_stk_cap * sizeof(void *)); }
     for (i = 0; i < y_roots_n; i++) {
@@ -12659,6 +12789,12 @@ static void y_collect(JSRuntime *rt)
             if (c->rec) continue;
             for (; blk + stride <= c->bump; blk += stride) {
                 JSObject *p = (JSObject *)(blk + 8);
+#ifdef QJS_GC_STRESS
+                if (Y_IS(p) && p->has_weak_ref) {
+                    fprintf(stderr, "QJS_GC_STRESS: young cell %p has weak references (it would die without clearing them)\n", (void *)p);
+                    abort();
+                }
+#endif
                 if (Y_IS(p) && Y_RCN(JS_REF_COUNT(p)) > 0 && !js_rc(p)->mark) {
                     if (y_cnt[11]++ < 5) {
                         struct list_head *el_; int nh = 0;
@@ -12676,6 +12812,10 @@ static void y_collect(JSRuntime *rt)
                         }
                         fprintf(stderr, "  holders found: %d\n", nh);
                     }
+#ifdef QJS_GC_STRESS
+                    fprintf(stderr, "QJS_GC_STRESS: a young cell with references is not a root of the young collection\n");
+                    abort();
+#endif
                 }
             }
         }
@@ -12950,11 +13090,10 @@ static inline void regvm_put_arg(JSContext *ctx, JSValue *buf, int owned,
 static void js_regvm_drc_suspend(JSRuntime *rt, JSValue *regs, uint32_t nregs)
 {
     uint32_t i;
-    for (i = 0; i < nregs; i++) {
-        JSValue v = regs[i];
-        if (JS_VALUE_HAS_REF_COUNT(v))
-            JS_REF_COUNT(JS_VALUE_GET_PTR(v))++;
-    }
+    /* js_dup, not a bare increment: a nursery cell must be noted as referenced from the heap, or a young collection while the
+       coroutine is suspended frees it under the register that still names it. */
+    for (i = 0; i < nregs; i++)
+        js_dup(regs[i]);
 }
 
 static void js_regvm_drc_resume(JSRuntime *rt, JSValue *regs, uint32_t nregs)
@@ -15508,6 +15647,11 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
     ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
+#ifdef QJS_GC_STRESS
+    if (js_gc_stress_poll)
+        ctx->interrupt_counter = 1;
+    JS_GC_STRESS_FORCE(rt);
+#endif
     js_drc_safepoint(rt);
     if (rt->interrupt_handler) {
         if (rt->interrupt_handler(rt, rt->interrupt_opaque)) {
@@ -18130,6 +18274,9 @@ static int64_t js_arr_packed_find(const JSObject *p, JSValueConst target, int64_
 }
 #endif
 
+/* Stores val at idx past the end of a fast array, leaving holes in the gap. Takes val on every path: 1 stored it, -1 is an
+   exception, 0 declines (the gap is too large or too sparse, or length is not a writable int) and frees it; the caller then
+   converts the array and stores its own reference. */
 static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
                                    JSValue val)
 {
@@ -18142,20 +18289,20 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
     count = p->u.array.count;
     gap = idx - count;
     if (gap > JS_ARRAY_HOLE_MAX_GAP)
-        return 0;
+        goto decline;
     if (idx >= (uint32_t)INT32_MAX)
-        return 0;
+        goto decline;
     new_count = idx + 1;
     elems = new_count - ((p->holey ? p->u.array.hole_count : 0) + gap);
     if (new_count > JS_ARRAY_HOLE_DENSE_FLOOR &&
         elems * (uint64_t)JS_ARRAY_HOLE_MIN_DENSITY < new_count)
-        return 0;
+        goto decline;
     if (unlikely(JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT))
-        return 0;
+        goto decline;
     array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
     if (new_count > array_len &&
         unlikely(!(get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE)))
-        return 0;
+        goto decline;
     if (new_count > p->u.array.u1.size) {
         if (expand_fast_array(ctx, p, new_count)) {
             JS_FreeValue(ctx, val);
@@ -18174,6 +18321,9 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
     }
     p->u.array.hole_count += gap;
     return 1;
+ decline:
+    JS_FreeValue(ctx, val);
+    return 0;
 }
 
 static void js_array_fill_hole(JSObject *p, uint32_t idx, JSValue val)
@@ -29500,16 +29650,18 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
  * counted reference does not stop an unhashed shape from being mutated in
  * place; a hashed one with refcount >= 2 is copy-on-write, which the hit path
  * needs. The hash is recomputed from the property list because `sh->hash` is
- * only maintained while `is_hashed`. A shape with a deleted property is left
- * as it is: every delete makes its own copy, which no transition reaches, so
- * hashing them puts one more equal shape in the same bucket per object and
- * each free walks the chain. Its sites take the uncached path.
+ * only maintained while `is_hashed`. An ordinary object's shape with a deleted
+ * property (`copy`) is left as it is: every delete makes the object its own
+ * copy, which no transition reaches, so hashing them puts one more equal shape
+ * in the same bucket per object and each free walks the chain. Its sites take
+ * the uncached path. A prototype's shape is one long-lived shape however many
+ * objects read through it, so it is hashed even with a deleted property.
  */
-static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh)
+static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh, bool copy)
 {
     uint32_t h, i;
 
-    if (sh->is_hashed || sh->deleted_prop_count != 0)
+    if (sh->is_hashed || (copy && sh->deleted_prop_count != 0))
         return;
     if (2 * (rt->shape_hash_count + 1) > rt->shape_hash_size)
         resize_shape_hash(rt, rt->shape_hash_bits + 1);
@@ -29594,13 +29746,13 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
     /* A depth-0/1 site hashes its receiver shape (see regvm_shape_hashify);
        depth-2 sites use the global stub cache, which does not need it. */
     if (depth <= 1) {
-        regvm_shape_hashify(rt, rsh);
+        regvm_shape_hashify(rt, rsh, !p->is_prototype);
         if (hsh)
-            regvm_shape_hashify(rt, hsh);
+            regvm_shape_hashify(rt, hsh, false);
     } else {
-        regvm_shape_hashify(rt, rsh);
-        regvm_shape_hashify(rt, mid);
-        regvm_shape_hashify(rt, holder->shape);
+        regvm_shape_hashify(rt, rsh, !p->is_prototype);
+        regvm_shape_hashify(rt, mid, false);
+        regvm_shape_hashify(rt, holder->shape, false);
     }
 
     /* The site's state before the install below, which can newly kill it. A
@@ -31926,7 +32078,11 @@ static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
         nb++;
     }
 #if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
-    if ((qjs_aot_form_v & 4) || rt->aot_fl_top != NULL || rec_scan > 0 || (rec_scan < 0 && ((qjs_aot_form_v & 2) || getenv("QJS_RECSCAN"))))
+    /* rec_scan is decided once (the form bits are set by the units' constructors, before any code runs): an unset QJS_RECSCAN was
+       looked up again on every backtrace. */
+    if (rec_scan < 0)
+        rec_scan = (qjs_aot_form_v & 2) || getenv("QJS_RECSCAN") != NULL;
+    if ((qjs_aot_form_v & 4) || rt->aot_fl_top != NULL || rec_scan > 0)
         nb = regvm_merge_fl_records(rt, bt, anc, nb, max);
 #endif
     return nb;
@@ -34581,10 +34737,8 @@ static uint8_t *REGVM_CC regvm_t_branch_cmp_loc_reg(REGVM_ARGS)
                !((r = regvm_int_cmp(sub & ~REG_CMP_INVERT,
                                     JS_VALUE_GET_INT(a),
                                     JS_VALUE_GET_INT(b))) < 0))) {
-        if (unlikely(r ^ ((sub & REG_CMP_INVERT) != 0))) {
-            REGVM_DRC_BACKEDGE(ctx, off);
-            T_NEXT(T_SZ_BURT + off);
-        }
+        if (unlikely(r ^ ((sub & REG_CMP_INVERT) != 0)))
+            T_NEXT(T_SZ_BURT + off); /* T_NEXT runs the back-edge poll on the target it continues at */
         T_NEXT(T_SZ_BURT);
     }
     __attribute__((musttail)) return regvm_t_branch_cmp_loc_reg_slow(REGVM_PASS);
@@ -34716,6 +34870,10 @@ static uint8_t *REGVM_CC regvm_t_set_name(REGVM_ARGS)
 static inline __attribute__((always_inline)) int
 regvm_get_elem_typed(JSObject *p, uint32_t idx, JSValue *out)
 {
+    /* the class first: only an array or a typed array has u.array, and a plain object's allocation can end before it (its inline properties
+       start at u) */
+    if ((unsigned)(p->class_id - JS_CLASS_UINT8C_ARRAY) > (unsigned)(JS_CLASS_FLOAT64_ARRAY - JS_CLASS_UINT8C_ARRAY))
+        return 0;
     if (unlikely(idx >= p->u.array.count))
         return 0;
     switch (p->class_id) {
@@ -34766,6 +34924,9 @@ regvm_put_elem_fast(JSContext *ctx, JSValue recv, JSValue k, JSValue v)
         return 1;
     }
     if (JS_VALUE_GET_TAG(v) != JS_TAG_INT)
+        return 0;
+    /* as in regvm_get_elem_typed: u.array is read only once the class says the object has it */
+    if ((unsigned)(p->class_id - JS_CLASS_UINT8C_ARRAY) > (unsigned)(JS_CLASS_FLOAT64_ARRAY - JS_CLASS_UINT8C_ARRAY))
         return 0;
     if (unlikely(idx >= (uint32_t)p->u.array.count))
         return 0;
@@ -47465,6 +47626,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     done_generator:
         sf->cur_pc = pc;
         sf->cur_sp = sp;
+        /* A parked frame is off the native stack and out of the call chain, so no scan finds the nursery cells it holds (an object
+           literal suspended before its fields are filled): they are noted as referenced from the heap, or a young collection while the
+           coroutine waits frees them. */
+        if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_INT && likely(y_interp_on))
+            js_frame_note_young(sf->arg_buf, sp);
     } else {
     done:
         if (unlikely(sf->var_ref_count != 0)) {
@@ -64227,6 +64393,37 @@ static void add_pc2line_info(JSFunctionDef *s, uint32_t pc,
     s->col_number_last = col_num;
 }
 
+/* The bytes resolve_labels may add to an input instruction: a field access gains its inline-cache index (and a get_loc/get_arg fused with
+   it no more than that), an object literal its template index, an arguments element or a received array element its operand. A fused
+   group grows by at most the sum of its members. */
+static int resolve_growth(int op)
+{
+    switch (op) {
+    case OP_get_field:
+    case OP_get_field2:
+    case OP_put_field:
+    case OP_object:
+    case OP_args_el:
+        return 2;
+    case OP_get_array_el:
+    case OP_put_array_el:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* An upper bound of the output bytes of the input instructions in [pos, end). */
+static int resolve_gap_bound(const uint8_t *bc_buf, int pos, int end)
+{
+    int n = end - pos;
+    while (pos < end) {
+        n += resolve_growth(bc_buf[pos]);
+        pos += opcode_info[bc_buf[pos]].size;
+    }
+    return n;
+}
+
 /* Emit the IC variant for every cacheable field access when enabled. */
 static void resolve_emit_field(JSFunctionDef *s, DynBuf *bc_out,
                                int plain_op, int ic_op, JSAtom atom,
@@ -64940,6 +65137,9 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     int args_alias_idx = -1;
     D3Ev *d3_ev = NULL;
     int d3_n = 0, d3_k = 0;
+#ifndef NDEBUG
+    int grow_pos = -1, grow_out = 0;
+#endif
 
     label_slots = s->label_slots;
 
@@ -65090,6 +65290,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 
     for (pos = prologue_skip_to; pos < bc_len; pos = pos_next) {
         int val;
+#ifndef NDEBUG
+        /* the previous step grew within resolve_growth, which the forward 8-bit jumps rely on */
+        assert(grow_pos < 0 || (int)bc_out.size - grow_out <= resolve_gap_bound(bc_buf, grow_pos, pos));
+        grow_pos = pos;
+        grow_out = bc_out.size;
+#endif
         objlit_template_index = -1;
         op = bc_buf[pos];
         len = opcode_info[op].size;
@@ -65306,8 +65512,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             jp->label = label;
 
             if (ls->addr == -1) {
+                /* The label's output position is not known yet, and this pass can make code longer than its input (resolve_growth):
+                   the 8-bit form is taken only when the gap still fits with the growth it may get. Anything else is shortened by the
+                   jump pass at the end, which sees the final positions. */
                 int diff = ls->pos2 - pos - 1;
-                if (diff < 128 && (op == OP_if_false || op == OP_if_true || op == OP_goto)) {
+                if (diff < 128 && (op == OP_if_false || op == OP_if_true || op == OP_goto) &&
+                    diff - (ls->pos2 - pos_next) + resolve_gap_bound(bc_buf, pos_next, ls->pos2) < 128) {
                     jp->size = 1;
                     jp->op = OP_if_false8 + (op - OP_if_false);
                     dbuf_putc(&bc_out, OP_if_false8 + (op - OP_if_false));
@@ -66260,6 +66470,218 @@ static __exception int ss_check(JSContext *ctx, StackSizeState *s,
     s->pc_stack[s->pc_stack_len++] = pos;
     return 0;
 }
+
+/* The bytecode verifier, compiled in assertion builds only (QJS_BC_VERIFY; nothing of it is in a -DNDEBUG build unless asked for).
+   compute_stack_size already checks opcodes, bounds and the stack depth at merges; this adds what it does not: every jump lands
+   on an instruction start, and every operand index (local, argument, closure variable, constant, atom, inline-cache entry) is
+   in range for the function. A failure throws an InternalError naming the pc and opcode, and with dumps compiled in prints the
+   function's disassembly. */
+#if !defined(QJS_BC_VERIFY) && !defined(NDEBUG)
+#define QJS_BC_VERIFY 1
+#endif
+#if defined(QJS_BC_VERIFY) && QJS_BC_VERIFY
+static int js_bc_verify_fail(JSContext *ctx, JSFunctionDef *fd, int pos, int op, const char *what, int val)
+{
+#ifdef ENABLE_DUMPS
+    {
+        /* dump_byte_code decodes short opcodes when given a bytecode object; without a source it reads nothing else from it. */
+        JSFunctionBytecode shortform;
+        memset(&shortform, 0, sizeof(shortform));
+        printf("bytecode verifier: function at line %d\n", fd->line_num);
+        dump_byte_code(ctx, 3, fd->byte_code.buf, fd->byte_code.size, fd->args, fd->arg_count, fd->vars, fd->var_count,
+                       fd->closure_var, fd->closure_var_count, fd->cpool, fd->cpool_count, NULL, fd->line_num, NULL,
+                       &shortform, 0);
+    }
+#endif
+#ifdef ENABLE_DUMPS
+    JS_ThrowInternalError(ctx, "bytecode verifier: %s %d (op=%s, pc=%d)", what, val,
+                          op < OP_COUNT ? short_opcode_info(op).name : "?", pos);
+#else
+    JS_ThrowInternalError(ctx, "bytecode verifier: %s %d (op=%d, pc=%d)", what, val, op, pos);
+#endif
+    return -1;
+}
+
+static int js_bc_verify_atom(JSContext *ctx, JSAtom a)
+{
+    JSRuntime *rt = ctx->rt;
+    if (__JS_AtomIsTaggedInt(a))
+        return 1;
+    return a < (JSAtom)rt->atom_size && !atom_is_free(rt->atom_array[a]);
+}
+
+static __exception int js_bc_verify(JSContext *ctx, JSFunctionDef *fd)
+{
+    const uint8_t *tab = fd->byte_code.buf;
+    int len = fd->byte_code.size, pos, op, size, target, idx;
+    uint8_t *start;
+    const JSOpCode *oi;
+
+    start = js_mallocz(ctx, len + 1);
+    if (!start)
+        return -1;
+    for (pos = 0; pos < len; pos += size) {
+        op = tab[pos];
+        if (op >= OP_COUNT) {
+            js_free(ctx, start);
+            return js_bc_verify_fail(ctx, fd, pos, op, "invalid opcode", op);
+        }
+        size = short_opcode_info(op).size;
+        if (size <= 0 || pos + size > len) {
+            js_free(ctx, start);
+            return js_bc_verify_fail(ctx, fd, pos, op, "instruction past the end, size", size);
+        }
+        start[pos] = 1;
+    }
+#define VFAIL(what, v) do { js_free(ctx, start); return js_bc_verify_fail(ctx, fd, pos, op, what, (int)(v)); } while (0)
+#define VLOC(i) do { if ((unsigned)(i) >= (unsigned)fd->var_count) VFAIL("local index", i); } while (0)
+#define VARG(i) do { if ((unsigned)(i) >= (unsigned)fd->arg_count) VFAIL("argument index", i); } while (0)
+#define VREF(i) do { if ((unsigned)(i) >= (unsigned)fd->closure_var_count) VFAIL("closure variable index", i); } while (0)
+#define VIC(i) do { if (JS_ENABLE_IC && (unsigned)(i) >= fd->ic_count) VFAIL("inline cache index", i); } while (0)
+    for (pos = 0; pos < len; pos += size) {
+        const uint8_t *a;
+        op = tab[pos];
+        oi = &short_opcode_info(op);
+        size = oi->size;
+        a = tab + pos + 1;
+        target = -1;
+        switch (oi->fmt) {
+        case OP_FMT_label8:
+            target = pos + 1 + (int8_t)a[0];
+            break;
+        case OP_FMT_label16:
+            target = pos + 1 + (int16_t)get_u16(a);
+            break;
+        case OP_FMT_label:
+        case OP_FMT_label_u16:
+            target = pos + 1 + (int32_t)get_u32(a);
+            break;
+        case OP_FMT_atom_label_u8:
+        case OP_FMT_atom_label_u16:
+            if (!js_bc_verify_atom(ctx, get_u32(a)))
+                VFAIL("atom", get_u32(a));
+            target = pos + 5 + (int32_t)get_u32(a + 4);
+            break;
+        case OP_FMT_const8:
+            if (a[0] >= fd->cpool_count)
+                VFAIL("constant index", a[0]);
+            break;
+        case OP_FMT_const:
+            if (get_u32(a) >= (uint32_t)fd->cpool_count)
+                VFAIL("constant index", get_u32(a));
+            break;
+        case OP_FMT_atom:
+        case OP_FMT_atom_u8:
+        case OP_FMT_atom_u16:
+            if (!js_bc_verify_atom(ctx, get_u32(a)))
+                VFAIL("atom", get_u32(a));
+            switch (op) {
+            case OP_get_field_ic:
+            case OP_get_field2_ic:
+            case OP_put_field_ic:
+                VIC(get_u16(a + 4));
+                break;
+            case OP_get_loc_field_nr:
+                VLOC(get_u16(a + 4));
+                VIC(get_u16(a + 6));
+                break;
+            case OP_get_arg_field_nr:
+                VARG(get_u16(a + 4));
+                VIC(get_u16(a + 6));
+                break;
+            case OP_make_loc_ref:
+                VLOC(get_u16(a + 4));
+                break;
+            case OP_make_arg_ref:
+                VARG(get_u16(a + 4));
+                break;
+            case OP_make_var_ref_ref:
+                VREF(get_u16(a + 4));
+                break;
+            }
+            break;
+        case OP_FMT_loc:
+            VLOC(get_u16(a));
+            break;
+        case OP_FMT_arg:
+            VARG(get_u16(a));
+            break;
+        case OP_FMT_var_ref:
+            VREF(get_u16(a));
+            break;
+        case OP_FMT_loc8:
+            switch (op) {
+            case OP_get_arg8_el_recv:
+            case OP_get_arg8_array_el:
+                VARG(a[0]);
+                break;
+            case OP_put_el_recv:
+                if (a[0] & 0x80)
+                    VARG(a[0] & 0x7f);
+                else
+                    VLOC(a[0]);
+                break;
+            default:
+                VLOC(a[0]);
+                break;
+            }
+            break;
+        case OP_FMT_loc8_loc8:
+            if (op == OP_reserved7) {
+                VARG(a[0]);
+                VLOC(a[1]);
+            }
+            break;
+        case OP_FMT_none_loc:
+            switch (op) {
+            case OP_get_loc0: case OP_put_loc0: case OP_set_loc0: idx = 0; break;
+            case OP_get_loc1: case OP_put_loc1: case OP_set_loc1: idx = 1; break;
+            case OP_get_loc2: case OP_put_loc2: case OP_set_loc2: idx = 2; break;
+            case OP_get_loc3: case OP_put_loc3: case OP_set_loc3: idx = 3; break;
+            default: idx = -1; break;
+            }
+            if (idx >= 0)
+                VLOC(idx);
+            break;
+        case OP_FMT_none_arg:
+            switch (op) {
+            case OP_get_arg0: case OP_put_arg0: case OP_set_arg0: idx = 0; break;
+            case OP_get_arg1: idx = 1; break;
+            case OP_get_arg2: idx = 2; break;
+            case OP_get_arg3: idx = 3; break;
+            default: idx = -1; break;
+            }
+            if (idx >= 0)
+                VARG(idx);
+            break;
+        case OP_FMT_none_var_ref:
+            switch (op) {
+            case OP_get_var_ref0: case OP_put_var_ref0: case OP_set_var_ref0: idx = 0; break;
+            case OP_get_var_ref1: idx = 1; break;
+            case OP_get_var_ref2: idx = 2; break;
+            case OP_get_var_ref3: idx = 3; break;
+            default: idx = -1; break;
+            }
+            if (idx >= 0)
+                VREF(idx);
+            break;
+        default:
+            break;
+        }
+        if (target >= 0 || oi->fmt == OP_FMT_label8 || oi->fmt == OP_FMT_label16) {
+            if (target < 0 || target >= len || !start[target])
+                VFAIL("jump target not an instruction start", target);
+        }
+    }
+#undef VFAIL
+#undef VLOC
+#undef VARG
+#undef VREF
+#undef VIC
+    js_free(ctx, start);
+    return 0;
+}
+#endif
 
 static __exception int compute_stack_size(JSContext *ctx,
                                           JSFunctionDef *fd,
@@ -70551,7 +70973,7 @@ QJS_AOT_STUB JSValue qjs_aot_gated_call(JSContext *ctx, JSObject *co, JSValue th
    needs the slot to be writable and the object not to be a prototype. It never
    runs JavaScript, so a compiled body may call it without a safepoint. */
 #if QJS_AOT || QJS_AOT_GEN
-static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh);
+static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh, bool copy);
 
 static int js_aot_poly_lookup(JSObject *obj, JSAtom atom, int write, uint32_t *off)
 {
@@ -72764,14 +73186,15 @@ int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v)
     return 0;
 }
 
+/* Compiled code keeps the array where no nursery collection can see it, so it is built as an ordinary object. A nursery cell
+   promoted on the spot cost the promotion, and its death went unnoticed: the young allocation runs no collection trigger, so a
+   compiled loop without a safepoint parked every dead array until the end of the run. */
 int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)
 {
-    JSValue val = regvm_array_from_regs(ctx, argv, na);
+    JSValue val = regvm_array_from_regs_old(ctx, argv, na);
 
     if (JS_IsException(val))
         return -1;
-    if (Y_YOUNG(JS_VALUE_GET_PTR(val)))
-        y_promote_now(JS_VALUE_GET_OBJ(val));
     *out = val;
     return 0;
 }
@@ -74010,7 +74433,7 @@ QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
    1 when the site now holds (the caller probes it again), 0 when the global is absent, an accessor, uninitialised or the function has no
    cache array yet. A compiled loop whose hoisted global read found the cell empty (a process that has not run the site yet) fills it here
    and goes on, where the miss would hand the rest of the activation to the interpreter. */
-QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int atom)
+static int qjs_aot_global_warm_pic(JSContext *ctx, JSFunctionBytecode *b, JSRegPIC **ppic, int site, int atom)
 {
     JSValue v;
     JSObject *p;
@@ -74018,7 +74441,7 @@ QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int 
     JSProperty *pr;
     int k;
 
-    if (f->pic == NULL)
+    if (*ppic == NULL)
         return 0;
     if (!js_gv_cell_peek(ctx, (JSAtom)atom, &v)) {
         for (k = 0; k < 2; k++) {
@@ -74041,8 +74464,19 @@ QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int 
         }
         JS_FreeValue(ctx, v);
     }
-    regvm_global_site_fill(ctx, f->b, &f->pic, (JSAtom)atom, site);
+    regvm_global_site_fill(ctx, b, ppic, (JSAtom)atom, site);
     return 1;
+}
+
+QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int atom)
+{
+    return qjs_aot_global_warm_pic(ctx, f->b, &f->pic, site, atom);
+}
+
+/* The same for a frameless body, which has no frame: the cache array is the function's own (a frame's is the same pointer). */
+QJS_AOT_STUB int qjs_aot_global_warm_b(JSContext *ctx, struct JSFunctionBytecode *b, int site, int atom)
+{
+    return qjs_aot_global_warm_pic(ctx, b, &b->regvm_pic, site, atom);
 }
 
 __attribute__((always_inline)) int qjs_aot_put_field_own(JSContext *ctx, JSRegRun *f, JSValue recv, int site, JSValue v)
@@ -84458,6 +84892,97 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     return rc;
 }
 
+#if defined(QJS_BC_VERIFY) && QJS_BC_VERIFY
+/* The register program a lowering produced, checked before the function is made (assertion builds only, with js_bc_verify).
+   Once per process: every stack opcode has a lowering kind and every register opcode an operand format. Per function: the
+   program decodes exactly to its end, every register operand is an aligned slot of the register file, and every branch lands
+   on an instruction start. A failure is an InternalError naming the register pc and opcode. */
+static __exception int js_regvm_verify(JSContext *ctx, JSFunctionDef *fd)
+{
+    static int tables_ok;
+    const uint8_t *code = fd->regvm_code;
+    int len = fd->regvm_len, pc, op, sz, m, q, k;
+    uint8_t *start;
+    int32_t nregs = fd->regvm_reg_count;
+
+    if (!tables_ok) {
+        for (op = 0; op < OP_COUNT; op++) {
+            if (regvm_op_kind[op] == REG_LOWER_UNSET) {
+                JS_ThrowInternalError(ctx, "register verifier: stack opcode %d has no lowering kind", op);
+                return -1;
+            }
+        }
+        /* ROP_put_local_probe has no format: the encoder never emits it (a program holding it fails the decode below). */
+        for (op = 1; op < ROP_COUNT; op++) {
+            if (regvm_rop_fmt[op] == NULL && op != ROP_put_local_probe) {
+                JS_ThrowInternalError(ctx, "register verifier: register opcode %d has no operand format", op);
+                return -1;
+            }
+        }
+        tables_ok = 1;
+    }
+    if (code == NULL || len <= 0)
+        return 0;
+    start = js_mallocz(ctx, len + 1);
+    if (!start)
+        return -1;
+    for (pc = 0; pc < len; pc += 1 + sz) {
+        op = code[pc];
+        if (op <= 0 || op >= ROP_COUNT || regvm_rop_fmt[op] == NULL) {
+            js_free(ctx, start);
+            JS_ThrowInternalError(ctx, "register verifier: invalid opcode %d (pc=%d)", op, pc);
+            return -1;
+        }
+        sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
+        if (sz < 0 || pc + 1 + sz > len) {
+            js_free(ctx, start);
+            JS_ThrowInternalError(ctx, "register verifier: instruction past the end (op=%d, pc=%d)", op, pc);
+            return -1;
+        }
+        start[pc] = 1;
+    }
+    for (pc = 0; pc < len; pc += 1 + sz) {
+        const char *fmt;
+        int nar;
+        op = code[pc];
+        fmt = regvm_rop_fmt[op];
+        nar = regvm_rop_narrow((uint16_t)op);
+        sz = regvm_fmt_size(fmt, 1, (uint16_t)op);
+        q = pc + 1;
+        for (m = 0; fmt[m]; m++) {
+            switch (fmt[m]) {
+            case 'r':
+                k = nar ? code[q] : regvm_ld_u16(code + q);
+                if (k % (int)sizeof(JSValue) != 0 || k / (int)sizeof(JSValue) >= nregs) {
+                    js_free(ctx, start);
+                    JS_ThrowInternalError(ctx, "register verifier: register operand %d outside the %d registers (op=%d, pc=%d)",
+                                          k, nregs, op, pc);
+                    return -1;
+                }
+                q += nar ? 1 : 2;
+                break;
+            case 't':
+                k = nar ? (int8_t)code[q] : (int32_t)regvm_ld_u32(code + q);
+                k += pc + 1 + sz;
+                if (k < 0 || k >= len || !start[k]) {
+                    js_free(ctx, start);
+                    JS_ThrowInternalError(ctx, "register verifier: branch target %d not an instruction start (op=%d, pc=%d)",
+                                          k, op, pc);
+                    return -1;
+                }
+                q += nar ? 1 : 4;
+                break;
+            case 'i': case 'b': q += 1; break;
+            case 'u': case 's': q += 2; break;
+            default: q += 4; break;
+            }
+        }
+    }
+    js_free(ctx, start);
+    return 0;
+}
+#endif
+
 static __exception int js_regvm_scan(JSContext *ctx, JSFunctionDef *fd)
 {
     const uint8_t *bc_buf = fd->byte_code.buf;
@@ -85983,6 +86508,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     if (resolve_labels(ctx, fd))
         goto fail;
 
+#if defined(QJS_BC_VERIFY) && QJS_BC_VERIFY
+    if (js_bc_verify(ctx, fd))
+        goto fail;
+#endif
     if (compute_stack_size(ctx, fd, &stack_size) < 0)
         goto fail;
 
@@ -85991,6 +86520,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
        decodes exactly, is fully classified, and has coherent targets. */
     if (js_regvm_scan(ctx, fd))
         goto fail;
+#if defined(QJS_BC_VERIFY) && QJS_BC_VERIFY
+    if (fd->regvm_compiled && js_regvm_verify(ctx, fd))
+        goto fail;
+#endif
     if (!fd->regvm_compiled) {
         /* No stack interpreter can run this function, so it must not be
            created: the error belongs at the function's source position, not the
@@ -102268,10 +102801,11 @@ static void js_regexp_set_compiled_data(JSRegExp *re, JSString *pattern,
 
     re->pattern = pattern;
     re->bytecode = bytecode;
-    re->metadata = NULL;
+    re->meta_off = 0;
     if (!bytecode->is_wide_char &&
         lre_get_metadata(str8(bytecode), bytecode->len, &metadata) == 1) {
-        re->metadata = metadata.payload - LRE_META_HEADER_LEN;
+        re->meta_off = metadata.payload - LRE_META_HEADER_LEN - str8(bytecode);
+        assert(re->meta_off != 0);
     }
 }
 
@@ -102308,6 +102842,10 @@ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
     re = &p->u.regexp;
     js_regexp_set_compiled_data(re, JS_VALUE_GET_STRING(pattern),
                                 JS_VALUE_GET_STRING(bc));
+    re->realm_id = ctx->realm_id;
+    re->legacy = JS_IsUndefined(ctor) ||
+                 (JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT &&
+                  JS_VALUE_GET_PTR(ctor) == JS_VALUE_GET_PTR(ctx->regexp_ctor));
     if (unlikely(re_st_on))
         re_st_note_created(re);
     return obj;
@@ -102434,6 +102972,9 @@ static JSValue js_regexp_compile(JSContext *ctx, JSValueConst this_val,
     re = js_get_regexp(ctx, this_val, true);
     if (!re)
         return JS_EXCEPTION;
+    /* Annex B: only a regexp of this realm made by its %RegExp% can be recompiled */
+    if (re->realm_id != ctx->realm_id || !re->legacy)
+        return JS_ThrowTypeError(ctx, "RegExp.prototype.compile: not a RegExp of this realm made by RegExp");
     pattern1 = argv[0];
     flags1 = argv[1];
     re1 = js_get_regexp(ctx, pattern1, false);
@@ -103246,7 +103787,7 @@ js_regexp_exec_data_init(JSRegExpExecData *d, JSRegExp *re, int capture_count)
 {
     d->bytecode = str8(re->bytecode);
     d->re_flags = lre_get_flags(d->bytecode);
-    d->metadata = re->metadata;
+    d->metadata = re->meta_off ? d->bytecode + re->meta_off : NULL;
     d->strategy = JS_REGEXP_MATCH_GENERIC;
     if (d->metadata) {
         switch (d->metadata[LRE_META_KIND_OFFSET]) {
@@ -103534,13 +104075,111 @@ js_regexp_match_counted(JSContext *ctx, uint8_t **capture,
     return re_st_match_done(re, str, start_index, d->strategy, rc, capture, t0);
 }
 
-static inline int
+/* A successful RegExpBuiltinExec sets the legacy statics of the current realm (UpdateLegacyRegExpStaticProperties):
+   the subject, and the capture pointers of the match, $1..$9 and the last group (the getters make the substrings).
+   A regexp of another realm, or one made by a subclass, invalidates them instead. */
+static inline __attribute__((always_inline)) void js_regexp_legacy_update(JSContext *ctx, uint8_t **capture,
+                                           const JSRegExpExecData *d, JSRegExp *re,
+                                           JSString *str)
+{
+    int n;
+
+    if (unlikely(!re->legacy || re->realm_id != ctx->realm_id)) {
+        ctx->re_legacy_valid = false;
+        return;
+    }
+    ctx->re_legacy_valid = true;
+    if (unlikely(JS_VALUE_GET_PTR(ctx->re_subject) != str)) {
+        JS_FreeValue(ctx, ctx->re_subject);
+        ctx->re_subject = js_dup(JS_MKPTR(JS_TAG_STRING, str));
+    }
+    if (unlikely(!JS_IsUninitialized(ctx->re_input))) {
+        JS_FreeValue(ctx, ctx->re_input);
+        ctx->re_input = JS_UNINITIALIZED;
+    }
+    n = lre_get_capture_count(d->bytecode);
+    /* A fixed copy of the match and $1..$9: every capture buffer has at least JS_REGEXP_CAPTURE_STACK_SIZE entries (the
+       stack one, or a larger allocation), and the getters read no group at or past n. */
+    static_assert(JS_REGEXP_CAPTURE_STACK_SIZE >= 20, "legacy statics copy 20 capture pointers");
+    memcpy(ctx->re_legacy_cap, capture, sizeof(ctx->re_legacy_cap));
+    ctx->re_legacy_last[0] = capture[2 * n - 2];
+    ctx->re_legacy_last[1] = capture[2 * n - 1];
+    ctx->re_legacy_n = n;
+}
+
+static inline __attribute__((always_inline)) int
 js_regexp_match(JSContext *ctx, uint8_t **capture, const JSRegExpExecData *d,
                 JSRegExp *re, JSString *str, int start_index)
 {
+    int rc;
+
     if (unlikely(re_st_on))
-        return js_regexp_match_counted(ctx, capture, d, re, str, start_index);
-    return js_regexp_match_raw(ctx, capture, d, re, str, start_index);
+        rc = js_regexp_match_counted(ctx, capture, d, re, str, start_index);
+    else
+        rc = js_regexp_match_raw(ctx, capture, d, re, str, start_index);
+    if (rc == 1)
+        js_regexp_legacy_update(ctx, capture, d, re, str);
+    return rc;
+}
+
+/* get RegExp.input, lastMatch, lastParen, leftContext, rightContext, $1..$9 (magic 0..4, 5..13) and their $ aliases:
+   GetLegacyRegExpStaticProperty. Only %RegExp% of the getter's realm has them, and only while they are valid. */
+static JSValue js_regexp_legacy_get(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    const uint8_t *const *cap = ctx->re_legacy_cap;
+    const uint8_t *base;
+    JSString *sp;
+    int a, b, k, shift;
+
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_PTR(this_val) != JS_VALUE_GET_PTR(ctx->regexp_ctor))
+        return JS_ThrowTypeError(ctx, "RegExp legacy static accessor called on an incompatible receiver");
+    if (!ctx->re_legacy_valid)
+        return JS_ThrowTypeError(ctx, "RegExp legacy static properties are not available");
+    if (magic == 0)
+        return js_dup(JS_IsUninitialized(ctx->re_input) ? ctx->re_subject : ctx->re_input);
+    sp = JS_VALUE_GET_STRING(ctx->re_subject);
+    base = str8(sp);
+    shift = sp->is_wide_char;
+    if (magic == 2) {                                   /* lastParen */
+        if (ctx->re_legacy_n < 2)
+            return js_empty_string(ctx->rt);
+        cap = ctx->re_legacy_last;
+        k = 0;
+    } else {
+        k = magic >= 5 ? magic - 4 : 0;                 /* $1..$9, or the match */
+        if (k >= ctx->re_legacy_n)
+            return js_empty_string(ctx->rt);
+    }
+    if (!cap[2 * k] || !cap[2 * k + 1])
+        return js_empty_string(ctx->rt);
+    a = (cap[2 * k] - base) >> shift;
+    b = (cap[2 * k + 1] - base) >> shift;
+    if (magic == 3) {                                   /* leftContext */
+        b = a;
+        a = 0;
+    } else if (magic == 4) {                            /* rightContext */
+        a = b;
+        b = sp->len;
+    }
+    return js_sub_string(ctx, sp, a, b);
+}
+
+/* set RegExp.input and RegExp.$_: SetLegacyRegExpStaticProperty */
+static JSValue js_regexp_legacy_set_input(JSContext *ctx, JSValueConst this_val, JSValueConst val, int magic)
+{
+    JSValue str;
+
+    (void)magic;
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_PTR(this_val) != JS_VALUE_GET_PTR(ctx->regexp_ctor))
+        return JS_ThrowTypeError(ctx, "RegExp legacy static accessor called on an incompatible receiver");
+    str = JS_ToString(ctx, val);
+    if (JS_IsException(str))
+        return JS_EXCEPTION;
+    JS_FreeValue(ctx, ctx->re_input);
+    ctx->re_input = str;
+    return JS_UNDEFINED;
 }
 
 /* Prepare the shared capture buffer and execution strategy. Callers retain
@@ -105783,6 +106422,25 @@ done:
 static const JSCFunctionListEntry js_regexp_funcs[] = {
     JS_CFUNC_DEF("escape", 1, js_regexp_escape ),
     JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL ),
+    JS_CGETSET_MAGIC_DEF("input", js_regexp_legacy_get, js_regexp_legacy_set_input, 0 ),
+    JS_CGETSET_MAGIC_DEF("$_", js_regexp_legacy_get, js_regexp_legacy_set_input, 0 ),
+    JS_CGETSET_MAGIC_DEF("lastMatch", js_regexp_legacy_get, NULL, 1 ),
+    JS_CGETSET_MAGIC_DEF("$&", js_regexp_legacy_get, NULL, 1 ),
+    JS_CGETSET_MAGIC_DEF("lastParen", js_regexp_legacy_get, NULL, 2 ),
+    JS_CGETSET_MAGIC_DEF("$+", js_regexp_legacy_get, NULL, 2 ),
+    JS_CGETSET_MAGIC_DEF("leftContext", js_regexp_legacy_get, NULL, 3 ),
+    JS_CGETSET_MAGIC_DEF("$`", js_regexp_legacy_get, NULL, 3 ),
+    JS_CGETSET_MAGIC_DEF("rightContext", js_regexp_legacy_get, NULL, 4 ),
+    JS_CGETSET_MAGIC_DEF("$'", js_regexp_legacy_get, NULL, 4 ),
+    JS_CGETSET_MAGIC_DEF("$1", js_regexp_legacy_get, NULL, 5 ),
+    JS_CGETSET_MAGIC_DEF("$2", js_regexp_legacy_get, NULL, 6 ),
+    JS_CGETSET_MAGIC_DEF("$3", js_regexp_legacy_get, NULL, 7 ),
+    JS_CGETSET_MAGIC_DEF("$4", js_regexp_legacy_get, NULL, 8 ),
+    JS_CGETSET_MAGIC_DEF("$5", js_regexp_legacy_get, NULL, 9 ),
+    JS_CGETSET_MAGIC_DEF("$6", js_regexp_legacy_get, NULL, 10 ),
+    JS_CGETSET_MAGIC_DEF("$7", js_regexp_legacy_get, NULL, 11 ),
+    JS_CGETSET_MAGIC_DEF("$8", js_regexp_legacy_get, NULL, 12 ),
+    JS_CGETSET_MAGIC_DEF("$9", js_regexp_legacy_get, NULL, 13 ),
 };
 
 static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
@@ -106951,6 +107609,16 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
 }
 
 
+static bool js_json_is_ascii(const uint8_t *p, uint32_t n)
+{
+    uint32_t i;
+    uint8_t acc = 0;
+
+    for (i = 0; i < n; i++)
+        acc |= p[i];
+    return acc < 0x80;
+}
+
 static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -106974,6 +107642,13 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                 return obj;
             exc = JS_GetException(ctx);
             if (JS_IsUncatchableError(exc))
+                return JS_Throw(ctx, exc);
+            /* An ASCII input is the same bytes in its UTF-8 copy, and the Latin-1 reading differs only on bytes >= 0x80: the
+               general path would raise this same syntax error, so it is kept rather than built a second time (with its
+               backtrace). A memory or stack failure is redone, as is any failure on a non-ASCII input. */
+            if (JS_VALUE_GET_TAG(exc) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(exc)->class_id == JS_CLASS_ERROR &&
+                JS_VALUE_GET_OBJ(exc)->shape->proto == JS_VALUE_GET_OBJ(ctx->native_error_proto[JS_SYNTAX_ERROR]) &&
+                js_json_is_ascii(str8(jp), jp->len))
                 return JS_Throw(ctx, exc);
             JS_FreeValue(ctx, exc);
         }
@@ -109569,6 +110244,10 @@ static JSWeakRefRecord **weak_slot(JSRuntime *rt, JSObject *p, bool create)
     }
     if (!create)
         return NULL;
+    /* A young collection drops a dead cell without visiting it, so a cell with weak references must be old: its weak records are
+       then cleared when it dies, through the ordinary free. */
+    if (Y_IS(p))
+        y_promote_now(p);
     t->key[i] = p;
     t->head[i] = NULL;
     t->n++;

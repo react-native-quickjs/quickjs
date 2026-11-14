@@ -101,6 +101,53 @@ emit('  }');
 emit('  var tot = 0; for (var q = 0; q < res.length; q++) tot += res[q];');
 emit('  return tot + arr.length;');
 emit('}');
+// Coroutine shapes (drawn after everything above, so a seed's earlier program is unchanged): objects made between
+// suspensions and read after more allocation, in generators and async functions; stores far past an array's end.
+const nCo = 1 + ri(3);
+for (let i = 0; i < nCo; i++) {
+  const c = pick(classes);
+  const f = pick(c.fs);
+  emit(`function* g${i}(o, n) {`);
+  emit('  for (var i = 0; i < n; i++) {');
+  emit(`    var held = { v: i, w: { x: ${numExpr({ objs: [{ v: 'o', cls: c }] }, 1)} }, k: new ${c.name}(${c.fs.map(() => ri(9)).join(', ')}) };`);
+  if (chance(0.5)) emit(`    var got = yield held.v + held.w.x;`);
+  else emit(`    var got = yield held;`);
+  emit(`    for (var j = 0; j < ${2 + ri(30)}; j++) o.${f} = { j: j }.j + (got === undefined ? 0 : 1);`);
+  emit(`    if (held.k.sum() !== held.k.sum()) throw new Error('held');`);
+  emit(`    yield held.w.x + held.k.${f};`);
+  emit('  }');
+  emit('  return n;');
+  emit('}');
+  emit(`async function a${i}(o, n) {`);
+  emit('  var acc = 0;');
+  emit('  for (var i = 0; i < n; i++) {');
+  emit(`    var before = { i: i, p: [i, i + 1] };`);
+  emit(`    await ${chance(0.5) ? 'null' : `idle${i}()`};`);
+  emit(`    var mid = { b: before, q: new ${c.name}(${c.fs.map(() => ri(9)).join(', ')}) };`);
+  emit(`    acc += await take${i}(mid.q.sum() + before.p[1]);`);
+  emit(`    for (var j = 0; j < ${1 + ri(20)}; j++) acc += { j: j }.j & 1;`);
+  emit('    acc += mid.b.i + mid.b.p[0];');
+  emit('  }');
+  emit('  return acc;');
+  emit('}');
+  emit(`async function idle${i}() { }`);
+  emit(`async function take${i}(x) { return x; }`);
+}
+emit('function far(n) { var a = []; for (var k = 0; k < n; k++) a[k * ' + (50 + ri(400)) + '] = { k: k, s: [k] }; var t = 0; for (var q in a) t += a[q].k + a[q].s[0]; return t + a.length; }');
+emit('function genSum(it) { var t = 0, r = it.next(); var c = 0; while (!r.done) { t += typeof r.value === "object" ? r.value.v + r.value.w.x : r.value; r = it.next(c++); } return t + r.value; }');
+// A forward jump over a run of field accesses whose cache operands make the code grow past an 8-bit offset (the input gap is
+// just under 128 bytes for some run lengths).
+{
+  const c = classes[0];
+  const nput = 2 + ri(13);
+  const seq = Array.from({ length: nput }, (_, q) => `this.p.${c.fs[q % c.fs.length]} = this.c.${c.fs[(q + 1) % c.fs.length]}`).join(', ');
+  emit(`function FJ(o) { this.c = o; this.p = new ${c.name}(${c.fs.map(() => 0).join(', ')}); }`);
+  emit(`FJ.prototype.run = function (k) { var i = k && this.c.${c.fs[0]} !== this.p.${c.fs[0]}; return i && (${seq}), i ? this.p.sum() : -1; };`);
+  emit(`function fj(o, k) { return new FJ(o).run(k); }`);
+}
+const coCalls = [];
+for (let i = 0; i < nCo; i++) coCalls.push(`genSum(g${i}(new ${classes[0].name}(1, 2, 3, 4, 5, 6), ${2 + ri(6)}))`);
+emit(`function coMain() { return ${coCalls.join(' + ')} + far(${3 + ri(10)}) + fj(new ${classes[0].name}(1, 2, 3, 4, 5, 6), 1) + fj(new ${classes[0].name}(1, 2, 3, 4, 5, 6), 0); }`);
 const prog = out_.join('\n') + '\n';
 const classNames = classes.map((c) => c.name);
 
@@ -118,7 +165,9 @@ variants.push(`print('str+num', mix('a', 1), mix(1, 'b'), mix(2147483647, 1), mi
 variants.push(`var oo = new ${classNames[0]}(1, 2, 3, 4, 5, 6); oo.zz = 1; delete oo.${classes[0].fs[0]}; print('shape', f0(oo, 4));`);
 variants.push(`print('gc', (function () { for (var g = 0; g < 200; g++) main(4); if (typeof gc === 'function') gc(); return main(5); })());`);
 variants.push(`print('rec', rec(40, new ${classNames[0]}(1, 2, 3, 4, 5, 6)));`);
-const trainSeq = `for (var t = 0; t < 400; t++) main(0);\nprint('train', main(0));`;
+variants.push(`print('co', coMain(), coMain());`);
+variants.push(`(function () { var ps = []; for (var z = 0; z < ${20 + ri(200)}; z++) ps.push(a${ri(nCo)}(new ${classNames[0]}(1, 2, 3, 4, 5, 6), ${1 + ri(5)})); Promise.all(ps).then(function (v) { var t = 0; for (var q = 0; q < v.length; q++) t += v[q]; print('async', v.length, t); }, function (e) { print('async threw', String(e)); }); })();`);
+const trainSeq = `for (var t = 0; t < 400; t++) main(0);\nfor (var t = 0; t < 40; t++) coMain();\nprint('train', main(0), coMain());`;
 mkdirSync(out, { recursive: true });
 writeFileSync(join(out, 'prog.js'), prog);
 writeFileSync(join(out, 'train.js'), `${prog}${trainSeq}\n`);

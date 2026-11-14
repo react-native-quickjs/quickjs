@@ -3564,6 +3564,15 @@ static _Thread_local struct {
     size_t size;
 } lre_scratch;
 
+/* Frees the calling thread's kept backtrack stack. A thread that ends with one kept would leak it (up to LRE_SCRATCH_MAX_ELEMS elements):
+   JS_FreeRuntime calls this, on the thread that ran the runtime. A later match on the thread grows a new one. */
+void lre_scratch_release(void)
+{
+    free(lre_scratch.buf);
+    lre_scratch.buf = NULL;
+    lre_scratch.size = 0;
+}
+
 no_inline int lre_stack_realloc(REExecContext *s, size_t n)
 {
     StackElem *new_stack;

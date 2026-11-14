@@ -130,6 +130,7 @@ static int rg_native_call(RCtx *c, int ii, const char *method, const Q2Insn *cal
     rg_emit_cap(c, ii, call->pc, o);
     if (rg_nat_kn()) fprintf(o, "        { static JSValue nc_; static int nh_; JSValue r_; if (nk_ == 2) { if (!nh_) { nh_ = 1; nc_ = JS_GetProperty(ctx, %s, nat_%d); } r_ = JS_Call(ctx, nc_, %s, %d, av_); } else r_ = JS_Invoke(ctx, %s, nat_%d, %d, av_);\n", rv, call->pc, rv, call->win_n, rv, call->pc, call->win_n);
     else fprintf(o, "        { JSValue r_ = JS_Invoke(ctx, %s, nat_%d, %d, av_);\n", rv, call->pc, call->win_n);
+    rg_emit_uncap(c, ii, o);
     fprintf(o, "          if (__builtin_expect(JS_IsException(r_), 0)) { %sRG_FREE_OWNED(); return JS_EXCEPTION; }\n", rg_nat_kn() ? "if (nk_ == 3) { JS_FreeValue(ctx, JS_GetException(ctx)); RG_FREE_OWNED(); return JS_UNDEFINED; } " : "");
     fprintf(o, "          %s; rn_%d = r_; %s = r_; }\n", rel_, ki, resvar);
     rg_xlabel(c, rg_xit_x(c, ii, call->next), call->pc, "native-facts", xo, sizeof(xo));
@@ -171,6 +172,7 @@ static int rg_native_construct(RCtx *c, int ii, const Q2Insn *in, const char *gn
     rg_emit_cap(c, ii, in->pc, o);
     fprintf(o, "        cv_ = JS_DupValue(ctx, cv_);\n");
     fprintf(o, "        { JSValue r_ = JS_CallConstructor(ctx, cv_, %d, av_);\n          JS_FreeValue(ctx, cv_);\n", in->win_n);
+    rg_emit_uncap(c, ii, o);
     fprintf(o, "          if (__builtin_expect(JS_IsException(r_), 0)) { %sRG_FREE_OWNED(); return JS_EXCEPTION; }\n", rg_nat_kn() ? "if (nk_ == 3) { JS_FreeValue(ctx, JS_GetException(ctx)); RG_FREE_OWNED(); return JS_UNDEFINED; } " : "");
     fprintf(o, "          %s; rn_%d = r_; %sv%d = r_; }\n", rel_, ki, I->pfx, dv);
     rg_xlabel(c, rg_xit_x(c, ii, in->next), in->pc, "native-facts", xo, sizeof(xo));

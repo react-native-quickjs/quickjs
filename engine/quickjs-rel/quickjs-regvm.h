@@ -484,6 +484,7 @@ typedef enum JSRegOpcode {
     /* A definition whose source is dead: the reference moves instead of being
        duplicated and retained. */
     ROP_move_xfer, ROP_put_local_xfer, ROP_put_arg_xfer,
+    /* Never emitted and has no operand format; it stays because removing it renumbers every later opcode in precompiled register bytecode. */
     ROP_put_local_probe,
 
     /* ROP_get_local_field with the slot in the opcode. */

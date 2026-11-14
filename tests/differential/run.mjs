@@ -17,6 +17,7 @@
  *   node tests/differential/run.mjs --qjs build/tests/qjs-run
  *   node tests/differential/run.mjs --via-bytecode         # through qjsc-ng
  *   node tests/differential/run.mjs --corpus pending       # a sibling directory
+ *   node tests/differential/run.mjs --leak-check           # also fail a file whose run leaves objects at teardown
  *
  * `--via-bytecode` compiles each file with qjsc-ng and runs the container
  * instead of the source. That is the path React Native actually ships, and it
@@ -27,7 +28,7 @@
  * Exit status is non-zero on the first mismatch, and the difference is printed.
  * Any engine binary that runs a script and provides `print` works.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, writeFileSync, mkdtempSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -41,11 +42,13 @@ const args = process.argv.slice(2);
 let qjs = null;
 let qjsc = null;
 let viaBytecode = false;
+let leakCheck = false;
 const filters = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--qjs') qjs = args[++i];
   else if (args[i] === '--qjsc') qjsc = args[++i];
   else if (args[i] === '--via-bytecode') viaBytecode = true;
+  else if (args[i] === '--leak-check') leakCheck = true;
   else if (args[i] === '--corpus') CORPUS = join(HERE, args[++i]);
   else filters.push(args[i]);
 }
@@ -121,11 +124,21 @@ for (const f of files) {
     });
   }
 
-  let a, b;
-  try {
-    a = execFileSync(qjs, [input], { encoding: 'utf8', maxBuffer: 64 << 20 });
-  } catch (e) {
-    a = `<<qjs exited ${e.status}>>\n${e.stdout || ''}${e.stderr || ''}`;
+  let a, b, leak = null;
+  if (leakCheck) {
+    // QJS_DEBUG_LEAK makes JS_FreeRuntime report the GC objects still alive after its final collection: a reference
+    // counted but never released (in release builds too, where the teardown assertion is compiled out).
+    const r = spawnSync(qjs, [input], { encoding: 'utf8', maxBuffer: 64 << 20,
+      env: { ...process.env, QJS_DEBUG_LEAK: '1' } });
+    a = r.status === 0 ? r.stdout : `<<qjs exited ${r.status}>>\n${r.stdout || ''}${r.stderr || ''}`;
+    const m = /leak: (\d+) objects left/.exec(r.stderr || '');
+    if (m) leak = m[1];
+  } else {
+    try {
+      a = execFileSync(qjs, [input], { encoding: 'utf8', maxBuffer: 64 << 20 });
+    } catch (e) {
+      a = `<<qjs exited ${e.status}>>\n${e.stdout || ''}${e.stderr || ''}`;
+    }
   }
   try {
     b = execFileSync(process.execPath, ['--input-type=module', '-e',
@@ -135,7 +148,10 @@ for (const f of files) {
     b = `<<node exited ${e.status}>>\n${e.stdout || ''}${e.stderr || ''}`;
   }
 
-  if (a === b) {
+  if (leak !== null) {
+    failed++;
+    console.log(`FAIL  ${f}  (leak: ${leak} objects left at teardown)`);
+  } else if (a === b) {
     console.log(`ok    ${f}  (${a.split('\n').length - 1} lines identical)`);
   } else {
     failed++;

@@ -4648,7 +4648,9 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* The entries a function's exits are measured against: its own entries and, where the build counts them (not the production
            unit build, see QJS_AOT_NOENTNOTE), the entries of its inlined copies. */
         "#define E_ENTS(fi) (e_ent[fi] + e_inl[fi])\n"
-        "static void __attribute__((noinline, cold, unused, preserve_most)) e_exit_note_c(const E_NoteD *d)\n"
+        /* A plain cold call, not preserve_most: the exit stubs are many and inside hot loops' functions, and preserve_most there changed
+           the register allocation of the loops themselves (kit am3: two more moves per iteration, +4.3% cycles) for no size gain. */
+        "static void __attribute__((noinline, cold, unused)) e_exit_note_c(const E_NoteD *d)\n"
         "{\n"
         "  int fi = d->fi;\n"
         "  if (e_ep_exit) { e_ep_exit = 0; return; }\n"

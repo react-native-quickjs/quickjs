@@ -1,0 +1,24 @@
+Subject: The register VM's element fast paths test the class before reading the array length
+
+What this does
+  regvm_get_elem_typed and the typed-array arm of regvm_put_elem_fast return 0 (the generic path) unless the receiver's class is a typed array, before they read p->u.array.count. They read it first and looked at the class after.
+
+Why we need it
+  Only arrays and typed arrays have u.array. A plain object is allocated without the union: its inline properties start at u, so one with no or one inline property ends before u.array.count. An int-keyed load or store on such an object (o[1], o[0] = 1) read past its allocation; the result was discarded by the class switch, but the read itself was out of bounds and can fault at the end of a mapping. Found by the AOT acceptance run's ASan stage (heap-buffer-overflow in regvm_put_elem_fast, the receiver a plain object at the end of an arena block, in the first test262 test). It is reported only when the object is the last in its arena block, so no ordinary test shows it.
+
+Soundness
+  The class test is the one the switch below made, moved ahead of the read: every typed array takes the same path as before, and every other object returns 0 as before, now without touching u.array. The typed-array classes are contiguous (JS_CLASS_UINT8C_ARRAY to JS_CLASS_FLOAT64_ARRAY, as is_typed_array tests). The other reads of u.array.count in the register VM already test for JS_CLASS_ARRAY or a typed array first.
+
+diff --git a/quickjs.c b/quickjs.c
+index b71510d..180ed27 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -34870,0 +34871,4 @@ regvm_get_elem_typed(JSObject *p, uint32_t idx, JSValue *out)
++    /* the class first: only an array or a typed array has u.array, and a plain object's allocation can end before it (its inline properties
++       start at u) */
++    if ((unsigned)(p->class_id - JS_CLASS_UINT8C_ARRAY) > (unsigned)(JS_CLASS_FLOAT64_ARRAY - JS_CLASS_UINT8C_ARRAY))
++        return 0;
+@@ -34921,0 +34926,3 @@ regvm_put_elem_fast(JSContext *ctx, JSValue recv, JSValue k, JSValue v)
++    /* as in regvm_get_elem_typed: u.array is read only once the class says the object has it */
++    if ((unsigned)(p->class_id - JS_CLASS_UINT8C_ARRAY) > (unsigned)(JS_CLASS_FLOAT64_ARRAY - JS_CLASS_UINT8C_ARRAY))
++        return 0;

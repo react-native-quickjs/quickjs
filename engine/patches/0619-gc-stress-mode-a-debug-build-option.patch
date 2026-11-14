@@ -1,0 +1,80 @@
+Subject: GC stress mode (QJS_GC_STRESS), a debug build option
+
+What this does
+  A build with -DQJS_GC_STRESS forces collections where a missed young root shows at once:
+  - a reconcile (with its young collection) at every QJS_DRC_STRESS_EVERY-th allocation (default 61; built on QJS_DRC_STRESS_ALLOC);
+  - a reconcile before every pending job;
+  - a reconcile at every interrupt poll, with QJS_GC_STRESS_POLL=1 setting the poll counter to 1 (every back edge and call).
+  Allocation sites are never pretenured, QJS_Y_CHECK is on, and an unrecorded young root (a young cell with references that is not a root of the young collection) aborts. Each runtime starts the allocation count at zero, so a failure reproduces from its own script. Without the macro nothing of it is compiled: the -O2 -DNDEBUG objects of both VMs are byte-identical to the previous patch's (same disassembly, same symbols).
+
+Why we need it
+  The nursery bugs of JetStream 3 (0612, 0614) were found by crashes on large workloads. The stress mode makes such a miss fail on a small script, on the corpus and on test262. Choices that matter, found by reverting 0612 and 0614:
+  - Collecting at every allocation hides the bugs: a cell is collected while still in a live register and promoted at once, so it never reaches a parked frame young. The same holds for a collection before each coroutine resume (an await first calls another async function, which resumes a coroutine while the caller still runs), so there is none.
+  - Forced collections make every site look long-lived; pretenuring would then keep cells out of the nursery.
+  - The job boundary is where every coroutine is parked and the native stack is shallow.
+  With 0612 reverted (register VM), async-suspend-young-object.js aborts with QJS_DRC_STRESS_EVERY 7, 61 or no allocation stress. With 0614 reverted (stack VM), it aborts only with QJS_GC_STRESS_POLL=1. generator-frame-young-object.js catches both in every mode. Run both poll settings. On test262 it found the stack-scan bug fixed by 0618.
+
+Soundness
+  Every forced collection is a reconcile at a point where the engine may already reconcile (an allocation, a poll, between jobs), skipped when one is in progress or a cycle collection runs. Pretenuring changes where cells are made, not what a program computes.
+
+diff --git a/quickjs.c b/quickjs.c
+index 90ed349..19efc2d 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -166,0 +167,7 @@ typedef struct JSRegRCC JSRegRCC;
++/* QJS_GC_STRESS (a debug build option; nothing of it is compiled otherwise) forces collections where a missed root shows at once: a reconcile
++   (with its young collection) every QJS_DRC_STRESS_EVERY-th allocation (default 61), before every pending job, and at every interrupt poll
++   (each back edge and call when QJS_GC_STRESS_POLL is set; every JS_INTERRUPT_COUNTER_INIT-th otherwise). Allocation sites are never
++   pretenured, and QJS_Y_CHECK is on with an unrecorded young root fatal. The two poll settings catch different misses: run both. */
++#if defined(QJS_GC_STRESS) && !defined(QJS_DRC_STRESS_ALLOC)
++#define QJS_DRC_STRESS_ALLOC 1
++#endif
+@@ -170,0 +178,5 @@ static void js_drc_reconcile(JSRuntime *rt);
++#ifdef QJS_GC_STRESS
++/* Not every allocation: a cell collected at the next allocation is still in a live register and is promoted at once, so it never reaches a
++   suspended frame or a store young, where a missed root is. */
++static uint32_t js_drc_stress_every = 61;
++#else
+@@ -171,0 +184 @@ static uint32_t js_drc_stress_every = 1;
++#endif
+@@ -179,0 +193,8 @@ __attribute__((constructor)) static void js_drc_stress_init(void)
++#ifdef QJS_GC_STRESS
++#define JS_GC_STRESS_FORCE(rt_) do { if (!(rt_)->drc_in_reconcile && (rt_)->gc_phase == JS_GC_PHASE_NONE) js_drc_reconcile(rt_); } while (0)
++static int js_gc_stress_poll;
++__attribute__((constructor)) static void js_gc_stress_init(void)
++{
++    js_gc_stress_poll = getenv("QJS_GC_STRESS_POLL") != NULL;
++}
++#endif
+@@ -4419,0 +4441,4 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
++#ifdef QJS_GC_STRESS
++    /* Each runtime starts at the same phase of the allocation count, so a failure reproduces from its own script alone. */
++    js_drc_stress_ctr = 0;
++#endif
+@@ -4699,0 +4725,5 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
++#ifdef QJS_GC_STRESS
++    /* Between jobs every coroutine is parked, and the native stack is shallow: no stale copy of a parked frame's registers is
++       scanned, so a cell the frame holds only through a register stays young unless the suspend path noted it. */
++    JS_GC_STRESS_FORCE(rt);
++#endif
+@@ -5101,0 +5132,5 @@ static void y_site_eval(void) {
++#ifdef QJS_GC_STRESS
++        /* Forced collections make every site look long-lived; a pretenured site would keep its cells out of the nursery the stress is for. */
++        s->made = s->surv = 0;
++        continue;
++#endif
+@@ -12726,0 +12762,3 @@ static void y_collect(JSRuntime *rt)
++#ifdef QJS_GC_STRESS
++    if (y_check_on < 0) y_check_on = 1;
++#endif
+@@ -12757,0 +12796,4 @@ static void y_collect(JSRuntime *rt)
++#ifdef QJS_GC_STRESS
++                    fprintf(stderr, "QJS_GC_STRESS: a young cell with references is not a root of the young collection\n");
++                    abort();
++#endif
+@@ -15588,0 +15631,5 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
++#ifdef QJS_GC_STRESS
++    if (js_gc_stress_poll)
++        ctx->interrupt_counter = 1;
++    JS_GC_STRESS_FORCE(rt);
++#endif

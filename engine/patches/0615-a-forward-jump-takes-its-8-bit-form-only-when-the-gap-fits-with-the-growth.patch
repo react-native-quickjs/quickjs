@@ -1,0 +1,66 @@
+Subject: A forward jump takes its 8-bit form only when the gap fits with the bytes resolve_labels may add
+
+What this does
+  resolve_labels picks the 8-bit form of a forward if_false/if_true/goto from the gap to its label measured in its input bytes. The gap is now bounded first by the bytes this pass may add to the instructions in it (resolve_growth: 2 for get_field, get_field2, put_field, object and args_el, 1 for get_array_el and put_array_el; resolve_gap_bound walks the gap, at most 128 bytes), and the 8-bit form is taken only when that bound fits. A jump that does not qualify is emitted with a 32-bit offset and shortened by the existing jump pass at the end of resolve_labels once the positions are final. In builds with assertions on, each step of the pass checks that its output grew by no more than resolve_gap_bound of the input it consumed.
+
+Why we need it
+  The estimate assumed this pass never makes code longer than its input, which held before the inline caches (a u16 cache index on field accesses and their get_loc/get_arg fusions), object-literal template indices, the arguments-element and received-element forms. A forward jump over enough of them got an 8-bit offset whose final distance was over 127: the stored offset wrapped, the stack-size pass then followed a wrong target ("InternalError: inconsistent stack size: 1 4 (pc=53)", or "bytecode buffer overflow"; an assertion in resolve_labels with assertions on). JetStream 3 babylonjs bundles (all four babylonjs rows, both VMs) failed to compile on `return i&&(this.p.x=this.c.x,...),i`. Repro: tests/differential/corpus/forward-jump-over-field-caches.js.
+
+Soundness
+  The bound counts every input byte of the gap plus the growth of each instruction in it; the 8-bit decision is made only when that bound plus the bytes before the gap fits, so the final distance fits too. The growth table was checked against a census of the pass over the JetStream 3 sources and the differential corpus (542 files) and is enforced per step in assertion builds. Final bytecode is unchanged where the old estimate was right: the jump pass shortens to the same forms when the final distance fits.
+
+diff --git a/quickjs.c b/quickjs.c
+index 88c40fb..acf80ac 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -64281,0 +64282,31 @@ static void add_pc2line_info(JSFunctionDef *s, uint32_t pc,
++/* The bytes resolve_labels may add to an input instruction: a field access gains its inline-cache index (and a get_loc/get_arg fused with
++   it no more than that), an object literal its template index, an arguments element or a received array element its operand. A fused
++   group grows by at most the sum of its members. */
++static int resolve_growth(int op)
++{
++    switch (op) {
++    case OP_get_field:
++    case OP_get_field2:
++    case OP_put_field:
++    case OP_object:
++    case OP_args_el:
++        return 2;
++    case OP_get_array_el:
++    case OP_put_array_el:
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++/* An upper bound of the output bytes of the input instructions in [pos, end). */
++static int resolve_gap_bound(const uint8_t *bc_buf, int pos, int end)
++{
++    int n = end - pos;
++    while (pos < end) {
++        n += resolve_growth(bc_buf[pos]);
++        pos += opcode_info[bc_buf[pos]].size;
++    }
++    return n;
++}
++
+@@ -64994,0 +65026,3 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
++#ifndef NDEBUG
++    int grow_pos = -1, grow_out = 0;
++#endif
+@@ -65144,0 +65179,6 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
++#ifndef NDEBUG
++        /* the previous step grew within resolve_growth, which the forward 8-bit jumps rely on */
++        assert(grow_pos < 0 || (int)bc_out.size - grow_out <= resolve_gap_bound(bc_buf, grow_pos, pos));
++        grow_pos = pos;
++        grow_out = bc_out.size;
++#endif
+@@ -65360,0 +65401,3 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
++                /* The label's output position is not known yet, and this pass can make code longer than its input (resolve_growth):
++                   the 8-bit form is taken only when the gap still fits with the growth it may get. Anything else is shortened by the
++                   jump pass at the end, which sees the final positions. */
+@@ -65362 +65405,2 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
+-                if (diff < 128 && (op == OP_if_false || op == OP_if_true || op == OP_goto)) {
++                if (diff < 128 && (op == OP_if_false || op == OP_if_true || op == OP_goto) &&
++                    diff - (ls->pos2 - pos_next) + resolve_gap_bound(bc_buf, pos_next, ls->pos2) < 128) {

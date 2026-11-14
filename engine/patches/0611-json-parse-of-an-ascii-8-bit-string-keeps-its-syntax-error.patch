@@ -1,0 +1,34 @@
+Subject: JSON.parse of an ASCII 8-bit string keeps its syntax error
+
+What this does
+  When the parse of an 8-bit string's own bytes (0581) fails with a SyntaxError and the input has no byte >= 0x80, js_json_parse throws that error instead of parsing the input again from its UTF-8 copy. Other failures (memory, stack, any failure on a non-ASCII input) are redone as before.
+
+Why we need it
+  Since 0581 every invalid JSON input was parsed twice and built two errors with their backtraces. Kit throws (JSON.parse("{") among its throwing cases) went from 3039 to 3561 M interpreter instructions at 0581 (patch bisect over 0564-0609). With 0610 and this patch: interpreter 3607 -> 3046 M, compiled 3807.7 -> 3078.2 M (baseline 3273.0).
+
+Soundness
+  An ASCII string's UTF-8 copy is the same bytes, and the Latin-1 reading (json_latin1) changes only how bytes >= 0x80 are read (json_scan_plain and the string slow path), so the general path would raise the same SyntaxError with the same message and position; the call stack, and so the backtrace, is the same. The JSON differential suites give the green run's results (14/15 equal to the old engine, jdt2 differs by design).
+
+diff --git a/quickjs.c b/quickjs.c
+index 3b970f8..d2fdd4d 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -106979,0 +106980,10 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
++static bool js_json_is_ascii(const uint8_t *p, uint32_t n)
++{
++    uint32_t i;
++    uint8_t acc = 0;
++
++    for (i = 0; i < n; i++)
++        acc |= p[i];
++    return acc < 0x80;
++}
++
+@@ -107003,0 +107014,7 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
++            /* An ASCII input is the same bytes in its UTF-8 copy, and the Latin-1 reading differs only on bytes >= 0x80: the
++               general path would raise this same syntax error, so it is kept rather than built a second time (with its
++               backtrace). A memory or stack failure is redone, as is any failure on a non-ASCII input. */
++            if (JS_VALUE_GET_TAG(exc) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(exc)->class_id == JS_CLASS_ERROR &&
++                JS_VALUE_GET_OBJ(exc)->shape->proto == JS_VALUE_GET_OBJ(ctx->native_error_proto[JS_SYNTAX_ERROR]) &&
++                js_json_is_ascii(str8(jp), jp->len))
++                return JS_Throw(ctx, exc);

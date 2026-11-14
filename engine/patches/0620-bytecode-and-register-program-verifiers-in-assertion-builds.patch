@@ -1,0 +1,340 @@
+Subject: Bytecode and register-program verifiers in assertion builds
+
+What this does
+  QJS_BC_VERIFY (on when NDEBUG is not defined; can be set either way) adds two checks to js_create_function:
+  - js_bc_verify, on the final stack bytecode, before compute_stack_size: every instruction decodes within the buffer, every jump (label8, label16, label, label_u16, atom_label) lands on an instruction start, and every operand index is in range for the function. That covers locals, arguments, closure variables, constants, atoms (live or tagged ints), the inline-cache index of get_field_ic/get_field2_ic/put_field_ic and the get_loc/get_arg field fusions, and the slot of make_loc_ref/make_arg_ref/make_var_ref_ref and the receiver/argument-element forms.
+  - js_regvm_verify, on the register program a lowering produced (register builds). Once per process it checks that every stack opcode has a lowering kind and every register opcode an operand format; ROP_put_local_probe, which the encoder never emits, is the one opcode without a format. Per function it checks that the program decodes exactly to its end, that every register operand is an aligned slot below regvm_reg_count, and that every branch target is an instruction start.
+  A failure throws an InternalError naming the pc and opcode; with dumps compiled in, the stack check also prints the function's disassembly.
+
+Why we need it
+  JetStream 3's babylonjs bundles failed with "inconsistent stack size" (0615): a forward jump wrapped its 8-bit offset, and the stack-size pass reported the symptom far from the cause. The verifier names the cause: with 0615 reverted it reports "jump target not an instruction start 34 (op=if_false8, pc=158)" on tests/differential/corpus/forward-jump-over-field-caches.js and on both babylonjs bundles, with the disassembly. The register checks caught a planted off-by-one branch target in a scratch build ("branch target 185 not an instruction start"). Neither catches a missed GC root (0612, 0614); those are runtime bugs that the GC stress mode (0619) catches.
+
+Soundness
+  Checks only: a passing function is built exactly as before. On every JS file of the JetStream 3 submodule and the differential corpus (556 files), both VMs compile with no verifier error, and the corpus passes on both VMs in assertion builds. Release objects are unchanged: -O2 -DNDEBUG objects of both VMs have the same disassembly and symbols as the previous patch's.
+  Cost (assertion builds, -O1, best of 3 compiles): register VM +0.1-1.1%, stack VM +1.5-3.6% (typescript-lib 439 -> 454 ms, babylonjs es6 922 -> 955 ms on the stack VM).
+
+diff --git a/quickjs.c b/quickjs.c
+index 19efc2d..d245a58 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -66447,0 +66448,212 @@ static __exception int ss_check(JSContext *ctx, StackSizeState *s,
++/* The bytecode verifier, compiled in assertion builds only (QJS_BC_VERIFY; nothing of it is in a -DNDEBUG build unless asked for).
++   compute_stack_size already checks opcodes, bounds and the stack depth at merges; this adds what it does not: every jump lands
++   on an instruction start, and every operand index (local, argument, closure variable, constant, atom, inline-cache entry) is
++   in range for the function. A failure throws an InternalError naming the pc and opcode, and with dumps compiled in prints the
++   function's disassembly. */
++#if !defined(QJS_BC_VERIFY) && !defined(NDEBUG)
++#define QJS_BC_VERIFY 1
++#endif
++#if defined(QJS_BC_VERIFY) && QJS_BC_VERIFY
++static int js_bc_verify_fail(JSContext *ctx, JSFunctionDef *fd, int pos, int op, const char *what, int val)
++{
++#ifdef ENABLE_DUMPS
++    {
++        /* dump_byte_code decodes short opcodes when given a bytecode object; without a source it reads nothing else from it. */
++        JSFunctionBytecode shortform;
++        memset(&shortform, 0, sizeof(shortform));
++        printf("bytecode verifier: function at line %d\n", fd->line_num);
++        dump_byte_code(ctx, 3, fd->byte_code.buf, fd->byte_code.size, fd->args, fd->arg_count, fd->vars, fd->var_count,
++                       fd->closure_var, fd->closure_var_count, fd->cpool, fd->cpool_count, NULL, fd->line_num, NULL,
++                       &shortform, 0);
++    }
++#endif
++#ifdef ENABLE_DUMPS
++    JS_ThrowInternalError(ctx, "bytecode verifier: %s %d (op=%s, pc=%d)", what, val,
++                          op < OP_COUNT ? short_opcode_info(op).name : "?", pos);
++#else
++    JS_ThrowInternalError(ctx, "bytecode verifier: %s %d (op=%d, pc=%d)", what, val, op, pos);
++#endif
++    return -1;
++}
++
++static int js_bc_verify_atom(JSContext *ctx, JSAtom a)
++{
++    JSRuntime *rt = ctx->rt;
++    if (__JS_AtomIsTaggedInt(a))
++        return 1;
++    return a < (JSAtom)rt->atom_size && !atom_is_free(rt->atom_array[a]);
++}
++
++static __exception int js_bc_verify(JSContext *ctx, JSFunctionDef *fd)
++{
++    const uint8_t *tab = fd->byte_code.buf;
++    int len = fd->byte_code.size, pos, op, size, target, idx;
++    uint8_t *start;
++    const JSOpCode *oi;
++
++    start = js_mallocz(ctx, len + 1);
++    if (!start)
++        return -1;
++    for (pos = 0; pos < len; pos += size) {
++        op = tab[pos];
++        if (op >= OP_COUNT) {
++            js_free(ctx, start);
++            return js_bc_verify_fail(ctx, fd, pos, op, "invalid opcode", op);
++        }
++        size = short_opcode_info(op).size;
++        if (size <= 0 || pos + size > len) {
++            js_free(ctx, start);
++            return js_bc_verify_fail(ctx, fd, pos, op, "instruction past the end, size", size);
++        }
++        start[pos] = 1;
++    }
++#define VFAIL(what, v) do { js_free(ctx, start); return js_bc_verify_fail(ctx, fd, pos, op, what, (int)(v)); } while (0)
++#define VLOC(i) do { if ((unsigned)(i) >= (unsigned)fd->var_count) VFAIL("local index", i); } while (0)
++#define VARG(i) do { if ((unsigned)(i) >= (unsigned)fd->arg_count) VFAIL("argument index", i); } while (0)
++#define VREF(i) do { if ((unsigned)(i) >= (unsigned)fd->closure_var_count) VFAIL("closure variable index", i); } while (0)
++#define VIC(i) do { if (JS_ENABLE_IC && (unsigned)(i) >= fd->ic_count) VFAIL("inline cache index", i); } while (0)
++    for (pos = 0; pos < len; pos += size) {
++        const uint8_t *a;
++        op = tab[pos];
++        oi = &short_opcode_info(op);
++        size = oi->size;
++        a = tab + pos + 1;
++        target = -1;
++        switch (oi->fmt) {
++        case OP_FMT_label8:
++            target = pos + 1 + (int8_t)a[0];
++            break;
++        case OP_FMT_label16:
++            target = pos + 1 + (int16_t)get_u16(a);
++            break;
++        case OP_FMT_label:
++        case OP_FMT_label_u16:
++            target = pos + 1 + (int32_t)get_u32(a);
++            break;
++        case OP_FMT_atom_label_u8:
++        case OP_FMT_atom_label_u16:
++            if (!js_bc_verify_atom(ctx, get_u32(a)))
++                VFAIL("atom", get_u32(a));
++            target = pos + 5 + (int32_t)get_u32(a + 4);
++            break;
++        case OP_FMT_const8:
++            if (a[0] >= fd->cpool_count)
++                VFAIL("constant index", a[0]);
++            break;
++        case OP_FMT_const:
++            if (get_u32(a) >= (uint32_t)fd->cpool_count)
++                VFAIL("constant index", get_u32(a));
++            break;
++        case OP_FMT_atom:
++        case OP_FMT_atom_u8:
++        case OP_FMT_atom_u16:
++            if (!js_bc_verify_atom(ctx, get_u32(a)))
++                VFAIL("atom", get_u32(a));
++            switch (op) {
++            case OP_get_field_ic:
++            case OP_get_field2_ic:
++            case OP_put_field_ic:
++                VIC(get_u16(a + 4));
++                break;
++            case OP_get_loc_field_nr:
++                VLOC(get_u16(a + 4));
++                VIC(get_u16(a + 6));
++                break;
++            case OP_get_arg_field_nr:
++                VARG(get_u16(a + 4));
++                VIC(get_u16(a + 6));
++                break;
++            case OP_make_loc_ref:
++                VLOC(get_u16(a + 4));
++                break;
++            case OP_make_arg_ref:
++                VARG(get_u16(a + 4));
++                break;
++            case OP_make_var_ref_ref:
++                VREF(get_u16(a + 4));
++                break;
++            }
++            break;
++        case OP_FMT_loc:
++            VLOC(get_u16(a));
++            break;
++        case OP_FMT_arg:
++            VARG(get_u16(a));
++            break;
++        case OP_FMT_var_ref:
++            VREF(get_u16(a));
++            break;
++        case OP_FMT_loc8:
++            switch (op) {
++            case OP_get_arg8_el_recv:
++            case OP_get_arg8_array_el:
++                VARG(a[0]);
++                break;
++            case OP_put_el_recv:
++                if (a[0] & 0x80)
++                    VARG(a[0] & 0x7f);
++                else
++                    VLOC(a[0]);
++                break;
++            default:
++                VLOC(a[0]);
++                break;
++            }
++            break;
++        case OP_FMT_loc8_loc8:
++            if (op == OP_reserved7) {
++                VARG(a[0]);
++                VLOC(a[1]);
++            }
++            break;
++        case OP_FMT_none_loc:
++            switch (op) {
++            case OP_get_loc0: case OP_put_loc0: case OP_set_loc0: idx = 0; break;
++            case OP_get_loc1: case OP_put_loc1: case OP_set_loc1: idx = 1; break;
++            case OP_get_loc2: case OP_put_loc2: case OP_set_loc2: idx = 2; break;
++            case OP_get_loc3: case OP_put_loc3: case OP_set_loc3: idx = 3; break;
++            default: idx = -1; break;
++            }
++            if (idx >= 0)
++                VLOC(idx);
++            break;
++        case OP_FMT_none_arg:
++            switch (op) {
++            case OP_get_arg0: case OP_put_arg0: case OP_set_arg0: idx = 0; break;
++            case OP_get_arg1: idx = 1; break;
++            case OP_get_arg2: idx = 2; break;
++            case OP_get_arg3: idx = 3; break;
++            default: idx = -1; break;
++            }
++            if (idx >= 0)
++                VARG(idx);
++            break;
++        case OP_FMT_none_var_ref:
++            switch (op) {
++            case OP_get_var_ref0: case OP_put_var_ref0: case OP_set_var_ref0: idx = 0; break;
++            case OP_get_var_ref1: idx = 1; break;
++            case OP_get_var_ref2: idx = 2; break;
++            case OP_get_var_ref3: idx = 3; break;
++            default: idx = -1; break;
++            }
++            if (idx >= 0)
++                VREF(idx);
++            break;
++        default:
++            break;
++        }
++        if (target >= 0 || oi->fmt == OP_FMT_label8 || oi->fmt == OP_FMT_label16) {
++            if (target < 0 || target >= len || !start[target])
++                VFAIL("jump target not an instruction start", target);
++        }
++    }
++#undef VFAIL
++#undef VLOC
++#undef VARG
++#undef VREF
++#undef VIC
++    js_free(ctx, start);
++    return 0;
++}
++#endif
++
+@@ -84656,0 +84869,91 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
++#if defined(QJS_BC_VERIFY) && QJS_BC_VERIFY
++/* The register program a lowering produced, checked before the function is made (assertion builds only, with js_bc_verify).
++   Once per process: every stack opcode has a lowering kind and every register opcode an operand format. Per function: the
++   program decodes exactly to its end, every register operand is an aligned slot of the register file, and every branch lands
++   on an instruction start. A failure is an InternalError naming the register pc and opcode. */
++static __exception int js_regvm_verify(JSContext *ctx, JSFunctionDef *fd)
++{
++    static int tables_ok;
++    const uint8_t *code = fd->regvm_code;
++    int len = fd->regvm_len, pc, op, sz, m, q, k;
++    uint8_t *start;
++    int32_t nregs = fd->regvm_reg_count;
++
++    if (!tables_ok) {
++        for (op = 0; op < OP_COUNT; op++) {
++            if (regvm_op_kind[op] == REG_LOWER_UNSET) {
++                JS_ThrowInternalError(ctx, "register verifier: stack opcode %d has no lowering kind", op);
++                return -1;
++            }
++        }
++        /* ROP_put_local_probe has no format: the encoder never emits it (a program holding it fails the decode below). */
++        for (op = 1; op < ROP_COUNT; op++) {
++            if (regvm_rop_fmt[op] == NULL && op != ROP_put_local_probe) {
++                JS_ThrowInternalError(ctx, "register verifier: register opcode %d has no operand format", op);
++                return -1;
++            }
++        }
++        tables_ok = 1;
++    }
++    if (code == NULL || len <= 0)
++        return 0;
++    start = js_mallocz(ctx, len + 1);
++    if (!start)
++        return -1;
++    for (pc = 0; pc < len; pc += 1 + sz) {
++        op = code[pc];
++        if (op <= 0 || op >= ROP_COUNT || regvm_rop_fmt[op] == NULL) {
++            js_free(ctx, start);
++            JS_ThrowInternalError(ctx, "register verifier: invalid opcode %d (pc=%d)", op, pc);
++            return -1;
++        }
++        sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
++        if (sz < 0 || pc + 1 + sz > len) {
++            js_free(ctx, start);
++            JS_ThrowInternalError(ctx, "register verifier: instruction past the end (op=%d, pc=%d)", op, pc);
++            return -1;
++        }
++        start[pc] = 1;
++    }
++    for (pc = 0; pc < len; pc += 1 + sz) {
++        const char *fmt;
++        int nar;
++        op = code[pc];
++        fmt = regvm_rop_fmt[op];
++        nar = regvm_rop_narrow((uint16_t)op);
++        sz = regvm_fmt_size(fmt, 1, (uint16_t)op);
++        q = pc + 1;
++        for (m = 0; fmt[m]; m++) {
++            switch (fmt[m]) {
++            case 'r':
++                k = nar ? code[q] : regvm_ld_u16(code + q);
++                if (k % (int)sizeof(JSValue) != 0 || k / (int)sizeof(JSValue) >= nregs) {
++                    js_free(ctx, start);
++                    JS_ThrowInternalError(ctx, "register verifier: register operand %d outside the %d registers (op=%d, pc=%d)",
++                                          k, nregs, op, pc);
++                    return -1;
++                }
++                q += nar ? 1 : 2;
++                break;
++            case 't':
++                k = nar ? (int8_t)code[q] : (int32_t)regvm_ld_u32(code + q);
++                k += pc + 1 + sz;
++                if (k < 0 || k >= len || !start[k]) {
++                    js_free(ctx, start);
++                    JS_ThrowInternalError(ctx, "register verifier: branch target %d not an instruction start (op=%d, pc=%d)",
++                                          k, op, pc);
++                    return -1;
++                }
++                q += nar ? 1 : 4;
++                break;
++            case 'i': case 'b': q += 1; break;
++            case 'u': case 's': q += 2; break;
++            default: q += 4; break;
++            }
++        }
++    }
++    js_free(ctx, start);
++    return 0;
++}
++#endif
++
+@@ -86181,0 +86485,4 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
++#if defined(QJS_BC_VERIFY) && QJS_BC_VERIFY
++    if (js_bc_verify(ctx, fd))
++        goto fail;
++#endif
+@@ -86189,0 +86497,4 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
++#if defined(QJS_BC_VERIFY) && QJS_BC_VERIFY
++    if (fd->regvm_compiled && js_regvm_verify(ctx, fd))
++        goto fail;
++#endif
+diff --git a/quickjs-regvm.h b/quickjs-regvm.h
+index d3f542a..d200f0d 100644
+--- a/quickjs-regvm.h
++++ b/quickjs-regvm.h
+@@ -486,0 +487 @@ typedef enum JSRegOpcode {
++    /* Never emitted and has no operand format; it stays because removing it renumbers every later opcode in precompiled register bytecode. */

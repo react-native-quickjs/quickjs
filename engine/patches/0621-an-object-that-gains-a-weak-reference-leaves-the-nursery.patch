@@ -1,0 +1,27 @@
+Subject: An object that gains a weak reference leaves the nursery
+
+What this does
+  weak_slot, where an object first gets an entry in the runtime's weak table (a WeakMap or WeakSet key, a WeakRef or FinalizationRegistry target), promotes the object if it is a young cell (y_promote_now), before recording it. The GC stress mode (0619) checks the rule: a young cell with weak references aborts its young collection.
+
+Why we need it
+  A young collection frees a dead cell without visiting it: it does not run the free path that clears an object's weak records. A young key with weak references therefore died with its records in place. The WeakMap kept its value for the life of the runtime, and the weak table kept the dead address. A new key allocated at that address then found the old record: on the register VM in release builds, WeakMap.has / WeakSet.has / WeakMap.get answered for keys never added (191555 of 200000 fresh keys in tests/differential/corpus/weak-keys-made-young.js), and the values leaked (9184 objects left at teardown). The Intl module keeps each formatter's state in a WeakMap keyed by the instance, so `new Intl.DateTimeFormat()` twice left 1658 objects (the ctest `intl` aborted in a Debug register build).
+
+Soundness
+  Promotion is the step every young cell takes when it outlives the nursery: it counts the cell's edges and puts it on the object list, and a cell only a register names is parked as any object at count zero. After it, the object dies only through the ordinary free, which clears its weak records (WeakMap entries, WeakRef targets, FinalizationRegistry callbacks). Keys made old early cost one promotion each; ordinary objects are unaffected. With the promotion removed, the stress build aborts on the corpus test ("young cell ... has weak references").
+
+diff --git a/quickjs.c b/quickjs.c
+index d245a58..a15f2e0 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -12778,0 +12779,6 @@ static void y_collect(JSRuntime *rt)
++#ifdef QJS_GC_STRESS
++                if (Y_IS(p) && p->has_weak_ref) {
++                    fprintf(stderr, "QJS_GC_STRESS: young cell %p has weak references (it would die without clearing them)\n", (void *)p);
++                    abort();
++                }
++#endif
+@@ -110220,0 +110227,4 @@ static JSWeakRefRecord **weak_slot(JSRuntime *rt, JSObject *p, bool create)
++    /* A young collection drops a dead cell without visiting it, so a cell with weak references must be old: its weak records are
++       then cleared when it dies, through the ordinary free. */
++    if (Y_IS(p))
++        y_promote_now(p);

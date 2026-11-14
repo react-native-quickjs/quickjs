@@ -1,0 +1,39 @@
+Subject: JS_FreeRuntime frees the thread's kept regexp backtrack stack
+
+What this does
+  libregexp gets lre_scratch_release(), which frees the backtrack stack the calling thread keeps between matches (lre_scratch, from 0531), and JS_FreeRuntime calls it after the runtime's arenas are released.
+
+Why we need it
+  The kept stack is thread-local and was never freed: every thread that ran a deep regexp match and then ended leaked it, up to LRE_SCRATCH_MAX_ELEMS elements (8 MB). An embedder that runs its runtime on a thread it later ends (a React Native reload makes a new JS thread; run-test262 -t 2 ends two worker threads) loses it each time. Found by LeakSanitizer in the AOT acceptance run's ASan stage: two direct leaks of 22104 and 14736 bytes from lre_stack_realloc, one per worker thread.
+
+Soundness
+  A match takes the kept stack out of lre_scratch while it runs (the slot is empty until stack_release puts a stack back), so the release can never free a stack a match is using, even with other runtimes on the same thread. After the release the next deep match on the thread allocates a new stack as on its first use; nothing else reads the slot. A runtime is freed on the thread that ran it, which is the thread whose slot the release empties.
+
+diff --git a/libregexp.c b/libregexp.c
+index b70880d..f0be2c3 100644
+--- a/libregexp.c
++++ b/libregexp.c
+@@ -3566,0 +3567,9 @@ static _Thread_local struct {
++/* Frees the calling thread's kept backtrack stack. A thread that ends with one kept would leak it (up to LRE_SCRATCH_MAX_ELEMS elements):
++   JS_FreeRuntime calls this, on the thread that ran the runtime. A later match on the thread grows a new one. */
++void lre_scratch_release(void)
++{
++    free(lre_scratch.buf);
++    lre_scratch.buf = NULL;
++    lre_scratch.size = 0;
++}
++
+diff --git a/libregexp.h b/libregexp.h
+index 61012b3..0280a42 100644
+--- a/libregexp.h
++++ b/libregexp.h
+@@ -115,0 +116,2 @@ int lre_exec_at(uint8_t **capture,
++/* frees the backtrack stack the calling thread keeps between matches */
++void lre_scratch_release(void);
+diff --git a/quickjs.c b/quickjs.c
+index 180ed27..9d04f3b 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -5688,0 +5689,2 @@ void JS_FreeRuntime(JSRuntime *rt)
++    /* the regexp backtrack stack this thread keeps between matches: a runtime is freed on its thread, and a thread that ends keeps nothing */
++    lre_scratch_release();

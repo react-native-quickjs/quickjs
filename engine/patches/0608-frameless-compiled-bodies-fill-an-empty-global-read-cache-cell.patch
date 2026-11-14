@@ -1,0 +1,44 @@
+Subject: Frameless compiled bodies fill an empty global-read cache cell
+
+What this does
+  Adds qjs_aot_global_warm_b, the frameless form of qjs_aot_global_warm: it fills the cache cell of a global-read site from the function's own cache array (a frame's is the same pointer). Both share the body, now qjs_aot_global_warm_pic. The generator emits it in frameless bodies, where it emitted no fill before.
+
+Why we need it
+  A compiled loop whose hoisted global read finds its cell empty (the process has not run that site yet) fills the cell and goes on; frameless bodies had no fill and exited instead. A frameless function called once, such as a driver whose calls became frameless-compatible, then ran its whole loop in the interpreter: corpus kernel2_swap_int_512 (work() swaps elements of the global array `a`) took 377.3 M cycles compiled against 365.6 M interpreted (31 ms compiled on 10-22, 112 ms in the green run). Now 28.3 M cycles, work exits 0 times.
+
+Soundness
+  The fill is the existing one: it runs no user code and does not throw (only a plain data property of the global object is cached; an accessor, an absent or uninitialised binding returns 0 and the body exits as before). It allocates nothing when the cache array exists, and it returns 0 when it does not, so a frameless body's no-allocation rule holds. The body reads the cell again after the fill, through the same cache array pointer it loaded at entry.
+
+diff --git a/quickjs.c b/quickjs.c
+index 5b8486f..7883355 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -74015 +74015 @@ QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
+-QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int atom)
++static int qjs_aot_global_warm_pic(JSContext *ctx, JSFunctionBytecode *b, JSRegPIC **ppic, int site, int atom)
+@@ -74023 +74023 @@ QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int
+-    if (f->pic == NULL)
++    if (*ppic == NULL)
+@@ -74046 +74046 @@ QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int
+-    regvm_global_site_fill(ctx, f->b, &f->pic, (JSAtom)atom, site);
++    regvm_global_site_fill(ctx, b, ppic, (JSAtom)atom, site);
+@@ -74049,0 +74050,11 @@ QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int
++QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int atom)
++{
++    return qjs_aot_global_warm_pic(ctx, f->b, &f->pic, site, atom);
++}
++
++/* The same for a frameless body, which has no frame: the cache array is the function's own (a frame's is the same pointer). */
++QJS_AOT_STUB int qjs_aot_global_warm_b(JSContext *ctx, struct JSFunctionBytecode *b, int site, int atom)
++{
++    return qjs_aot_global_warm_pic(ctx, b, &b->regvm_pic, site, atom);
++}
++
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+index a9c1f0a..4e4a0b2 100644
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -718,0 +719,3 @@ QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int
++/* The same for a frameless body: `b` is the function's bytecode, whose cache array the body read at entry. */
++struct JSFunctionBytecode;
++QJS_AOT_STUB int qjs_aot_global_warm_b(JSContext *ctx, struct JSFunctionBytecode *b, int site, int atom);

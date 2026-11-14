@@ -18,13 +18,24 @@
  * so a workload can be measured from source and from AOT bytecode -- and they
  * are not the same path.
  *
- *   qjs-bench [--mem] [--stats] [--bytecode-mode=<mode>] <file.js|file.bc>
+ *   qjs-bench [--mem] [--stats] [--shell [--intl]] [--bytecode-mode=<mode>] <file.js|file.bc> [-- args]
+ *
+ * --shell adds what a JS shell provides (printErr, readFile, read, loadString,
+ * runString, setTimeout/clearTimeout, `arguments` from the words after --), for drivers such as
+ * JetStream's cli.js; without it the global object is as described above.
+ *
+ * --intl (with --shell) installs `Intl` (modules/intl) in the main realm and in every realm runString
+ * makes. A host build links the module's en-US/UTC stub backend, so Intl output is the stub's: JetStream's
+ * intl rows run, but they do not measure a real locale backend. Only in builds with QJS_BENCH_INTL.
  *
  * Bytecode modes: eager, lazy-copy, lazy-borrow. Borrowed mode is safe here
  * because the input buffer remains allocated until the runtime is destroyed.
  */
 
 #include <fcntl.h>
+#if defined(QJS_BENCH_INTL) && QJS_BENCH_INTL
+#include "IntlModuleC.h"
+#endif
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -125,6 +136,186 @@ static uint8_t *read_file(const char *path, size_t *out_size) {
   fclose(f);
   *out_size = (size_t)size;
   return buf;
+}
+
+/* ---- --shell: what a JS shell gives a script (JetStream's cli.js) -------------------------------
+   printErr, readFile(path), read(path[, "binary"]), setTimeout, loadString(src) -- evaluated as a global script
+   in the realm the function belongs to -- and runString(src), which makes a new global (a context on
+   the same runtime) carrying the same functions, evaluates src there and returns that global. Only
+   installed under --shell, so every other run keeps `print` alone. */
+static JSContext **shell_realms;
+static int shell_nrealms, shell_realm_cap;
+
+static JSValue js_print_err(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  fflush(stdout);
+  for (int i = 0; i < argc; i++) {
+    const char *s = JS_ToCString(ctx, argv[i]);
+    fprintf(stderr, "%s%s", i ? " " : "", s ? s : "");
+    if (s) JS_FreeCString(ctx, s);
+  }
+  fprintf(stderr, "\n");
+  return JS_UNDEFINED;
+}
+
+static JSValue js_read_file(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  const char *path, *mode = NULL;
+  uint8_t *buf;
+  size_t size = 0;
+  JSValue r;
+  (void)this_val;
+  path = JS_ToCString(ctx, argv[0]);
+  if (!path) return JS_EXCEPTION;
+  buf = read_file(path, &size);
+  if (!buf) {
+    r = JS_ThrowTypeError(ctx, "cannot read %s", path);
+    JS_FreeCString(ctx, path);
+    return r;
+  }
+  JS_FreeCString(ctx, path);
+  if (argc > 1 && JS_IsString(argv[1])) mode = JS_ToCString(ctx, argv[1]);
+  if (mode && !strcmp(mode, "binary"))
+    r = JS_NewArrayBufferCopy(ctx, buf, size);
+  else
+    r = JS_NewStringLen(ctx, (const char *)buf, size);
+  if (mode) JS_FreeCString(ctx, mode);
+  free(buf);
+  return r;
+}
+
+static JSValue js_load_string(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  size_t len;
+  const char *src, *name = NULL;
+  JSValue r;
+  (void)this_val;
+  src = JS_ToCStringLen(ctx, &len, argv[0]);
+  if (!src) return JS_EXCEPTION;
+  if (argc > 1 && JS_IsString(argv[1])) name = JS_ToCString(ctx, argv[1]);
+  r = JS_Eval(ctx, src, len, name ? name : "<loadString>", JS_EVAL_TYPE_GLOBAL);
+  if (name) JS_FreeCString(ctx, name);
+  JS_FreeCString(ctx, src);
+  return r;
+}
+
+/* setTimeout/clearTimeout: a timer runs when no promise job is pending, in order of its due time on
+   a virtual clock (the delay is not waited for, as in a JS shell's event loop with nothing else to do). */
+typedef struct {
+  JSContext *ctx;
+  JSValue fn;
+  double due;
+  int id;
+} ShellTimer;
+static ShellTimer *shell_timers;
+static int shell_ntimers, shell_timer_cap, shell_timer_id;
+static double shell_vnow;
+
+static JSValue js_set_timeout(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  double ms = 0;
+  (void)this_val;
+  if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+    return JS_ThrowTypeError(ctx, "setTimeout: not a function");
+  if (argc > 1 && JS_ToFloat64(ctx, &ms, argv[1])) return JS_EXCEPTION;
+  if (!(ms > 0)) ms = 0;
+  if (shell_ntimers == shell_timer_cap) {
+    int cap = shell_timer_cap ? shell_timer_cap * 2 : 16;
+    ShellTimer *p = realloc(shell_timers, sizeof(*p) * cap);
+    if (!p) return JS_ThrowOutOfMemory(ctx);
+    shell_timers = p;
+    shell_timer_cap = cap;
+  }
+  ShellTimer *t = &shell_timers[shell_ntimers++];
+  t->ctx = ctx;
+  t->fn = JS_DupValue(ctx, argv[0]);
+  t->due = shell_vnow + ms;
+  t->id = ++shell_timer_id;
+  return JS_NewInt32(ctx, t->id);
+}
+
+static JSValue js_clear_timeout(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  int id = 0;
+  (void)this_val;
+  if (argc > 0 && JS_ToInt32(ctx, &id, argv[0])) return JS_EXCEPTION;
+  for (int i = 0; i < shell_ntimers; i++)
+    if (shell_timers[i].id == id) {
+      JS_FreeValue(shell_timers[i].ctx, shell_timers[i].fn);
+      memmove(&shell_timers[i], &shell_timers[i + 1],
+              sizeof(ShellTimer) * (shell_ntimers - i - 1));
+      shell_ntimers--;
+      break;
+    }
+  return JS_UNDEFINED;
+}
+
+/* Runs the earliest timer; 0 when there is none. */
+static int shell_run_timer(int *status) {
+  int best = -1;
+  for (int i = 0; i < shell_ntimers; i++)
+    if (best < 0 || shell_timers[i].due < shell_timers[best].due) best = i;
+  if (best < 0) return 0;
+  ShellTimer t = shell_timers[best];
+  memmove(&shell_timers[best], &shell_timers[best + 1],
+          sizeof(ShellTimer) * (shell_ntimers - best - 1));
+  shell_ntimers--;
+  if (t.due > shell_vnow) shell_vnow = t.due;
+  JSValue r = JS_Call(t.ctx, t.fn, JS_UNDEFINED, 0, NULL);
+  if (JS_IsException(r)) {
+    dump_exception(t.ctx);
+    *status = 1;
+  }
+  JS_FreeValue(t.ctx, r);
+  JS_FreeValue(t.ctx, t.fn);
+  return 1;
+}
+
+static JSValue js_run_string(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+
+static int shell_intl; /* --intl: every shell realm gets Intl */
+
+static void shell_install(JSContext *ctx, JSValueConst g) {
+#if defined(QJS_BENCH_INTL) && QJS_BENCH_INTL
+  if (shell_intl) rnqjs_intl_install(ctx);
+#endif
+  JS_SetPropertyStr(ctx, g, "print", JS_NewCFunction(ctx, js_print, "print", 1));
+  JS_SetPropertyStr(ctx, g, "printErr", JS_NewCFunction(ctx, js_print_err, "printErr", 1));
+  JS_SetPropertyStr(ctx, g, "readFile", JS_NewCFunction(ctx, js_read_file, "readFile", 1));
+  JS_SetPropertyStr(ctx, g, "read", JS_NewCFunction(ctx, js_read_file, "read", 2));
+  JS_SetPropertyStr(ctx, g, "loadString", JS_NewCFunction(ctx, js_load_string, "loadString", 2));
+  JS_SetPropertyStr(ctx, g, "runString", JS_NewCFunction(ctx, js_run_string, "runString", 1));
+  JS_SetPropertyStr(ctx, g, "setTimeout", JS_NewCFunction(ctx, js_set_timeout, "setTimeout", 2));
+  JS_SetPropertyStr(ctx, g, "clearTimeout", JS_NewCFunction(ctx, js_clear_timeout, "clearTimeout", 1));
+}
+
+static JSValue js_run_string(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  JSContext *nc;
+  JSValue g, r;
+  (void)this_val;
+  if (shell_nrealms == shell_realm_cap) {
+    int cap = shell_realm_cap ? shell_realm_cap * 2 : 16;
+    JSContext **p = realloc(shell_realms, sizeof(*p) * cap);
+    if (!p) return JS_ThrowOutOfMemory(ctx);
+    shell_realms = p;
+    shell_realm_cap = cap;
+  }
+  nc = JS_NewContext(JS_GetRuntime(ctx));
+  if (!nc) return JS_ThrowInternalError(ctx, "cannot create a realm");
+  shell_realms[shell_nrealms++] = nc;
+  g = JS_GetGlobalObject(nc);
+  shell_install(nc, g);
+  if (argc > 0) {
+    r = js_load_string(nc, JS_UNDEFINED, 1, argv);
+    if (JS_IsException(r)) {
+      JS_FreeValue(ctx, g);
+      return r;
+    }
+    JS_FreeValue(nc, r);
+  }
+  return g;
 }
 
 static double now_ms(void) {
@@ -512,6 +703,8 @@ int main(int argc, char **argv) {
   int stats = 0;
   const char *bytecode_mode = "eager";
   const char *path = NULL;
+  int shell = 0, script_argc = 0;
+  char **script_argv = NULL;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--mem"))
       mem = 1;
@@ -521,14 +714,33 @@ int main(int argc, char **argv) {
       bytecode_mode = argv[i] + 16;
     else if (!strcmp(argv[i], "--bytecode-mode") && i + 1 < argc)
       bytecode_mode = argv[++i];
-    else
+    else if (!strcmp(argv[i], "--shell"))
+      shell = 1;
+    else if (!strcmp(argv[i], "--intl"))
+      shell_intl = 1;
+    else if (!strcmp(argv[i], "--") && path) {
+      script_argv = argv + i + 1;
+      script_argc = argc - i - 1;
+      break;
+    } else
       path = argv[i];
   }
+  if (shell_intl && !shell) {
+    fprintf(stderr, "qjs-bench: --intl needs --shell\n");
+    return 2;
+  }
+#if !(defined(QJS_BENCH_INTL) && QJS_BENCH_INTL)
+  if (shell_intl) {
+    fprintf(stderr, "qjs-bench: built without Intl (QJS_BENCH_INTL=OFF), --intl is not available\n");
+    return 2;
+  }
+#endif
   if (!path) {
     fprintf(
         stderr,
-        "usage: qjs-bench [--mem] [--stats] "
-        "[--bytecode-mode=<eager|lazy-copy|lazy-borrow>] <file.js|file.bc>\n");
+        "usage: qjs-bench [--mem] [--stats] [--shell [--intl]] "
+        "[--bytecode-mode=<eager|lazy-copy|lazy-borrow>] <file.js|file.bc> "
+        "[-- args]\n");
     return 2;
   }
   int read_flags = JS_READ_OBJ_BYTECODE;
@@ -588,6 +800,13 @@ int main(int argc, char **argv) {
      only at run time (never seen by qjsaot) to exercise the compiled ->
      interpreted -> compiled unwind path. */
   JS_SetPropertyStr(ctx, global, "__aot_bench_driver__", JS_NewBool(ctx, 1));
+  if (shell) {
+    JSValue args = JS_NewArray(ctx);
+    shell_install(ctx, global);
+    for (int ai = 0; ai < script_argc; ai++)
+      JS_SetPropertyUint32(ctx, args, (uint32_t)ai, JS_NewString(ctx, script_argv[ai]));
+    JS_SetPropertyStr(ctx, global, "arguments", args);
+  }
   JS_SetPropertyStr(
       ctx, global, "host_set",
       JS_NewCFunction(ctx, js_host_set, "host_set", 3));
@@ -666,7 +885,10 @@ int main(int argc, char **argv) {
   for (;;) {
     JSContext *job_ctx = NULL;
     int rc = JS_ExecutePendingJob(rt, &job_ctx);
-    if (rc == 0) break;
+    if (rc == 0) {
+      if (shell && shell_run_timer(&status)) continue;
+      break;
+    }
     if (rc < 0) {
       dump_exception(job_ctx);
       status = 1;
@@ -712,6 +934,13 @@ int main(int argc, char **argv) {
   bench_irq_obj = JS_UNDEFINED;
   for (int fi = 0; fi < bench_nfacts; fi++) bench_facts[fi] = NULL;
   while (bench_nrealms > 0) JS_FreeContext(bench_realms[--bench_nrealms]);
+  while (shell_ntimers > 0) {
+    shell_ntimers--;
+    JS_FreeValue(shell_timers[shell_ntimers].ctx, shell_timers[shell_ntimers].fn);
+  }
+  free(shell_timers);
+  while (shell_nrealms > 0) JS_FreeContext(shell_realms[--shell_nrealms]);
+  free(shell_realms);
   JS_FreeContext(ctx);
   JS_FreeRuntime(rt);
   free(buf);

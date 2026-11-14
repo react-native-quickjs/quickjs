@@ -11281,6 +11281,13 @@ static void e_kscan(const Q2Func *fn, int fi) {
     if ((k = e_kuse(&fn->insns[i])) >= 0) e_kmark(fi, k);
 }
 
+/* The call that fills an empty global-read cell, open after its first argument pair, and the code its atom is read from: a framed body
+   passes its frame, a frameless one (no frame) its bytecode and the code it loaded at entry. */
+static const char *e_gwarm_call(void) {
+  return g_e_fl ? "qjs_aot_global_warm_b(ctx, (struct JSFunctionBytecode *)cb" : "qjs_aot_global_warm(ctx, f";
+}
+static const char *e_gwarm_code(void) { return g_e_fl ? "ecb" : "q2_code(f)"; }
+
 /* A speculative-body GLOBAL READ: `get_global` ("rabs": dest, atom offset, throw
    flag, site). `q2_global_hit` is the same inline test the generic body uses; a
    miss goes to the wrapper, which performs the real lookup (that path can run a
@@ -11337,15 +11344,16 @@ static int emit_typed_global_read(
     e_note_stub(g_e_vx, g_e_vx_cur, g_e_vx_blk, &g_e_vx_n, in->pc, cur, NULL);
     e_sweep_guard(f, "vx", in->pc);
     fprintf(f, "    { JSValue _g;\n");
-    if (in->own == 0 && !g_e_inl && !g_e_fl && in->narg > 1 && in->arg[1].kind == 'a' && in->arg[1].off >= 0)
-      /* a cell no one has filled in this process: fill it (no user code) and go on, where the exit would hand the whole activation to the interpreter */
+    if (in->own == 0 && !g_e_inl && in->narg > 1 && in->arg[1].kind == 'a' && in->arg[1].off >= 0)
+      /* a cell no one has filled in this process: fill it (no user code) and go on, where the exit would hand the whole activation to the
+         interpreter (a frameless body called once, such as a top-level driver, would otherwise run its loops there) */
       fprintf(
           f,
           "      if (__builtin_expect(Q2_FORCE_MISS || !q2_global_hit(ctx, pic, %d, &_g), 0)) {\n"
-          "        if (Q2_FORCE_MISS || !qjs_aot_global_warm(ctx, f, %d, (int)qjs_aot_ld_u32(q2_code(f) + %d)) ||\n"
+          "        if (Q2_FORCE_MISS || !%s, %d, (int)qjs_aot_ld_u32(%s + %d)) ||\n"
           "            !q2_global_hit(ctx, pic, %d, &_g)) E_GOTO(vx, %d);\n"
           "      }\n",
-          site, site, in->arg[1].off, site, in->pc);
+          site, e_gwarm_call(), site, e_gwarm_code(), in->arg[1].off, site, in->pc);
     else
       fprintf(
           f,
@@ -11391,14 +11399,14 @@ static int emit_typed_global_read(
   }
   if (t->lb[dv] != E_LB_TAG && !e_def_dead(in, dv))
     e_note_stub(g_e_dx, g_e_dx_cur, g_e_dx_blk, &g_e_dx_n, in->next, cur, in);
-  if (e_must_exit(fn, in) && in->own == 0 && !g_e_inl && !g_e_fl && in->narg > 1 && in->arg[1].kind == 'a' && in->arg[1].off >= 0)
+  if (e_must_exit(fn, in) && in->own == 0 && !g_e_inl && in->narg > 1 && in->arg[1].kind == 'a' && in->arg[1].off >= 0)
     /* a cell no one has filled in this process: fill it (no user code) before the test, where the miss would leave the activation to the interpreter */
     fprintf(
         f,
         "    { JSValue _g0;\n"
         "      if (__builtin_expect(!Q2_FORCE_MISS && !q2_global_hit(ctx, pic, %d, &_g0), 0))\n"
-        "        (void)qjs_aot_global_warm(ctx, f, %d, (int)qjs_aot_ld_u32(q2_code(f) + %d)); }\n",
-        site, site, in->arg[1].off);
+        "        (void)%s, %d, (int)qjs_aot_ld_u32(%s + %d)); }\n",
+        site, e_gwarm_call(), site, e_gwarm_code(), in->arg[1].off);
   fprintf(f, "    { JSValue _g;\n");
   fprintf(
       f,

@@ -1,0 +1,22 @@
+Subject: Backtraces decide the compiled-record scan once
+
+What this does
+  regvm_fill_backtrace_frames sets rec_scan (QJS_RECSCAN or form bit 2) the first time it runs, as regvm_merge_fl_records already did, and then tests the cached value.
+
+Why we need it
+  Until the merge ran, rec_scan stayed unset and every backtrace called getenv("QJS_RECSCAN"): 3.4% of the instructions of kit throws (one backtrace per thrown error), which went from 3273.0 to 3807.7 M compiled instructions in the green run.
+
+Soundness
+  The value is the one the merge computes: the form bits come from the units' constructors, which run before any code, and the environment variable is read once as before.
+
+diff --git a/quickjs.c b/quickjs.c
+index cc3c961..3b970f8 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -31939 +31939,5 @@ static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
+-    if ((qjs_aot_form_v & 4) || rt->aot_fl_top != NULL || rec_scan > 0 || (rec_scan < 0 && ((qjs_aot_form_v & 2) || getenv("QJS_RECSCAN"))))
++    /* rec_scan is decided once (the form bits are set by the units' constructors, before any code runs): an unset QJS_RECSCAN was
++       looked up again on every backtrace. */
++    if (rec_scan < 0)
++        rec_scan = (qjs_aot_form_v & 2) || getenv("QJS_RECSCAN") != NULL;
++    if ((qjs_aot_form_v & 4) || rt->aot_fl_top != NULL || rec_scan > 0)

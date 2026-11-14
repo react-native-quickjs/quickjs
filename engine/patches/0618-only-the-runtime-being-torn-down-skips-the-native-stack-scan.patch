@@ -1,0 +1,29 @@
+Subject: Only the runtime being torn down skips the native-stack scan
+
+What this does
+  The final collection of JS_FreeRuntime scans no native stack (patch 0499). The flag that said so (ss_final) was a process-wide int set before that collection and never cleared. It is now the runtime being torn down (ss_final_rt): js_drc_pin skips the scan only for that runtime, and JS_FreeRuntime clears it just before the runtime's memory is released.
+
+Why we need it
+  After the first JS_FreeRuntime in a process, every later runtime skipped the conservative native-stack scan for good. Since the interpreter allocates plain objects and small arrays in the nursery (0563), the stack VM's frames (on the native stack) and an embedder's C locals are found only by that scan. So a young cell held only by a frame or a local was not a root of the young collection and was freed while live. Any embedder that frees a runtime and creates another (a React Native reload, run-test262: one runtime per test) was exposed. Found by the GC stress mode (next patch) on test262 built-ins/Array/prototype/fill: return-this.js then typed-array-resize.js, the second test's top-level `const evil = {...}`. Release check (a C embedder running the same script in three runtimes one after another, QJS_Y_CHECK=1): 2 unrecorded young roots before, 0 after; stack-scan words 0.88M before (only the first runtime scanned), 2.65M after.
+
+Soundness
+  The teardown keeps its rule: the runtime being freed scans no stack in its final collection and in any reconcile until its memory is released. Every other runtime, including one later allocated at the same address (the pointer is cleared before the release) and one running on another thread during the teardown, scans its stack as before.
+
+diff --git a/quickjs.c b/quickjs.c
+index 4018625..90ed349 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -5245,2 +5245,3 @@ static void drc_st_site_dump(void)
+-/* Set while the runtime is torn down: the final collection scans no native stack (every word on it is stale). */
+-static int ss_final;
++/* The runtime being torn down: its final collection scans no native stack (every word on it is stale). Only that runtime: a runtime made
++   after it, or running on another thread meanwhile, still scans its stack. */
++static JSRuntime *ss_final_rt;
+@@ -5362 +5363 @@ void JS_FreeRuntime(JSRuntime *rt)
+-    ss_final = 1;
++    ss_final_rt = rt;
+@@ -5653,0 +5655 @@ void JS_FreeRuntime(JSRuntime *rt)
++    ss_final_rt = NULL;
+@@ -12655 +12657 @@ static void js_drc_pin(JSRuntime *rt)
+-    if (ss_on && !ss_final) ss_scan(rt); else if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ss_n = 0;
++    if (ss_on && ss_final_rt != rt) ss_scan(rt); else if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ss_n = 0;

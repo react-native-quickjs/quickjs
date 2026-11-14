@@ -1,0 +1,91 @@
+Subject: Stack-VM coroutine frames are scanned and noted for nursery cells
+
+What this does
+  The young-collection root scan (ss_scan) also scans the value area of every running coroutine frame on the current call chain (a frame that is not on the native stack: it lives in its generator's or async function's heap state; C function frames leave cur_gc_obj unset, so the frame's address decides), from the arguments through the variables to the end of the operand stack, with the word match the native-stack scan uses (now shared as ss_young_word). A frame that parks (yield, await, initial yield) notes the nursery cells among its live values (js_frame_note_young, arguments to the stack pointer). Stack VM only: register-VM coroutine frames are published as root ranges and noted by js_regvm_drc_suspend.
+
+Why we need it
+  The stack VM keeps a coroutine's frame in its heap state, off the native stack, so the stack scan never saw it. An object literal under construction is a nursery cell that only the frame names until its fields are filled: when an allocation for one of its fields started a young collection, or the generator parked in the middle of the literal (`{ a: i, b: yield 0 }`) and a collection ran while it waited, the collection freed it and a later read met the reused cell ("cannot read property '1' of undefined", or the gc_decref_child / js_drc_reconcile_locked count assertions; QJS_Y_CHECK reports an unrecorded root). Found while reproducing JetStream 3 babel-minify-wtb; tests/differential/corpus/tos-cache-exceptions.js also tripped QJS_Y_CHECK. Repro: tests/differential/corpus/generator-frame-young-object.js.
+
+Soundness
+  A running frame's stack pointer is a local of JS_CallInternal, so its whole value area is scanned: a stale slot above the stack pointer can only pin a cell of the current epoch at a valid cell start (the existing match), which keeps an object alive until the next collection and never frees one. A parked frame's live values are exactly arguments..sp; a cell noted there is promoted at the next collection, after which it is an ordinary counted object, and a note on a cell that dies before that collection is ignored by it (its count is zero).
+
+diff --git a/quickjs.c b/quickjs.c
+index b0bb73c..88c40fb 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -4885,0 +4886,7 @@ static void y_formless_args_slow(JSValue this_obj, const JSValue *argv, int na)
++/* The nursery cells named by a parked coroutine frame's live values (arguments, variables, operand stack) are noted as roots. */
++static __attribute__((noinline)) void js_frame_note_young(const JSValue *v, const JSValue *end)
++{
++    for (; v < end; v++)
++        if (JS_VALUE_GET_TAG(*v) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(*v)) && Y_YOUNG(JS_VALUE_GET_PTR(*v)))
++            y_note(JS_VALUE_GET_PTR(*v));
++}
+@@ -12520,0 +12528,39 @@ static void ss_rng_of(void *ptr, JSValue val)
++/* A word that names a nursery cell of this epoch pins it: the cell is noted as a root, and the count taken here goes back at unpin. */
++static inline int ss_young_word(uintptr_t v)
++{
++    YChunk *c = (YChunk *)(v & ~(uintptr_t)65535);
++    uintptr_t off, idx, p;
++    uint32_t k;
++    for (k = 0; k < y_nurs_n; k++) if (y_nurs[k] == c) break;
++    if (k < y_nurs_n && v >= (uintptr_t)c + 64) {
++        off = v - ((uintptr_t)c + 64); idx = off / c->stride;
++        p = (uintptr_t)c + 64 + idx * c->stride + 8;
++        if (idx * c->stride + c->stride <= 65536 - 64 && Y_KIND((void *)p) == 0x80 && *(uint16_t *)(p + 22) == (uint16_t)(qjs_y_ep48 >> 48)) {
++            ss_stat[1]++;
++            ++JS_REF_COUNT((void *)p); y_note((void *)p);
++            ss_push(JS_MKPTR(JS_TAG_OBJECT, (void *)p));
++            return 1;
++        }
++    }
++    return 0;
++}
++#if !QJS_REGVM
++/* A running coroutine's frame lives in its heap state, not on the native stack, and its stack pointer is a local of the interpreter: the whole value area
++   is scanned like the native stack. A frame outside [lo, hi) is such a frame (every other frame is a local of its caller; C function frames do not set
++   cur_gc_obj, so it cannot tell them apart). */
++static void ss_scan_coro_frames(JSRuntime *rt, uintptr_t lo, uintptr_t hi)
++{
++    JSStackFrame *sf;
++    for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
++        JSFunctionBytecode *b;
++        const JSValue *v, *end;
++        if ((uintptr_t)sf - lo < hi - lo || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++            continue;
++        b = JS_VALUE_GET_OBJ(sf->cur_func)->u.func.function_bytecode;
++        end = sf->var_buf + b->var_count + b->stack_size;
++        for (v = sf->arg_buf; v < end; v++)
++            if (JS_VALUE_GET_TAG(*v) == JS_TAG_OBJECT && Y_REG(JS_VALUE_GET_PTR(*v)))
++                ss_young_word((uintptr_t)JS_VALUE_GET_PTR(*v));
++    }
++}
++#endif
+@@ -12545,15 +12591,2 @@ static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
+-        if (Y_REG((void *)v)) {
+-            YChunk *c = (YChunk *)(v & ~(uintptr_t)65535);
+-            uintptr_t off, idx, p;
+-            for (k = 0; k < y_nurs_n; k++) if (y_nurs[k] == c) break;
+-            if (k < y_nurs_n && v >= (uintptr_t)c + 64) {
+-                off = v - ((uintptr_t)c + 64); idx = off / c->stride;
+-                p = (uintptr_t)c + 64 + idx * c->stride + 8;
+-                if (idx * c->stride + c->stride <= 65536 - 64 && Y_KIND((void *)p) == 0x80 && *(uint16_t *)(p + 22) == (uint16_t)(qjs_y_ep48 >> 48)) {
+-                    ss_stat[1]++;
+-                    ++JS_REF_COUNT((void *)p); y_note((void *)p);
+-                    ss_push(JS_MKPTR(JS_TAG_OBJECT, (void *)p));
+-                    continue;
+-                }
+-            }
+-        }
++        if (Y_REG((void *)v) && ss_young_word(v))
++            continue;
+@@ -12565,0 +12599,3 @@ static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
++#if !QJS_REGVM
++    ss_scan_coro_frames(rt, lo, hi);
++#endif
+@@ -47478,0 +47515,5 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
++        /* A parked frame is off the native stack and out of the call chain, so no scan finds the nursery cells it holds (an object
++           literal suspended before its fields are filled): they are noted as referenced from the heap, or a young collection while the
++           coroutine waits frees them. */
++        if (JS_VALUE_GET_TAG(ret_val) == JS_TAG_INT && likely(y_interp_on))
++            js_frame_note_young(sf->arg_buf, sp);

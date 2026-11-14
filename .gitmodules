@@ -2,3 +2,6 @@
 	path = engine/quickjs-ng
 	url = https://github.com/quickjs-ng/quickjs.git
 	ignore = dirty
+[submodule "tools/benchmark/jetstream3/JetStream"]
+	path = tools/benchmark/jetstream3/JetStream
+	url = https://github.com/WebKit/JetStream.git

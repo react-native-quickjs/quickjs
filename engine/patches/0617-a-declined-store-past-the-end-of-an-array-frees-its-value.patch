@@ -1,0 +1,38 @@
+Subject: A store past the end of an array that declines its hole gap frees the value it was given
+
+What this does
+  js_array_store_hole_gap stores a value past the end of a fast array, leaving holes in the gap. It now takes the value on every path: it stores it (1), frees it on an exception (-1), and frees it when it declines (0: the gap is over JS_ARRAY_HOLE_MAX_GAP, the array would be too sparse, or length is not a writable int). Before, the decline paths returned without freeing.
+
+Why we need it
+  The only caller (JS_CreateProperty, for a store or defineProperty at an index past a fast array's end) hands it js_dup(val) and, on a decline, converts the array and stores val again through the ordinary path. The declined reference was never freed, so every such store leaked its value for the life of the runtime. An object value holds its realm through its prototype, so in assertion builds JS_FreeRuntime aborted on a non-empty gc_obj_list. JetStream 3 typescript-lib and the web-tooling typescript bundle (createBracketsMap: `const e=[]; e[1024]=["{","}"]`) left ~51000 and ~440 objects. Repro: tests/differential/corpus/array-store-far-past-end.js (437 objects left under QJS_DEBUG_LEAK=1 before, none after; both VMs).
+
+Soundness
+  Each path of the helper now ends with the value either stored in the array or freed once. The caller's own reference (val, borrowed) is unchanged and is the one the ordinary path stores. No other caller exists.
+
+diff --git a/quickjs.c b/quickjs.c
+index 763d183..4018625 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -18208,0 +18209,3 @@ static int64_t js_arr_packed_find(const JSObject *p, JSValueConst target, int64_
++/* Stores val at idx past the end of a fast array, leaving holes in the gap. Takes val on every path: 1 stored it, -1 is an
++   exception, 0 declines (the gap is too large or too sparse, or length is not a writable int) and frees it; the caller then
++   converts the array and stores its own reference. */
+@@ -18221 +18224 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
+-        return 0;
++        goto decline;
+@@ -18223 +18226 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
+-        return 0;
++        goto decline;
+@@ -18228 +18231 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
+-        return 0;
++        goto decline;
+@@ -18230 +18233 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
+-        return 0;
++        goto decline;
+@@ -18234 +18237 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
+-        return 0;
++        goto decline;
+@@ -18252,0 +18256,3 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
++ decline:
++    JS_FreeValue(ctx, val);
++    return 0;

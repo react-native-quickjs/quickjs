@@ -97,6 +97,22 @@ set(REACT_NATIVE_QUICKJS_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "" FORCE)
 add_subdirectory(modules/text-encoding)
 add_subdirectory(modules/intl)
 
+# qjs-bench --shell --intl: the Intl module with the backend a host build links (modules/intl's en-US/UTC stub),
+# for JetStream's intl rows. The core sources are compiled into the driver as intl-cli does, without JSI.
+option(QJS_BENCH_INTL "Link the Intl module into qjs-bench (--shell --intl)" ON)
+if(QJS_BENCH_INTL)
+  target_sources(qjs-bench PRIVATE
+    modules/intl/cpp/IntlModule.cpp
+    modules/intl/cpp/IntlPlatform.cpp
+    modules/intl/cpp/IntlNumberParts.cpp)
+  add_dependencies(qjs-bench rnqjs_intl_generate)
+  target_include_directories(qjs-bench PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/modules/intl/cpp"
+    "${CMAKE_BINARY_DIR}/modules/intl/intl-generated")
+  target_compile_features(qjs-bench PRIVATE cxx_std_20)
+  target_compile_definitions(qjs-bench PRIVATE QJS_BENCH_INTL=1)
+endif()
+
 # Test the generated module registry end to end: the TU must link the modules
 # in without any test calling their install functions directly -- the host
 # analogue of an app's iOS build. --dir keeps the list authoritative.

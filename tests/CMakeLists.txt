@@ -35,6 +35,12 @@ add_executable(quickjs_json_oom_tests json_oom_test.cpp)
 target_link_libraries(quickjs_json_oom_tests PRIVATE quickjs)
 add_test(NAME quickjs_json_oom_tests COMMAND quickjs_json_oom_tests)
 
+# Runtimes made one after another keep their stack roots (engine/patches/0618).
+add_executable(quickjs_runtime_reuse_tests runtime_reuse_test.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(quickjs_runtime_reuse_tests PRIVATE quickjs Threads::Threads)
+add_test(NAME quickjs_runtime_reuse_tests COMMAND quickjs_runtime_reuse_tests)
+
 # Hermes' own JSI conformance suite, parameterised over a RuntimeFactory, so
 # supplying ours is the whole integration. testlib.h is included as
 # <jsi/test/testlib.h>: only third_party/ goes on the include path, so
@@ -89,6 +95,18 @@ if(NODE_EXECUTABLE)
     COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
             --qjs $<TARGET_FILE:qjs-run> --qjsc $<TARGET_FILE:qjsc>
             --via-bytecode)
+  # A reference counted and never released leaves objects at teardown; QJS_DEBUG_LEAK reports them in any build.
+  add_test(NAME differential_leaks
+    COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
+            --qjs $<TARGET_FILE:qjs-run> --leak-check)
+  # Under the GC stress mode the differential test above runs with the allocation stress; this one adds a
+  # collection at every back edge and call. The two catch different missed roots (engine/patches/0619).
+  if(QJS_GC_STRESS)
+    add_test(NAME differential_gc_stress_poll
+      COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
+              --qjs $<TARGET_FILE:qjs-run>)
+    set_tests_properties(differential_gc_stress_poll PROPERTIES ENVIRONMENT "QJS_GC_STRESS_POLL=1")
+  endif()
 else()
   message(STATUS "rnqjs: node not found, differential corpus will not run")
 endif()

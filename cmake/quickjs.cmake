@@ -296,6 +296,14 @@ else()
   target_compile_definitions(quickjs PUBLIC JS_ENABLE_DEBUGGER=0)
 endif()
 
+# The GC stress mode (engine/patches/0619), for test configures only: forced
+# young collections at allocations, between jobs and at interrupt polls, with an
+# unrecorded young root fatal. Nothing of it is compiled without the option.
+option(QJS_GC_STRESS "Build the engine with the GC stress mode (testing only)" OFF)
+if(QJS_GC_STRESS)
+  target_compile_definitions(quickjs PRIVATE QJS_GC_STRESS=1)
+endif()
+
 # The interpreter recurses on the native stack: one JavaScript call is one
 # JS_CallInternal frame. Unoptimized that frame is around 10 KB, so on React
 # Native's roughly 1 MB JavaScript thread only about 80 JavaScript calls fit --

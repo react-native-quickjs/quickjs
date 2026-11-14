@@ -32,7 +32,7 @@ int qjs_aot_pool_tag(const struct JSAotGenFunc *g, uint32_t idx);
 /* The function being prepared: its text, the global sites its calls read and its arguments. */
 static char *pure_text;
 static size_t pure_len;
-static int pure_nargs, pure_nsites, pure_sites[8];
+static int pure_nargs, pure_nsites, pure_sites[8], pure_atoff[8]; /* atoff: where the code holds the site's atom, or -1 */
 static char pure_hex[33];
 
 #define PV_NONE 0
@@ -304,7 +304,10 @@ static void p_insn(PCtx *c, const Q2Insn *in) {
       /* the callee is whatever the global holds when the pure form is entered: the entry checks
          that it is this function, and nothing run in between can change it */
       for (k = 0; k < pure_nsites && pure_sites[k] != site; k++) {}
-      if (k == pure_nsites) pure_sites[pure_nsites++] = site;
+      if (k == pure_nsites) {
+        pure_atoff[pure_nsites] = gi->narg > 1 && gi->arg[1].kind == 'a' && gi->arg[1].off >= 0 ? gi->arg[1].off : -1;
+        pure_sites[pure_nsites++] = site;
+      }
       /* the arguments the callee reads; the call is a plain C call */
       fprintf(c->o, "    Q2P_CHECK();\n");
       fprintf(c->o, "    { Q2PR r_ = aot_p_%s(e_, b_", c->hex);
@@ -495,10 +498,19 @@ void e_pure_emit_entry(FILE *f) {
   fprintf(f, "        int32_t pa_[%d];\n        JSValue pg_;\n", pure_nargs > 0 ? pure_nargs : 1);
   fprintf(f, "        if (");
   for (i = 0; i < pure_nargs; i++) fprintf(f, "Q2_I32_OK(argv[%d], pa_[%d]) && ", i, i);
-  for (i = 0; i < pure_nsites; i++)
-    fprintf(
-        f, "q2_global_hit(ctx, pic, %d, &pg_) && q2_call_entry(pg_, (const void *)aot_f_%s)%s", pure_sites[i],
-        pure_hex, i + 1 < pure_nsites ? " && " : "");
+  /* A cell the process has not filled yet (the body reads the callee from its constant slot and never fills it) is filled
+     here, running no code, so the pure form is not refused for good. */
+  for (i = 0; i < pure_nsites; i++) {
+    if (pure_atoff[i] >= 0)
+      fprintf(
+          f,
+          "(q2_global_hit(ctx, pic, %d, &pg_) || (qjs_aot_global_warm_b(ctx, (struct JSFunctionBytecode *)cb, %d, "
+          "(int)qjs_aot_ld_u32(ecb + %d)) && q2_global_hit(ctx, pic, %d, &pg_))) && ",
+          pure_sites[i], pure_sites[i], pure_atoff[i], pure_sites[i]);
+    else
+      fprintf(f, "q2_global_hit(ctx, pic, %d, &pg_) && ", pure_sites[i]);
+    fprintf(f, "q2_call_entry(pg_, (const void *)aot_f_%s)%s", pure_hex, i + 1 < pure_nsites ? " && " : "");
+  }
   fprintf(f, ") {\n");
   fprintf(
       f,

@@ -1,0 +1,30 @@
+Subject: The native-stack scan is not instrumented by AddressSanitizer
+
+What this does
+  ss_scan, the conservative scan of the native stack, carries no_sanitize_address in builds with AddressSanitizer (SS_NO_ASAN; empty otherwise).
+
+Why we need it
+  The scan reads every word between its own frame and the stack top, and under ASan that range holds the redzones the instrumentation puts around locals: every scan reported a stack-buffer-underflow at its first word (its own frame's redzone). Such a report aborts the run, so a sanitized build could not run any code path that scans the stack. The AOT acceptance run's ASan stage met it in a teardown (0622).
+
+Soundness
+  Only the instrumentation of this one function changes, and only in sanitized builds; release objects are unchanged. The words it reads are the stack's own memory and are only compared against heap and nursery ranges, never dereferenced as stack objects. The functions it calls keep their instrumentation, so the reads of the cells a word points to are still checked.
+
+diff --git a/quickjs.c b/quickjs.c
+index 7f3f175..b71510d 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -12636 +12636,13 @@ static void ss_scan_coro_frames(JSRuntime *rt, uintptr_t lo, uintptr_t hi)
+-static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
++/* The scan reads every word of the native stack between its own frame and the stack top, including the redzones AddressSanitizer puts around
++   locals: the reads are the point of a conservative scan, so the function is not instrumented. */
++#if defined(__SANITIZE_ADDRESS__)
++#define SS_NO_ASAN __attribute__((no_sanitize_address))
++#elif defined(__has_feature)
++#if __has_feature(address_sanitizer)
++#define SS_NO_ASAN __attribute__((no_sanitize_address))
++#endif
++#endif
++#ifndef SS_NO_ASAN
++#define SS_NO_ASAN
++#endif
++static __attribute__((noinline)) SS_NO_ASAN void ss_scan(JSRuntime *rt)

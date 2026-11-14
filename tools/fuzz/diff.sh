@@ -1,6 +1,7 @@
 #!/bin/bash
-# diff.sh SEED WORK : one differential round. Modes: stack interpreter, register interpreter, AOT (profile = train.js),
-# AOT with an empty profile, AOT with a wrong profile (another seed's program). Exit 0 = all outputs equal.
+# diff.sh SEED WORK : one differential round. Modes: stack interpreter, register interpreter, the GC stress builds of both
+# (when built: tools/fuzz/build-refs.sh; each with and without QJS_GC_STRESS_POLL), AOT (profile = train.js), AOT with an
+# empty profile, AOT with a wrong profile (another seed's program). Exit 0 = all outputs equal.
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 CK=${CK:-$ROOT/.local/scratch/ck}
 seed=$1; W=$2/s$seed; mkdir -p "$W"
@@ -21,6 +22,12 @@ run reg   $CK/reg-rel/tests/qjs-run "$W/g/run.js"
 bad=0
 cmpm() { cmp -s "$W/stack.out" "$W/$1.out" || { echo "seed $seed: $1 differs from stack"; bad=1; }; }
 cmpm reg
+# GC stress: a missed young root aborts (an exit class the stack run does not have) instead of corrupting a later value
+for v in stack-gcs reg-gcs; do
+  [ -x "$CK/$v/tests/qjs-run" ] || continue
+  run $v "$CK/$v/tests/qjs-run" "$W/g/run.js"; cmpm $v
+  QJS_GC_STRESS_POLL=1 run ${v}p "$CK/$v/tests/qjs-run" "$W/g/run.js"; cmpm ${v}p
+done
 if [ -z "$NOAOT" ]; then
   $ROOT/tools/fuzz/aot-build.sh "$W/g/train.js" "$W/aot" > "$W/aot.build" 2>&1 || { echo "seed $seed: aot build: $(cat $W/aot.build | head -1)"; bad=1; }
   [ -x "$W/aot/run" ] && { run aot "$W/aot/run" "$W/g/run.js"; cmpm aot; }

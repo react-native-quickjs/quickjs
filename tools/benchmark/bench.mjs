@@ -12,6 +12,9 @@ import {
   mkdirSync,
   readFileSync,
   writeFileSync,
+  appendFileSync,
+  readlinkSync,
+  fstatSync,
   statSync,
 } from "node:fs";
 import { join, dirname, resolve, relative, basename } from "node:path";
@@ -19,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import * as device from "./lib/device.mjs";
 import * as hermes from "./lib/hermes.mjs";
+import * as js3 from "./jetstream3/jetstream3.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..", "..");
@@ -43,6 +47,7 @@ function parseArgs(argv) {
     ab: [],
     list: false,
     json: false,
+    partial: null,
     save: false,
     against: null,
     mem: false,
@@ -58,6 +63,8 @@ function parseArgs(argv) {
     ab_only: false,
     ab_baseline: null,
     all: false,
+    js3_iterations: null,
+    js3_worst: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -68,6 +75,7 @@ function parseArgs(argv) {
     else if (a === "--ab") out.ab.push(argv[++i]);
     else if (a === "--list") out.list = true;
     else if (a === "--json") out.json = true;
+    else if (a === "--partial") out.partial = argv[++i];
     else if (a === "--save") {
       const nx = argv[i + 1];
       out.save = nx && !nx.startsWith("--") ? (i++, nx) : true;
@@ -87,6 +95,8 @@ function parseArgs(argv) {
     else if (a === "--baseline") out.ab_baseline = argv[++i];
     else if (a === "--ab-only") out.ab_only = true;
     else if (a === "--all") out.all = true;
+    else if (a === "--js3-iterations") out.js3_iterations = Number(argv[++i]);
+    else if (a === "--js3-worst-case") out.js3_worst = Number(argv[++i]);
     else if (a === "-h" || a === "--help") out.help = true;
     else if (a.startsWith("--")) fail(`unknown flag: ${a}`);
     else out._.push(a);
@@ -99,13 +109,22 @@ function usage() {
 
 suites:
   react minireact rn primitives data strings surface suspense modern arrayholes jsonparse
-  octane compiler jit calls startup
+  octane jetstream3 compiler jit calls startup
 
 options:
   --rows a,b,c         only run rows matching (substring)
   --skip a,b,c         exclude rows matching
-  --all                include the octane rows held back by default (see below)
-  --engine qjs|hermes  add an engine (qjs always added)
+  --all                include the octane rows held back by default, and the
+                       jetstream3 workloads outside JetStream's default set
+  --engine E           add an engine (qjs always added): hermes, or for
+                       jetstream3 only: regvm (build-regvm/qjs-bench), node
+                       (the generated per-workload entry, main context),
+                       node-shell (cli.js in node:vm contexts),
+                       bun, bun-aot (bun build --compile --bytecode shell),
+                       bun-canary-aot (per-workload bundle, bun canary
+                       build --compile --aot; BUN_CANARY_BIN)
+  --js3-iterations N   jetstream3: override every workload's iteration count
+  --js3-worst-case N   jetstream3: override the worst-case count (< iterations)
   --ab a=/x,b=/y       A/B compare two binaries (alias for --engine)
   --reps N             process reps (default 1)
   --min-ms N           workload calibration floor (default 100)
@@ -117,6 +136,8 @@ options:
   --label <name>       label the --ab arm
   --baseline <file>    baseline to read pinned iters from
   --json               machine-readable
+  --partial FILE       append each finished row/engine result to FILE as one JSON line
+                       (default with --json and stdout redirected to X.json: X.partial.jsonl)
   --list               list rows and exit
   --device             run on a connected Android device
   -h, --help           this help
@@ -141,6 +162,7 @@ const SUITES = [
   { kind: "workload", name: "jsonparse", file: "90-jsonparse.js" },
   { kind: "workload", name: "prosemirror", file: "95-prosemirror.js" },
   { kind: "octane", name: "octane" },
+  { kind: "jetstream3", name: "jetstream3" },
   { kind: "kernels", name: "compiler", file: "compiler_bench.js" },
   { kind: "kernels", name: "jit", file: "jit_bench.js" },
   { kind: "calls", name: "calls" },
@@ -195,6 +217,20 @@ function allRows(suites) {
         "utf8",
       ).matchAll(/"row":\s*"([^"]+)"/g))
         out.push({ id: `octane/${f[1]}`, suite: "octane", name: f[1] });
+    } else if (s.kind === "jetstream3") {
+      let list = [];
+      try {
+        list = js3.workloads();
+      } catch (err) {
+        process.stderr.write(`[bench] jetstream3: ${err.message}\n`);
+      }
+      for (const w of list)
+        out.push({
+          id: `jetstream3/${w.name}`,
+          suite: "jetstream3",
+          name: w.name,
+          js3default: w.default,
+        });
     } else if (s.kind === "kernels") {
       const text = readFileSync(join(KERNELS, s.file), "utf8");
       for (const m of text.matchAll(/bench\("([^"]+)"/g))
@@ -242,6 +278,8 @@ function filterRows(rows, args) {
     if (wants.length && !wants.some((w) => r.id.includes(w))) return false;
     if (skips.length && skips.some((w) => r.id.includes(w))) return false;
     if (r.suite === "octane" && held.includes(r.name)) return false;
+    /* JetStream's own default set, unless --all. */
+    if (r.suite === "jetstream3" && !args.all && !r.js3default) return false;
     return true;
   });
 }
@@ -303,6 +341,32 @@ function enginesFromArgs(args, hermesHost) {
       else console.error(`bench: hermes not found at ${h}, skipping`);
     } else if (e === "qjs") {
       /* already handled */
+    } else if (e === "regvm") {
+      const p =
+        process.env.QJS_REGVM_BENCH || join(ROOT, "build-regvm", "qjs-bench");
+      if (!existsSync(p))
+        fail(
+          `regvm engine not built: cmake -B build-regvm -DQJS_REGVM=ON && cmake --build build-regvm --target qjs-bench`,
+        );
+      out.push({ id: "regvm", bin: p, kind: "qjs", extra: [] });
+    } else if (e === "node") {
+      out.push({ id: "node", bin: process.execPath, kind: "node", extra: [] });
+    } else if (e === "node-shell") {
+      /* jetstream3 only: node through cli.js and shell-node.cjs (each
+         workload in a node:vm context, where V8 reaches globals through
+         interceptors: up to 35x slower on global-heavy rows). */
+      out.push({ id: "node-shell", bin: process.execPath, kind: "node", shell: true, extra: [] });
+    } else if (e === "bun") {
+      out.push({ id: "bun", bin: process.env.BUN_BIN || "bun", kind: "bun", extra: [] });
+    } else if (e === "bun-aot") {
+      out.push({ id: "bun-aot", bin: null, kind: "bun-aot", extra: [] });
+    } else if (e === "bun-canary-aot") {
+      out.push({
+        id: "bun-canary-aot",
+        bin: js3.bunCanaryBin(),
+        kind: "bun-canary-aot",
+        extra: [],
+      });
     } else fail(`unknown engine: ${e}`);
   }
   if (out.length === 0)
@@ -437,6 +501,82 @@ function runOctane(suite, row, engine, args) {
   return { score, stats, mem };
 }
 
+/* One JetStream workload through JetStream's own cli.js driver, run from the
+ * submodule with the engine's shell shim; the score is the driver's
+ * "<name> Score" line. Non-qjs engines (node, bun, bun-aot) run this suite only. */
+function runJetStream3(suite, row, engine, args) {
+  const driver = js3.driverArgs(row, {
+    iterations: args.js3_iterations,
+    worstCase: args.js3_worst,
+  });
+  const tail = ["--"].concat(js3.shimArgs(), driver);
+  let argv;
+  let mem = null;
+  const wantMem = engine.kind === "qjs" && !args.no_mem;
+  if (engine.kind === "qjs")
+    argv = engine.extra.concat(
+      ["--shell"],
+      js3.needsIntl(row) ? ["--intl"] : [],
+      wantMem ? ["--mem"] : [],
+      [js3.SHELL_QJS],
+      tail,
+    );
+  else if (engine.kind === "node" && !engine.shell) {
+    /* node runs the same generated entry bun-canary-aot compiles: the
+       workload in node's main context, so V8 is measured without node:vm's
+       global interceptors. */
+    let entry;
+    try {
+      entry = js3.aotEntry(row, { iterations: args.js3_iterations, worstCase: args.js3_worst });
+    } catch (e) {
+      return { error: `entry: ${e.message}` };
+    }
+    const p = launch(engine, engine.extra.concat([entry]), { cwd: dirname(entry), timeout: 1800000 });
+    const out = (p.stdout || "") + "\n" + (p.stderr || "");
+    const { score, sub } = js3.parseOutput(row, out);
+    if (p.status !== 0 || !score) {
+      const err = /^(JetStream3 failed: .*|.*Error: .*)$/m.exec(out);
+      return { error: err ? err[1].slice(0, 200) : `exit ${p.status}, no score` };
+    }
+    return { score, sub };
+  } else if (engine.kind === "node" || engine.kind === "bun")
+    argv = engine.extra.concat([js3.SHELL_NODE], tail);
+  else if (engine.kind === "bun-aot") argv = tail;
+  else if (engine.kind === "bun-canary-aot") {
+    const b = js3.buildBunCanaryAot(row, {
+      iterations: args.js3_iterations,
+      worstCase: args.js3_worst,
+    });
+    if (b.error) return { error: b.error };
+    const p = launch({ bin: b.exe }, [], { cwd: dirname(b.exe), timeout: 1800000 });
+    const out = (p.stdout || "") + "\n" + (p.stderr || "");
+    const { score, sub } = js3.parseOutput(row, out);
+    if (p.status !== 0 || !score) {
+      const err = /^(JetStream3 failed: .*|error: .*|.*Error: .*)$/m.exec(out);
+      return { error: err ? err[1].slice(0, 200) : `exit ${p.status}, no score` };
+    }
+    return { score, sub, ms: b.buildMs, bytes: b.bytes };
+  } else return { error: `jetstream3 does not run on ${engine.kind}` };
+  const p = launch(engine, argv, { cwd: js3.JS3, timeout: 1800000 });
+  const out = (p.stdout || "") + "\n" + (p.stderr || "");
+  for (const line of (p.stderr || "").split("\n"))
+    if (line.startsWith("##MEM## "))
+      try {
+        mem = JSON.parse(line.slice("##MEM## ".length));
+      } catch {}
+  const { score, sub } = js3.parseOutput(row, out);
+  const err = /^(uncaught: .*|Error: .*|.*JetStream3 failed: .*)$/m.exec(out);
+  if (p.status !== 0 || !score)
+    return {
+      error: err
+        ? err[1].slice(0, 200)
+        : p.error
+          ? String(p.error.message || p.error)
+          : `exit ${p.status}, no score`,
+    };
+  return { score, sub, mem };
+}
+
 function runKernels(suite, row, engine, args) {
   const kernelFile = join(KERNELS, suite.file);
   let text = readFileSync(kernelFile, "utf8");
@@ -549,6 +689,7 @@ function runStartup(suite, row, engine, args, baselineIters) {
 function runnerFor(suite) {
   if (suite.kind === "workload") return runWorkload;
   if (suite.kind === "octane") return runOctane;
+  if (suite.kind === "jetstream3") return runJetStream3;
   if (suite.kind === "kernels") return runKernels;
   if (suite.kind === "calls") return runCalls;
   if (suite.kind === "startup") return runStartup;
@@ -607,6 +748,11 @@ async function main() {
       stdio: "inherit",
     });
   }
+  if (suites.some((s) => s.kind === "jetstream3")) {
+    js3.prepareAssets();
+    for (const e of engines)
+      if (e.kind === "bun-aot") e.bin = js3.buildBunAot();
+  }
   const all = allRows(suites);
   const rows = filterRows(all, args);
   if (rows.length === 0) fail("no rows after filter");
@@ -627,6 +773,21 @@ async function main() {
     return any ? m : null;
   }
 
+  /* One JSON line per finished (row, engine), so a long run can be read before it ends. */
+  let partialPath = args.partial;
+  if (!partialPath && args.json) {
+    try {
+      if (fstatSync(1).isFile())
+        partialPath = readlinkSync("/proc/self/fd/1").replace(/\.json$/, "") + ".partial.jsonl";
+    } catch {}
+  }
+  if (partialPath) writeFileSync(partialPath, "");
+  const notePartial = (rowId, engineId, v) => {
+    if (!partialPath) return;
+    const { ns, ms, score, iters, error } = v || {};
+    appendFileSync(partialPath, JSON.stringify({ id: rowId, engine: engineId, ns, ms, score, iters, error }) + "\n");
+  };
+
   let counter = 0,
     total = rows.length * engines.length;
   for (const s of suites) {
@@ -641,7 +802,10 @@ async function main() {
         process.stderr.write(
           `\r[${++counter}/${total}] ${s.name} on ${e.id}   `,
         );
-        const r0 = run(suite, null, e, args, pinned);
+        const r0 =
+          e.kind !== "qjs" && e.kind !== "hermes"
+            ? { error: `${e.id} runs the jetstream3 suite only` }
+            : run(suite, null, e, args, pinned);
         if (r0.error) {
           for (const r of suiteRows)
             perEngine[e.id][r.id] = { error: r0.error };
@@ -653,6 +817,7 @@ async function main() {
               : { error: "row not produced" };
           }
         }
+        for (const r of suiteRows) notePartial(r.id, e.id, perEngine[e.id][r.id]);
       }
     } else {
       for (const r of suiteRows) {
@@ -663,7 +828,11 @@ async function main() {
           process.stderr.write(
             `\r[${++counter}/${total}] ${r.id} on ${e.id}   `,
           );
-          perEngine[e.id][r.id] = run(suite, r.name, e, args, pinned);
+          perEngine[e.id][r.id] =
+            suite.kind !== "jetstream3" && e.kind !== "qjs" && e.kind !== "hermes"
+              ? { error: `${e.id} runs the jetstream3 suite only` }
+              : run(suite, r.name, e, args, pinned);
+          notePartial(r.id, e.id, perEngine[e.id][r.id]);
         }
       }
     }

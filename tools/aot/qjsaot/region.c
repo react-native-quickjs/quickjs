@@ -34,6 +34,7 @@
 #define RG_MAXT 8
 #define RG_MAXK 8
 #define RG_MAXX 8192
+#define RG_MAXD 16   /* the deepest inlining (14, rg_call) plus room: the frames an exit chain or a call's records name */
 
 typedef struct RReq { char name[40]; int slot; int write; } RReq;
 
@@ -2221,6 +2222,25 @@ static void rg_emit_cap(RCtx *c, int ii, int pc, FILE *o) {
   while (k > 0 && c->in[k]->par > 0) k = c->in[k]->par;
   if (k > 0) rpc = c->in[k]->par_call_pc;
   fprintf(o, "        *(const uint8_t **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_CAP_IP) = *(const uint8_t *const *)(*(uint8_t **)((uint8_t *)f + QJS_AOT_OFF_REGRUN_B) + QJS_AOT_OFF_FNBC_REGVM_CODE) + %d;\n", rpc);
+  /* A call out of inlined code: the inlined frames between the root and the caller have no frame of their own, so for the length of the call each is
+     published as a frame record (its function and the pc of the call it is in), outermost first, as an exit's chain would build them. Without them a
+     backtrace taken in the callee went from the callee straight to the root. rg_emit_uncap takes them off after the call. */
+  {
+    int pth[RG_MAXD], np = 0, j;
+    for (k = ii; k > 0 && np < RG_MAXD; k = c->in[k]->par) pth[np++] = k;
+    if (np > 0) {
+      fprintf(o, "        JSAotFlRec ifr_[%d];\n", np);
+      for (j = np - 1; j >= 0; j--)
+        fprintf(o, "        ifr_[%d] = (JSAotFlRec){ E_FL_PREV(ctx), (JSObject *)(%s), %d, 0, NULL, NULL, 0, 0 }; E_FL_PUSH(ctx, ifr_[%d]);\n",
+                np - 1 - j, c->in[pth[j]]->co, j == 0 ? pc : c->in[pth[j - 1]]->par_call_pc, np - 1 - j);
+    }
+  }
+}
+/* After the call rg_emit_cap set up: the inlined frames' records come off, innermost first. */
+static void rg_emit_uncap(RCtx *c, int ii, FILE *o) {
+  int k, np = 0;
+  for (k = ii; k > 0 && np < RG_MAXD; k = c->in[k]->par) np++;
+  while (np-- > 0) fprintf(o, "          E_FL_POP(ctx, ifr_[%d]);\n", np);
 }
 
 /* Before an out-of-line call (TRUST): every value a frame on the path still uses after the call (the call itself in instance ii, the call that
@@ -2766,6 +2786,7 @@ static int rg_call(RCtx *c, int ii, const char *method_in, const Q2Insn *call, c
             free(lpre.p); free(lpost.p);
           }
         }
+        rg_emit_uncap(c, ii, o);
         fprintf(o, "          if (__builtin_expect(JS_IsException(r_), 0)) { RG_FREE_OWNED(); return JS_EXCEPTION; }\n");
         if (rk_ >= 0) { char hy_[33]; rg_hexof(J->g, hy_); fprintf(o, "#ifdef RG_RETSLOT_%s\n          if (JS_VALUE_GET_TAG(r_) == JS_TAG_OBJECT && JS_VALUE_GET_PTR(r_) == JS_VALUE_GET_PTR(SKV_%d)) sk_%d = 1; else\n#endif\n", hy_, rk_, rk_); }
         fprintf(o, "          rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, r_); %s = r_; }\n", resvar);

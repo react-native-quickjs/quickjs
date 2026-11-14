@@ -96,6 +96,7 @@
                       phx_, I->pfx, u0, phx_, phx_, I->pfx, u0, in->win_n, I->pfx, u0, in->win_n);
             fprintf(o, "        { JSValue r_ = JS_Call(ctx, %sv%d, JS_UNDEFINED, %d, av_);\n", I->pfx, u0, in->win_n);
             if (phx_[0]) fprintf(o, "#endif\n");
+            rg_emit_uncap(c, ii, o);
             fprintf(o, "          if (__builtin_expect(JS_IsException(r_), 0)) { RG_FREE_OWNED(); return JS_EXCEPTION; }\n");
             fprintf(o, "          rg_own_put(ctx, &rgo_, &rgon_, &rgoc_, r_); %sv%d = r_; } }\n", I->pfx, dv);
             reg = fn->values[dv].reg;
