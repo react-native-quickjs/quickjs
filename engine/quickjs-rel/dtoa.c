@@ -1187,24 +1187,73 @@ int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
         const char *s;
         int lo = 1, hi = 17, best = 17;
 
+        /* is there a decimal of mid significant digits that reads back as ad: the nearest one (%.*e), or, since at a power of
+           two the gap below ad is half the gap above, its neighbour across ad. Sets *pm / *px to it (digits, exponent). */
+#define DTOA_TRY_DIGITS(mid, pm, px) ({                                          \
+            int ok_ = 0, x_, k_;                                                    \
+            uint64_t d_ = 0, c_, lo_ = 1, hi_;                                      \
+            const char *t_;                                                         \
+            snprintf(tmpbuf, sizeof(tmpbuf), "%.*e", (mid) - 1, ad);                \
+            for (t_ = tmpbuf; *t_ && *t_ != 'e'; t_++)                              \
+                if (*t_ >= '0' && *t_ <= '9')                                       \
+                    d_ = d_ * 10 + (*t_ - '0');                                     \
+            x_ = atoi(t_ + 1);                                                      \
+            if (strtod(tmpbuf, NULL) == ad) {                                       \
+                ok_ = 1;                                                            \
+                *(pm) = d_;                                                         \
+                *(px) = x_;                                                         \
+            } else if (pow2) {                                                      \
+                for (k_ = 1; k_ < (mid); k_++)                                      \
+                    lo_ *= 10;                                                      \
+                hi_ = lo_ * 10;                                                     \
+                for (k_ = 0; k_ < 2 && !ok_; k_++) {                                \
+                    char nb_[64];                                                   \
+                    c_ = k_ == 0 ? d_ + 1 : d_ - 1;                                 \
+                    if (c_ < lo_ || c_ >= hi_)                                      \
+                        continue;                                                   \
+                    snprintf(nb_, sizeof(nb_), "%" PRIu64 "e%d", c_, x_ - ((mid) - 1)); \
+                    if (strtod(nb_, NULL) == ad) {                                  \
+                        ok_ = 1;                                                    \
+                        *(pm) = c_;                                                 \
+                        *(px) = x_;                                                 \
+                    }                                                               \
+                }                                                                   \
+            }                                                                       \
+            ok_; })
+        uint64_t m_try;
+        int x_try, x_best = 0;
+        /* only a power of two has a lopsided interval, where the neighbour across ad needs a test (else nearest only) */
+        int pow2 = m == ((uint64_t)1 << 52);
+
+        int have = 0;
+
         while (lo <= hi) {
             int mid = (lo + hi) / 2;
 
-            snprintf(tmpbuf, sizeof(tmpbuf), "%.*e", mid - 1, ad);
-            if (strtod(tmpbuf, NULL) == ad) {
+            if (DTOA_TRY_DIGITS(mid, &m_try, &x_try)) {
+                /* the last success is the fewest digits */
                 best = mid;
+                mant = m_try;
+                x_best = x_try;
+                have = 1;
                 hi = mid - 1;
             } else {
                 lo = mid + 1;
             }
         }
-        snprintf(tmpbuf, sizeof(tmpbuf), "%.*e", best - 1, ad);
-        for (s = tmpbuf; *s && *s != 'e'; s++) {
-            if (*s >= '0' && *s <= '9')
-                mant = mant * 10 + (*s - '0');
+        if (!have && !DTOA_TRY_DIGITS(best, &mant, &x_best)) {
+            /* 17 digits always read back; kept only as a guard */
+            snprintf(tmpbuf, sizeof(tmpbuf), "%.*e", best - 1, ad);
+            mant = 0;
+            for (s = tmpbuf; *s && *s != 'e'; s++) {
+                if (*s >= '0' && *s <= '9')
+                    mant = mant * 10 + (*s - '0');
+            }
+            x_best = atoi(s + 1);
         }
+#undef DTOA_TRY_DIGITS
         P = best;
-        E = atoi(s + 1) + 1;
+        E = x_best + 1;
         while (P > 1 && (mant % 10) == 0) {
             mant /= 10;
             P--;
@@ -1234,31 +1283,40 @@ int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
                     break;
                 E++; /* at most one iteration is possible */
             }
+            /* garanteed to work for P = P_max */
+            if (P_found != 0) {
+                /* convert back to base 2. The nearest P-digit value can fall outside d's rounding interval while the one on
+                   the other side of d is inside it, when the interval is lopsided: at a power of two the gap below d is
+                   half the gap above. There the neighbours are tried too (only the one across d can be inside, and it is
+                   then the nearest inside); with a symmetric interval the one across d is no nearer, so it is not. */
+                int k, nk = m == ((uint64_t)1 << 52) ? 3 : 1;
+                uint64_t cand = mant;
+                for (k = 0; k < nk; k++) {
+                    cand = k == 0 ? mant : k == 1 ? mant + 1 : mant - 1;
+                    if (k > 0 && (cand >= mant_max1 || cand < pow_ui(radix, P - 1)))
+                        continue;
+                    mpb_set_u64(tmp1, cand);
+                    m1 = mul_pow_round_to_d(&e1, tmp1, radix1, radix_shift, E - P, JS_RNDN);
+                    /* Note: (m, e) is never zero here, so the exponent for m1
+                       = 0 does not matter */
+                    if (m1 == m && e1 == e)
+                        break;
+                }
+                if (k == nk)
+                    break;
+                mant = cand;
+            }
             /* remove useless trailing zero digits */
             while ((mant % radix) == 0) {
                 mant /= radix;
                 P--;
             }
-            /* garanteed to work for P = P_max */
-            if (P_found == 0)
-                goto prec_found;
-            /* convert back to base 2 */
-            mpb_set_u64(tmp1, mant);
-            m1 = mul_pow_round_to_d(&e1, tmp1, radix1, radix_shift, E - P, JS_RNDN);
-            //            printf("P=%2d: m=0x%016" PRIx64 " e=%d m1=0x%016" PRIx64 " e1=%d\n", P, m, e, m1, e1);
-            /* Note: (m, e) is never zero here, so the exponent for m1
-               = 0 does not matter */
-            if (m1 == m && e1 == e) {
-            prec_found:
-                P_found = P;
-                E_found = E;
-                mant_found = mant;
-                if (P == 1)
-                    break;
-                P--; /* try lower exponent */
-            } else {
+            P_found = P;
+            E_found = E;
+            mant_found = mant;
+            if (P == 1)
                 break;
-            }
+            P--; /* try lower exponent */
         }
         P = P_found;
         E = E_found;

@@ -1,6 +1,7 @@
 // Compile + evaluate fuzzer (libFuzzer). The input is JS source; the first byte picks script or module mode and
 // the strictness. The engine translation units are included so that the engine itself is instrumented.
 //   clang -g -O1 -fsanitize=address,undefined,fuzzer -I../../engine/quickjs-ng [-DQJS_REGVM=1] -o fuzz-eval fuzz-eval.c
+#define _GNU_SOURCE  // before any system header: the engine uses pthread_getattr_np
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +17,7 @@ static int fz_ticks;
 static int fz_interrupt(JSRuntime *rt, void *opaque) {
   (void)rt;
   (void)opaque;
-  return ++fz_ticks > 20000;  // a runaway loop ends with an exception
+  return ++fz_ticks > 1000;  // a runaway loop ends with an exception (bounded well inside -timeout=10 under ASan and comparison tracing)
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *buf, size_t len) {

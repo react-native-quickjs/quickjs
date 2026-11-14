@@ -16,7 +16,7 @@ Functions are grouped into parts of about --budget lines: a function bigger than
 are assigned by a hash of the digest, so a function keeps its part when other functions change. A part's object is cached under
 sha256(part text, compiler command, compiler version); an unchanged part is not compiled again.
 """
-import argparse, hashlib, os, re, subprocess, sys, time, concurrent.futures as cf
+import argparse, hashlib, os, re, subprocess, sys, threading, time, concurrent.futures as cf
 
 # BSD time reports with -l, GNU time with -v
 TIME_FLAG = '-l' if sys.platform == 'darwin' else '-v'
@@ -447,7 +447,9 @@ def main():
         cc = hot_cc if ishot else args.cc
         src = os.path.join(args.out, fn)
         obj = src[:-2] + '.o'
-        key = hashlib.sha256(open(src, 'rb').read() + b'\0' + hdr_text + b'\0' + cc.encode() + b'\0' + cc_ver.encode()).hexdigest()
+        # the unit's own directory is not part of the key: the same parts built from two directories (a base and a variant) share their objects
+        udir = os.path.dirname(os.path.abspath(args.unit))
+        key = hashlib.sha256(open(src, 'rb').read() + b'\0' + hdr_text + b'\0' + cc.replace(udir, '@UNIT@').encode() + b'\0' + cc_ver.encode()).hexdigest()
         if cache:
             cobj = os.path.join(cache, key + '.o')
             if os.path.exists(cobj):
@@ -464,7 +466,15 @@ def main():
             m = re.search(r'Maximum resident set size \(kbytes\): (\d+)', r.stderr)
             rss = int(m.group(1)) / 1024 if m else 0
         if cache:
-            subprocess.run(['cp', obj, cobj])
+            # published whole: written under a private name, then renamed, so a build that finds the key never copies a half-written object
+            tmp = '%s.%d.%d.tmp' % (cobj, os.getpid(), threading.get_ident())
+            if subprocess.run(['cp', obj, tmp]).returncode == 0:
+                os.replace(tmp, cobj)
+            else:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         return fn, 'built %.0fMB' % rss, dt, obj
 
     t1 = time.time()

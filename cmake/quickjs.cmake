@@ -105,8 +105,8 @@ if(QJS_REGVM)
   # The register VM's default executor is the threaded dispatch plus the record
   # call path; the engine's header defaults turn both on for a Clang register
   # build (see `engine/quickjs-ng/quickjs.c`). They are exposed here so a
-  # configure can opt back into the monolith, which the AOT runtime and the AOT
-  # profiler require -- with `QJS_AOT=ON` the engine keeps them off by itself.
+  # configure can opt back into the single-step interpreter. `QJS_AOT=ON` needs
+  # the threaded dispatch.
   option(QJS_REGVM_THREAD "Threaded dispatch for the register VM" ON)
   option(QJS_REGVM_RECORD "Record call path for the register VM" ON)
   if(NOT QJS_REGVM_THREAD)
@@ -130,6 +130,9 @@ set(QJS_AOT_UNIT "" CACHE FILEPATH "Generated AOT unit (aot_unit.c) to link into
 if(QJS_AOT)
   if(NOT QJS_REGVM)
     message(FATAL_ERROR "QJS_AOT=ON requires QJS_REGVM=ON")
+  endif()
+  if(DEFINED QJS_REGVM_THREAD AND NOT QJS_REGVM_THREAD)
+    message(FATAL_ERROR "QJS_AOT=ON requires QJS_REGVM_THREAD=ON")
   endif()
   # The debugger option is declared further down this file, so at this point it
   # may not exist yet and `if(QUICKJS_ENABLE_DEBUGGER)` is false even when it is
@@ -266,14 +269,8 @@ if(QJS_AOT_LTO)
   endif()
 endif()
 
-# Lazy JSON is opt-in for applications. Android and CocoaPods derive this
-# option from the consuming app's package.json; host builds can override it
-# with -DRNQJS_JSON_LAZY_DEFAULT=ON or QJS_JSON_LAZY at runtime for tests.
-option(RNQJS_JSON_LAZY_DEFAULT
-       "Enable lazy JSON parsing by default for this build" OFF)
-if(RNQJS_JSON_LAZY_DEFAULT)
-  target_compile_definitions(quickjs PRIVATE QJS_JSON_LAZY_DEFAULT=1)
-endif()
+# Lazy JSON parsing was removed (engine patch 0600): JSON.parse is always
+# eager, and RNQJS_JSON_LAZY_DEFAULT is no longer read.
 
 # The maths functions are in libSystem on Apple and in a separate libm
 # elsewhere, so a macOS host build links clean while Linux fails at the link

@@ -58,7 +58,7 @@ int main() {
   }
   if (!parsed || !failed) {
     std::fprintf(
-        stderr, "lazy JSON allocation-failure coverage was incomplete\n");
+        stderr, "JSON.parse allocation-failure coverage was incomplete\n");
     return 1;
   }
   return 0;

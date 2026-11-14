@@ -1,0 +1,185 @@
+Subject: JSON.stringify writes plain keys and primitive members of a cached shape straight from the slot, and never holds an unhashed shape
+
+What this does
+  - `JSONStringifyContext.walk_plain`: when a shape enters `walk_ok`, a bit per property (first 64) for keys that are 8-bit strings with nothing to escape
+  - in the shape walk, with no replacer and no gap, a plain key whose value is a primitive in a plain data slot is written as `,"key":` with one room check and one copy, and the value straight from the slot, borrowed (`json_put_prim_borrowed`), with no reference count traffic
+  - `json_str8`: str8 with the normal-string case inline (str8 itself was not inlined), used by the buffer writers
+  - the shape walk is taken only for hashed shapes; an unhashed shape goes to the general key-list path
+
+Why we need it
+  After 0593 a third of stringify cycles went to per-key quoting and to dup/free of each member, and a call to str8 per string. json_app stringify only: -18.1% cycles, -17.0% instructions; whole json_app -2.9%.
+  The walk (0585) held a reference to the object's shape for the whole walk; an unhashed shape is edited in place by add_property, which asserts it is unshared, so a getter adding a property to an object with an unhashed shape (for example after a delete) aborted (found by the new jkey.js test).
+
+Soundness
+  A hashed shape is never changed in place, and walk_ok holds it, so its key atoms and their strings stay alive and unchanged while walk_plain describes them. The fast write happens only while the object still has that shape and the property is a plain data property; nothing between reading the slot and writing it runs JS (buffer writes only), so the borrowed value stays alive. The bytes written are those json_quote_str and json_putc8 write for such a key. Gaps, replacers, non-plain keys, wide keys, accessors and properties past 64 take the existing code. Differentials identical old vs new: new jkey.js (36,079 outputs: 60 key sets of 1-90 keys with escaped, wide, surrogate-pair and 300-byte keys, all member types, accessors that add and delete properties mid-walk, non-enumerable members, 0-200 byte prefixes for buffer-room boundaries, gaps, replacers), and jstr, jprim, jedge, jdiff, jdiff2, jscan, jslot, jdt2, jdtoa.
+
+diff --git a/quickjs.c b/quickjs.c
+index 7409227..4eb9230 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -24030,11 +24030,17 @@ static const uint8_t json_quote_needs_escape[256] = {
+     [0x5c] = 1,
+ };
+ 
++/* str8 with the common case (a normal string, as every StringBuffer's is) inline */
++static inline __attribute__((always_inline)) uint8_t *json_str8(JSString *p)
++{
++    return likely(p->kind == JS_STRING_KIND_NORMAL) ? (uint8_t *)&p[1] : str8(p);
++}
++
+ /* string_buffer_putc8 with its common case inline: room left in an 8-bit buffer */
+ static inline __attribute__((always_inline)) int json_putc8(StringBuffer *b, uint32_t c)
+ {
+     if (likely(b->len < b->size && !b->is_wide_char)) {
+-        str8(b->str)[b->len++] = c;
++        json_str8(b->str)[b->len++] = c;
+         return 0;
+     }
+     return string_buffer_putc8(b, c);
+@@ -24050,10 +24056,10 @@ static int json_quote_str(StringBuffer *b, JSString *p)
+ 
+     /* an 8-bit string with nothing to escape, into an 8-bit buffer with room: one scan, one copy */
+     if (!p->is_wide_char && !b->is_wide_char && b->size - b->len >= (int)p->len + 2) {
+-        const uint8_t *s8 = str8(p);
++        const uint8_t *s8 = json_str8(p);
+         uint32_t n = p->len;
+         if (json_scan_plain(s8, s8 + n, true) == s8 + n) {
+-            uint8_t *d = str8(b->str) + b->len;
++            uint8_t *d = json_str8(b->str) + b->len;
+             d[0] = '\"';
+             memcpy(d + 1, s8, n);
+             d[n + 1] = '\"';
+@@ -108168,6 +108174,8 @@ typedef struct JSONStringifyContext {
+     StringBuffer *b;
+     /* shapes already found to hold only string, non-index, non-varref keys (the shape walk of js_json_to_str), each held with a count */
+     JSShape *walk_ok[8];
++    /* for each walk_ok shape, bit i: property i's key is an 8-bit string with nothing to escape (only i < 64) */
++    uint64_t walk_plain[8];
+ } JSONStringifyContext;
+ 
+ static bool json_stack_contains(JSONStringifyContext *jsc, JSObject *p)
+@@ -108300,11 +108308,11 @@ static inline bool json_is_prim(JSValueConst v)
+     }
+ }
+ 
+-/* Write a value json_is_prim accepts, as js_json_to_str does, and free it */
+-static int json_put_prim(JSContext *ctx, StringBuffer *b, JSValue v)
++/* Write a value json_is_prim accepts, as js_json_to_str does; the value is only borrowed */
++static inline int json_put_prim_borrowed(StringBuffer *b, JSValueConst v)
+ {
+     char numbuf[16];
+-    int ret, n;
++    int n;
+     switch (JS_VALUE_GET_NORM_TAG(v)) {
+     case JS_TAG_INT:
+         n = i32toa(numbuf, JS_VALUE_GET_INT(v));
+@@ -108317,12 +108325,18 @@ static int json_put_prim(JSContext *ctx, StringBuffer *b, JSValue v)
+     case JS_TAG_NULL:
+         return string_buffer_write8(b, (const uint8_t *)"null", 4);
+     default: /* JS_TAG_STRING */
+-        ret = json_quote_str(b, JS_VALUE_GET_STRING(v));
+-        JS_FreeValue(ctx, v);
+-        return ret;
++        return json_quote_str(b, JS_VALUE_GET_STRING(v));
+     }
+ }
+ 
++/* json_put_prim_borrowed, then free the value */
++static int json_put_prim(JSContext *ctx, StringBuffer *b, JSValue v)
++{
++    int ret = json_put_prim_borrowed(b, v);
++    JS_FreeValue(ctx, v);
++    return ret;
++}
++
+ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                           JSValueConst holder, JSValue val,
+                           JSValueConst indent)
+@@ -108452,6 +108466,10 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                 uint32_t idx_;
+                 if (jsc->walk_ok[wslot] == sh) {
+                     si = nsp;
++                } else if (!sh->is_hashed) {
++                    /* an unhashed shape belongs to this object alone and is edited in place when a getter adds to it
++                       (add_property needs it unshared), so it is not held across the walk: the general path takes it */
++                    si = -1;
+                 } else {
+                     for (si = 0; si < nsp; si++)
+                         if (prs[si].atom != JS_ATOM_NULL &&
+@@ -108461,12 +108479,25 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                     /* a hashed shape is shared and never changed in place (a change makes another shape), so the answer holds while it
+                        is held; an unhashed one can be edited in place by its owner and is checked every time */
+                     if (si == nsp && sh->is_hashed) {
++                        uint64_t bits = 0;
++                        int bi;
++                        for (bi = 0; bi < nsp && bi < 64; bi++) {
++                            JSString *ks;
++                            if (prs[bi].atom == JS_ATOM_NULL)
++                                continue;
++                            ks = ctx->rt->atom_array[prs[bi].atom];
++                            if (!ks->is_wide_char && json_scan_plain(json_str8(ks), json_str8(ks) + ks->len, true) == json_str8(ks) + ks->len)
++                                bits |= (uint64_t)1 << bi;
++                        }
+                         if (jsc->walk_ok[wslot])
+                             js_free_shape(ctx->rt, jsc->walk_ok[wslot]);
+                         jsc->walk_ok[wslot] = js_dup_shape(sh);
++                        jsc->walk_plain[wslot] = bits;
+                     }
+                 }
+                 if (si == nsp) {
++                    /* the cached answer for this shape (walk_ok holds it, so its key atoms stay alive) */
++                    uint64_t plain = jsc->walk_ok[wslot] == sh ? jsc->walk_plain[wslot] : 0;
+                     js_dup_shape(sh);
+                     json_putc8(jsc->b, '{');
+                     has_content = false;
+@@ -108476,10 +108507,39 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                             continue;
+                         JS_FreeValue(ctx, prop);
+                         prop = JS_UNDEFINED;
+-                        if (op->shape == sh && (prs[si].flags & JS_PROP_TMASK) == JS_PROP_NORMAL)
+-                            v = js_dup(op->prop[si].u.value);
+-                        else
++                        if (op->shape == sh && (prs[si].flags & JS_PROP_TMASK) == JS_PROP_NORMAL) {
++                            JSValueConst bv = op->prop[si].u.value;
++                            /* a primitive with no replacer, written at once from the slot (no JS runs before it is written) */
++                            if (JS_IsUndefined(jsc->replacer_func) && json_is_prim(bv) && !has_gap && si < 64 && ((plain >> si) & 1)) {
++                                StringBuffer *b = jsc->b;
++                                JSString *ks = ctx->rt->atom_array[atom];
++                                uint32_t kl = ks->len;
++                                if (likely(!b->is_wide_char && b->size - b->len >= (int)kl + 4)) {
++                                    uint8_t *d = json_str8(b->str) + b->len;
++                                    int o = 0;
++                                    if (has_content)
++                                        d[o++] = ',';
++                                    d[o++] = '"';
++                                    memcpy(d + o, json_str8(ks), kl);
++                                    o += kl;
++                                    d[o++] = '"';
++                                    d[o++] = ':';
++                                    b->len += o;
++                                } else {
++                                    if (has_content && json_putc8(b, ','))
++                                        goto exception_sh;
++                                    if (json_quote_str(b, ks) || json_putc8(b, ':'))
++                                        goto exception_sh;
++                                }
++                                if (json_put_prim_borrowed(b, bv))
++                                    goto exception_sh;
++                                has_content = true;
++                                continue;
++                            }
++                            v = js_dup(bv);
++                        } else {
+                             v = JS_GetProperty(ctx, val, atom);
++                        }
+                         if (JS_IsException(v))
+                             goto exception_sh;
+                         if (JS_IsUndefined(jsc->replacer_func) && json_is_prim(v)) {
+@@ -108718,6 +108778,7 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
+     jsc->replacer_func = JS_UNDEFINED;
+     jsc->stack = NULL;
+     memset(jsc->walk_ok, 0, sizeof(jsc->walk_ok));
++    memset(jsc->walk_plain, 0, sizeof(jsc->walk_plain));
+     jsc->stack_len = 0;
+     jsc->stack_size = 0;
+     jsc->property_list = JS_UNDEFINED;

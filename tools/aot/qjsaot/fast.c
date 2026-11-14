@@ -456,8 +456,6 @@ int fast_emit(FILE *f, const Q2Func *fn, const char hex[33], char *why, size_t w
   if (getenv("QJS_AOT_FASTSTATS") != NULL) fprintf(o, "    pst_%s[0]++;\n", hex);
   for (i = 0; i < nv; i++) fprintf(o, "    JSValue t%d = JS_UNDEFINED;\n", i);
   for (i = 0; i < c.nstores; i++) fprintf(o, "    JSValue old%d = JS_UNDEFINED;\n", i);
-  /* the one fact: no lazy JSON document exists in this runtime */
-  fprintf(o, "    if (__builtin_expect(E_LAZY_SEEN(ctx), 0)) goto pexit;\n");
   /* the receivers of `this` and the arguments are loaded first, then checked, before anything else can leave */
   for (i = 0; i < fn->ninsns; i++) {
     const Q2Insn *in = &fn->insns[i];

@@ -21,6 +21,7 @@
  * subset (see the selection section below).
  */
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,8 @@
 #include "quickjs-aot-rt.h"
 #include "quickjs-regvm.h"
 #include "quickjs.h"
+#include "libregexp.h"
+#include "regexp.h"
 
 static char *read_file(const char *path, long *len_out) {
   FILE *f = fopen(path, "rb");
@@ -175,6 +178,7 @@ typedef struct {
 /* An `S` record: the shapes one property site's inline cache saw. Shape values
    are addresses from the profiling process; they only say "the same shape as
    another site in this profile", never a runtime address. */
+static int prof_a_adds_into_own(const char *rec, int nown);
 #define PROF_MAX_SHAPES 4
 typedef struct {
   int site;
@@ -198,6 +202,11 @@ typedef struct {
      proxy, an exotic object, a dead cache), counted at every execution and not only at cache fills. 0 when the profile has none. */
   int ahas;
   unsigned long long aown, aadd, aoth;
+  /* The engine's `R` record: the executions through a read site and how many of them did not see its commonest receiver shape (0/0 without a record). */
+  unsigned long long rtotal;
+  int nr;
+  uint64_t rshape[8];
+  unsigned long long rcount[8];
 } ProfSite;
 
 /* A `W` record: the shape of the objects the instruction at `pc` defined, as a
@@ -306,6 +315,11 @@ static int g_nlayouts;
 /* Defined in ops.c: how many call sites hold a callee in the unit's table. */
 extern int g_cc_count;
 static int g_nprof = 0;
+
+/* The profile's regexp section (`X <matcher cycles> <attempts on 16-bit subjects> <hex bytecode>`): the compiled bytecode of every pattern that ran, with the cycles its matcher took. */
+typedef struct { unsigned long long cyc, wide; uint8_t *bc; size_t len; } ProfRx;
+static ProfRx *g_prx;
+static int g_nprx, g_cprx;
 /* Whether the profile's header said `thr=1`, i.e. it came from the threaded
    build whose `R` records are complete. See parse_profile. */
 static int g_prof_thr = 0;
@@ -739,6 +753,24 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
       }
       continue;
     }
+    if (line[0] == 'X' && line[1] == ' ') {
+      char *q;
+      unsigned long long cyc = strtoull(line + 2, &q, 10), wide = strtoull(q, &q, 10);
+      size_t hl = 0, k;
+      uint8_t *bc;
+      while (*q == ' ') q++;
+      while (isxdigit((unsigned char)q[hl])) hl++;
+      if (hl < 16 || (hl & 1)) continue;
+      bc = malloc(hl / 2);
+      if (!bc) continue;
+      for (k = 0; k < hl / 2; k++) { unsigned v; sscanf(q + 2 * k, "%2x", &v); bc[k] = (uint8_t)v; }
+      if (g_nprx == g_cprx) {
+        g_cprx = g_cprx ? g_cprx * 2 : 64;
+        g_prx = realloc(g_prx, sizeof(ProfRx) * (size_t)g_cprx);
+      }
+      g_prx[g_nprx].cyc = cyc; g_prx[g_nprx].wide = wide; g_prx[g_nprx].bc = bc; g_prx[g_nprx].len = hl / 2; g_nprx++;
+      continue;
+    }
     if ((line[0] != 'F' && line[0] != 'L' && line[0] != 'R' && line[0] != 'C' &&
          line[0] != 'P' && line[0] != 'S' && line[0] != 'U' && line[0] != 'T' &&
          line[0] != 'K' && line[0] != 'W' && line[0] != 'N' && line[0] != 'A') ||
@@ -996,6 +1028,30 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
           e->cres[k].has_num = 1;
         }
       }
+    } else if (line[0] == 'R' && strstr(line + 2, " total=") != NULL) { /* a read site's receiver census; the register type sets are the `else` below */
+      const char *p = strstr(line + 2, "site="), *t = strstr(line + 2, " total=");
+      if (p && t) {
+        int site = (int)strtol(p + 5, NULL, 10), j = pidx_find((int)(e - arr), 5, site);
+        if (j >= 0) {
+          ProfSite *ps = &e->sites[j];
+          unsigned long long total = strtoull(t + 7, NULL, 10);
+          const char *q = line + 2;
+          while ((q = strstr(q, " r")) != NULL) {
+            const char *c;
+            q += 2;
+            if (*q < '0' || *q > '9') continue;
+            c = strchr(q, ':');
+            if (c != NULL && ps->nr < 8) {
+              const char *eq = strchr(q, '=');
+              if (eq != NULL && eq < c) {
+                ps->rshape[ps->nr] = strtoull(eq + 1, NULL, 10);
+                ps->rcount[ps->nr++] = strtoull(c + 1, NULL, 10);
+              }
+            }
+          }
+          ps->rtotal += total;
+        }
+      }
     } else if (line[0] == 'S') {
       /* S <hex> site=<k> count=<n> src=.. shapes=<m> shape0=0x.. hits=..
          [shape1=..]. The shapes are process addresses; only equality across
@@ -1127,7 +1183,7 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
         {
           const char *nn = strstr(line + 2, " nown=");
           int nown = nn != NULL ? (int)strtol(nn + 6, NULL, 10) : 0, oi;
-          if (strtoull(pt + 7, NULL, 10) != 0 || strtoull(pa + 5, NULL, 10) > 16 || strtoull(pa + 5, NULL, 10) * 1024 > strtoull(po + 5, NULL, 10)) nown = 0;   /* a site that also adds or goes elsewhere keeps its record */
+          if (strtoull(pt + 7, NULL, 10) != 0 || ((strtoull(pa + 5, NULL, 10) > 16 || strtoull(pa + 5, NULL, 10) * 1024 > strtoull(po + 5, NULL, 10)) && !prof_a_adds_into_own(line + 2, nown))) nown = 0;   /* a site that also adds or goes elsewhere keeps its record */
           {
             const char *rr = strstr(line + 2, " rest=");
             if (rr == NULL || strtoull(rr + 6, NULL, 10) != 0) nown = 0;   /* shapes the record did not keep: it proves nothing about them */
@@ -1146,6 +1202,9 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
             snprintf(key, sizeof(key), " o%d=", oi);
             ok = strstr(line + 2, key);
             if (ok == NULL || sscanf(ok + strlen(key), "%llu:%d:%llu", &osh, &osl, &on) != 3) continue;
+            /* a shape under a thousandth of the site's overwrites is left out when another shape carries them: a receiver of that shape takes the
+               store's miss route (the transition store or the exit) instead of the site becoming a many-shape one */
+            if (oi > 0 && on * 1000 < strtoull(po + 5, NULL, 10) && ps->nshapes >= 1 && getenv("QJS_AOT_NORARESHAPE") == NULL) continue;
             ps->count += (unsigned)on;
             ps->kinds |= 1u << 3;
             for (jj = 0; jj < ps->nshapes; jj++)
@@ -1158,6 +1217,10 @@ static ProfEntry *parse_profile(const char *path, int *pn) {
             }
           }
         }
+        /* A site the record says overwrote on the shapes just taken and also added by transition: the add fill (bit 4) is the transition store's, so the
+           site reads as an own-slot site for the grouping and the layouts alike. */
+        if ((ps->kinds & (1u << 4)) != 0 && (ps->kinds & (1u << 3)) != 0 && ps->nshapes > 0 && strstr(line + 2, " nxf=") != NULL && strtoull(pa + 5, NULL, 10) * 8 <= strtoull(po + 5, NULL, 10) && getenv("QJS_AOT_NOADDWOWN") == NULL)
+          ps->kinds &= ~(1u << 4);
         ps->ahas = 1;
         ps->aown += strtoull(po + 5, NULL, 10);
         ps->aadd += strtoull(pa + 5, NULL, 10);
@@ -1632,6 +1695,17 @@ int qjs_aot_prof_call(
   return 1;
 }
 
+/* A site that also adds (`nxf` transitions in its record): its overwrite shapes are what the site's stores end up on, and a receiver of another shape is the
+   transition store's (see qjs_aot_store_xfer). */
+static int prof_a_adds_into_own(const char *rec, int nown) {
+  const char *nx = strstr(rec, " nxf=");
+  int nxf = nx != NULL ? (int)strtol(nx + 5, NULL, 10) : 0;
+  const char *po = strstr(rec, " own="), *pa = strstr(rec, " add=");
+  (void)nown;
+  /* the adds are at most an eighth of the overwrites: more than that is a site that builds objects, not one that overwrites them */
+  if (po == NULL || pa == NULL || strtoull(pa + 5, NULL, 10) * 8 > strtoull(po + 5, NULL, 10)) return 0;
+  return nxf > 0 && nxf <= PROF_MAX_SHAPES && getenv("QJS_AOT_NOAXFER") == NULL;
+}
 /* A store site the profile cannot tell an overwrite from an add. The engine records a store only when its cache misses, so a site that ran many
    times carries the one sample of its first miss, and an add records no shape: an own-slot record with a single fill, in a function entered
    many times, whose stores continue a fill of one shape (slot 0, or every lower slot stored earlier), is what an initialiser looks like and what a `Set(x, y)` looks like. The
@@ -2445,6 +2519,25 @@ int qjs_aot_prof_site_proto2(const uint8_t dg[16], int site) {
   return 0;
 }
 
+/* Whether a read site's receivers were, for at least 5% of its executions, of a shape the site's cache never recorded: what the body guards on would not
+   cover them. 0 when the profile has no receiver census for the site. */
+int qjs_aot_prof_site_multirecv(const uint8_t dg[16], int site) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i, k, j;
+  if (!e) return 0;
+  for (i = 0; i < e->nsites; i++) {
+    const ProfSite *ps = &e->sites[i];
+    unsigned long long cov = 0;
+    if (ps->site != site) continue;
+    if (ps->rtotal == 0) return 0;
+    for (k = 0; k < ps->nr; k++)
+      for (j = 0; j < ps->nshapes; j++)
+        if (ps->shape[j] == ps->rshape[k]) { cov += ps->rcount[k]; break; }
+    return (ps->rtotal - (cov < ps->rtotal ? cov : ps->rtotal)) * 20 > ps->rtotal;
+  }
+  return 0;
+}
+
 /* Whether every fill of a read site was a read from the direct prototype. */
 int qjs_aot_prof_site_proto(const uint8_t dg[16], int site) {
   const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
@@ -2453,6 +2546,29 @@ int qjs_aot_prof_site_proto(const uint8_t dg[16], int site) {
   for (i = 0; i < e->nsites; i++) {
     if (e->sites[i].site != site) continue;
     return e->sites[i].kinds == (1u << 2);
+  }
+  return 0;
+}
+
+/* A read site whose recorded shapes (two or more, or a saturated set) all put the atom at one slot, and whose fills installed own slots:
+   the slot, for a read by position. 0 when the profile says otherwise or says nothing. QJS_AOT_NO_ATOMSLOT=1 turns it off. */
+int qjs_aot_prof_site_atom_slot(const uint8_t dg[16], int site, int *slot) {
+  const ProfEntry *e = g_prof ? prof_entry(g_prof, g_nprof, dg) : NULL;
+  int i, k;
+  if (!e || !g_prof_sitekinds || getenv("QJS_AOT_NO_ATOMSLOT") != NULL) return 0;
+  for (i = 0; i < e->nsites; i++) {
+    const ProfSite *s = &e->sites[i];
+    unsigned sum = 0;
+    if (s->site != site) continue;
+    if ((s->kinds & (1u << 1)) == 0 || s->nshapes < 1 || s->slot[0] < 0) return 0;
+    for (k = 0; k < s->nshapes; k++) {
+      if (s->slot[k] != s->slot[0]) return 0;
+      sum += s->hits[k];
+    }
+    /* one shape that covers the site's fills is the cache's own case */
+    if (s->nshapes < 2 && s->count <= sum) return 0;
+    *slot = s->slot[0];
+    return 1;
   }
   return 0;
 }
@@ -3025,6 +3141,37 @@ static int find_unit(
   return found;
 }
 
+/* `--self-weights FILE`: lines `<digest hex> <n>`, the samples a function spent in the interpreter's own code (tools/aot/selfweights.py). When
+   given, the hot-cover ranking and its cumulative target use these instead of the profile's op counts, so a function that spends its time in
+   native builtins is not picked for the work it does not do itself. */
+static const char *g_self_weights;
+static unsigned long long self_weight_of(const char *path, const uint8_t dg[16]) {
+  static struct { uint8_t dg[16]; unsigned long long n; } *tab;
+  static int ntab, loaded;
+  int i;
+  if (!loaded) {
+    FILE *f = fopen(path, "r");
+    char line[128];
+    int cap = 0;
+    loaded = 1;
+    if (!f) { fprintf(stderr, "qjsaot: cannot read %s\n", path); exit(2); }
+    while (fgets(line, sizeof line, f)) {
+      char hx[40];
+      unsigned long long n;
+      uint8_t d[16];
+      if (sscanf(line, "%32s %llu", hx, &n) != 2 || hex_to_bytes16(hx, d) < 0) continue;
+      if (ntab == cap) { cap = cap ? cap * 2 : 256; tab = realloc(tab, (size_t)cap * sizeof(*tab)); }
+      memcpy(tab[ntab].dg, d, 16);
+      tab[ntab].n = n;
+      ntab++;
+    }
+    fclose(f);
+  }
+  for (i = 0; i < ntab; i++)
+    if (memcmp(tab[i].dg, dg, 16) == 0) return tab[i].n;
+  return 0;
+}
+
 /* Compare for a descending-ops sort of unit indices. */
 static const unsigned long long *g_sort_ops;
 static int unit_ops_cmp(const void *a, const void *b) {
@@ -3075,6 +3222,75 @@ static int unit_ops_cmp(const void *a, const void *b) {
 
 void qjsaot_number_guards(const char *path);
 
+/* The matchers of the hot patterns: the profile's patterns by matcher cycles, down to the cover of the hot-cover fraction of their total, those the
+   translator accepts, as <unit>-rx.c next to the unit (compiled and linked with it by the build wrappers; the engine finds a matcher by the exact
+   bytecode of the pattern, so a pattern that is not here, or whose bytecode differs, runs in the interpreter). A raw-atom pattern has its own
+   engine path and no matcher. */
+static int rx_by_cycles(const void *a, const void *b) {
+  const ProfRx *x = a, *y = b;
+  return x->cyc < y->cyc ? 1 : x->cyc > y->cyc ? -1 : 0;
+}
+static void e_emit_regexps(const char *out, double cover) {
+  size_t n = strlen(out);
+  char *path = malloc(n + 8);
+  FILE *f;
+  unsigned long long total = 0, acc = 0;
+  int i, k, nemit = 0;
+  char (*names)[24] = NULL;
+  const char *e = getenv("QJS_AOT_REGEXP");
+  if (path == NULL) return;
+  strcpy(path, out);
+  if (n > 2 && strcmp(path + n - 2, ".c") == 0) path[n - 2] = 0;
+  strcat(path, "-rx.c");
+  remove(path);
+  if (g_nprx == 0 || (e != NULL && e[0] == '0') || !(cover > 0.0)) { free(path); return; }
+  qsort(g_prx, (size_t)g_nprx, sizeof(ProfRx), rx_by_cycles);
+  for (i = 0; i < g_nprx; i++) total += g_prx[i].cyc;
+  if (total == 0) { free(path); return; }
+  f = fopen(path, "w");
+  if (f == NULL) { free(path); return; }
+  fprintf(f, "/* Generated by qjsaot: matchers of the profile's hot regexps (see regexp.c). Do not edit. */\n#include <stdint.h>\n#include \"libregexp.h\"\n");
+  names = calloc((size_t)g_nprx, sizeof(*names));
+  for (i = 0; i < g_nprx && names != NULL; i++) {
+    char nm[24];
+    int has16 = 0;
+    FILE *t;
+    char buf[65536];
+    size_t r;
+    if ((double)acc >= cover * (double)total) break;
+    acc += g_prx[i].cyc;
+    if (g_prx[i].len < 8 || (lre_get_flags(g_prx[i].bc) & LRE_FLAG_ATOM)) continue;
+    snprintf(nm, sizeof(nm), "p%d", nemit);
+    t = tmpfile();
+    if (t == NULL) break;
+    if (!rx_emit(t, nm, g_prx[i].bc, g_prx[i].len, g_prx[i].wide != 0, &has16)) { fclose(t); continue; }
+    rewind(t);
+    while ((r = fread(buf, 1, sizeof(buf), t)) > 0) fwrite(buf, 1, r, f);
+    fclose(t);
+    fprintf(f, "static const uint8_t bc_%s[%zu] = {", nm, g_prx[i].len);
+    for (k = 0; k < (int)g_prx[i].len; k++) fprintf(f, "%s%u", k ? "," : "", g_prx[i].bc[k]);
+    fprintf(f, "};\n");
+    snprintf(names[nemit], sizeof(names[0]), "%s%s", nm, has16 ? "+" : "");
+    nemit++;
+  }
+  if (nemit > 0) {
+    fprintf(f, "static const LreAotEntry rx_tab[] = {\n");
+    for (i = 0; i < nemit; i++) {
+      char nm[24];
+      int h16 = strchr(names[i], '+') != NULL;
+      snprintf(nm, sizeof(nm), "%s", names[i]);
+      if (h16) *strchr(nm, '+') = 0;
+      fprintf(f, "  {bc_%s, (uint32_t)sizeof(bc_%s), rxf_%s_8, %s%s%s},\n", nm, nm, nm, h16 ? "rxf_" : "NULL", h16 ? nm : "", h16 ? "_16" : "");
+    }
+    fprintf(f, "};\nstatic void __attribute__((constructor, unused)) rx_register(void) { lre_aot_register(rx_tab, %d); }\n", nemit);
+  }
+  fclose(f);
+  free(names);
+  if (nemit == 0) remove(path);
+  else fprintf(stderr, "qjsaot: %d regexp matchers (%.1f%% of the profile's matcher cycles) -> %s\n", nemit, 100.0 * (double)acc / (double)total, path);
+  free(path);
+}
+
 int qjsaot_driver_main(int argc, char **argv) {
   JSRuntime *rt;
   JSContext *ctx;
@@ -3123,6 +3339,8 @@ int qjsaot_driver_main(int argc, char **argv) {
       budget = strtol(argv[++i], NULL, 10);
     } else if (strcmp(argv[i], "--hot-cover") == 0 && i + 1 < argc) {
       hot_cover = strtod(argv[++i], NULL);
+    } else if (strcmp(argv[i], "--self-weights") == 0 && i + 1 < argc) {
+      g_self_weights = argv[++i];
     } else if (strcmp(argv[i], "--min-ops") == 0 && i + 1 < argc) {
       min_ops = strtol(argv[++i], NULL, 10);
     } else if (strcmp(argv[i], "--layout-header") == 0 && i + 1 < argc) {
@@ -3455,9 +3673,13 @@ int qjsaot_driver_main(int argc, char **argv) {
         JS_FreeRuntime(rt);
         return 2;
       }
+      unsigned long long *wt = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*wt));
+      unsigned long long total_wt = 0;
       for (k = 0; k < nuniq; k++) {
         ops[uniq[k]] = prof_ops_of(g_prof, g_nprof, funcs[uniq[k]].digest);
         total_ops += ops[uniq[k]];
+        wt[uniq[k]] = g_self_weights ? self_weight_of(g_self_weights, funcs[uniq[k]].digest) : ops[uniq[k]];
+        total_wt += wt[uniq[k]];
       }
       if (total_ops == 0) {
         for (k = 0; k < nuniq; k++) {
@@ -3468,15 +3690,28 @@ int qjsaot_driver_main(int argc, char **argv) {
         int *order = malloc(sizeof(int) * (size_t)nuniq);
         unsigned long long cum = 0;
         unsigned long long target =
-            (unsigned long long)(hot_cover * (double)total_ops);
+            (unsigned long long)(hot_cover * (double)total_wt);
         if (order) {
           for (k = 0; k < nuniq; k++) order[k] = uniq[k];
-          g_sort_ops = ops;
-          qsort(order, (size_t)nuniq, sizeof(int), unit_ops_cmp);
+          /* QJS_AOT_SEL_DENSITY=1: rank by weight per byte of generated C (the cover is still counted in weight), so a large function with a thin
+             share is the first to stay interpreted */
+          if (getenv("QJS_AOT_SEL_DENSITY") != NULL) {
+            unsigned long long *dw = calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*dw));
+            if (dw) {
+              for (k = 0; k < nuniq; k++) dw[uniq[k]] = wt[uniq[k]] * 1000000ull / (eb[uniq[k]].len ? (unsigned long long)eb[uniq[k]].len : 1ull);
+              g_sort_ops = dw;
+              qsort(order, (size_t)nuniq, sizeof(int), unit_ops_cmp);
+              free(dw);
+            } else { g_sort_ops = wt; qsort(order, (size_t)nuniq, sizeof(int), unit_ops_cmp); }
+          } else {
+            g_sort_ops = wt;
+            qsort(order, (size_t)nuniq, sizeof(int), unit_ops_cmp);
+          }
           for (k = 0; k < nuniq; k++) {
             if (cum >= target) break;
+            if (wt[order[k]] == 0) break;
             sel[order[k]] = 1;
-            cum += ops[order[k]];
+            cum += wt[order[k]];
           }
           free(order);
         }
@@ -3493,6 +3728,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           unsigned long long close_min = getenv("QJS_AOT_CLOSE_MIN_CALLS") ? strtoull(getenv("QJS_AOT_CLOSE_MIN_CALLS"), NULL, 10) : 1000;
           double close_pct = getenv("QJS_AOT_CLOSE_MIN_PCT") ? strtod(getenv("QJS_AOT_CLOSE_MIN_PCT"), NULL) : 0.0;
           int no_rgdep = getenv("QJS_AOT_NO_RGDEP_CLOSURE") != NULL;
+          unsigned long long edge_min = getenv("QJS_AOT_EDGE_MIN") ? strtoull(getenv("QJS_AOT_EDGE_MIN"), NULL, 10) : 0;
           int sel_log = getenv("QJS_AOT_SEL_LOG") != NULL;
           char (*why)[160] = sel_log ? calloc((size_t)(nfuncs > 0 ? nfuncs : 1), sizeof(*why)) : NULL;
           if (sel_log && why != NULL)
@@ -3520,6 +3756,34 @@ int qjsaot_driver_main(int argc, char **argv) {
                     char ch[33];
                     hex16(funcs[uniq[k]].digest, ch);
                     snprintf(why[ci], sizeof(why[0]), "closure via=%s pc=%d hits=%llu", ch, pe->calls[c].pc, pe->calls[c].hits);
+                  }
+                }
+              }
+            }
+            /* QJS_AOT_EDGE_MIN=N: a function that calls a selected function at least N times from one site is selected too, so the hot call does not
+               cross from the interpreter into compiled code on every execution (edges to natives are not counted: only bytecode callees are `kind 1`) */
+            if (edge_min > 0) {
+              for (k = 0; k < nuniq; k++) {
+                const ProfEntry *pe;
+                int c;
+                if (sel[uniq[k]] || !eb[uniq[k]].buf) continue;
+                pe = prof_entry_of(g_prof, g_nprof, funcs[uniq[k]].digest);
+                if (!pe) continue;
+                for (c = 0; c < pe->ncalls; c++) {
+                  uint8_t dg[16];
+                  int ci;
+                  if (pe->calls[c].kind != 1 || !pe->calls[c].digest[0] || pe->calls[c].hits < edge_min) continue;
+                  if (hex_to_bytes16(pe->calls[c].digest, dg) < 0) continue;
+                  ci = find_unit(funcs, nfuncs, dg);
+                  if (ci >= 0 && sel[ci]) {
+                    sel[uniq[k]] = 1;
+                    changed = 1;
+                    if (why != NULL) {
+                      char ch[33];
+                      hex16(funcs[ci].digest, ch);
+                      snprintf(why[uniq[k]], sizeof(why[0]), "edge to=%s pc=%d hits=%llu", ch, pe->calls[c].pc, pe->calls[c].hits);
+                    }
+                    break;
                   }
                 }
               }
@@ -3615,6 +3879,29 @@ int qjsaot_driver_main(int argc, char **argv) {
           }
         }
       }
+      /* QJS_AOT_SEL_MODEL=1: what the selection costs by the profile, on stderr: the ops of the functions left to the interpreter, and the calls that cross
+         between compiled and interpreted code (an edge with exactly one end selected; hits are the profile's call counts) */
+      if (getenv("QJS_AOT_SEL_MODEL") != NULL) {
+        unsigned long long dropped_ops = 0, all_ops = 0, cross_in = 0, cross_out = 0, all_calls = 0;
+        for (k = 0; k < nuniq; k++) {
+          const ProfEntry *pe = prof_entry_of(g_prof, g_nprof, funcs[uniq[k]].digest);
+          int c;
+          all_ops += ops[uniq[k]];
+          if (!sel[uniq[k]]) dropped_ops += ops[uniq[k]];
+          if (!pe) continue;
+          for (c = 0; c < pe->ncalls; c++) {
+            uint8_t dg[16];
+            int ci;
+            if (pe->calls[c].kind != 1 || !pe->calls[c].digest[0] || hex_to_bytes16(pe->calls[c].digest, dg) < 0) continue;
+            ci = find_unit(funcs, nfuncs, dg);
+            if (ci < 0) continue;
+            all_calls += pe->calls[c].hits;
+            if (sel[uniq[k]] && !sel[ci]) cross_out += pe->calls[c].hits;
+            else if (!sel[uniq[k]] && sel[ci]) cross_in += pe->calls[c].hits;
+          }
+        }
+        fprintf(stderr, "model: dropped_ops=%llu all_ops=%llu cross_out=%llu cross_in=%llu all_calls=%llu\n", dropped_ops, all_ops, cross_out, cross_in, all_calls);
+      }
       free(ops);
     }
     for (i = 0; i < nfuncs; i++)
@@ -3702,7 +3989,6 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_REG_PIC_OWN %uu\n"
           "#define QJS_AOT_REG_PIC_PROTO %uu\n"
           "#define QJS_AOT_REG_IC_NONE %uu\n"
-          "#define QJS_AOT_TAG_LAZY_JSON %uu\n"
           "#define QJS_AOT_REG_BIN_ADD %uu\n"
           /* The bitwise and shift sub-operations, printed with the engine's own
              enum values rather than derived by offset from BIN_ADD. The enum is
@@ -3875,7 +4161,6 @@ int qjsaot_driver_main(int argc, char **argv) {
           "#define QJS_AOT_OFF_JSREGPIC_MISSES %uu\n"
           "#define QJS_AOT_REG_PIC_ADD_W %uu\n"
           "#define QJS_AOT_OFF_RT_IC_EPOCH %uu\n"
-          "#define QJS_AOT_OFF_RT_LAZY_JSON %uu\n"
           "#define QJS_AOT_OFF_JSOBJECT_FLAGS16 %uu\n"
           "#define QJS_AOT_JSOBJECT_EXTENSIBLE_MASK %uu\n"
           "#define QJS_AOT_JSOBJECT_NOADD_MASK %uu\n"
@@ -3906,7 +4191,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.sizeof_JSRegPIC, lay.reg_pic_ways, lay.off_fnbc_pic_count,
           lay.off_regpic_shape, lay.off_regpic_slot_off, lay.off_regpic_kind,
           lay.reg_pic_own, lay.reg_pic_proto, lay.reg_ic_none,
-          lay.tag_lazy_json, lay.reg_bin_add, (unsigned)REG_BIN_SHL,
+          lay.reg_bin_add, (unsigned)REG_BIN_SHL,
           (unsigned)REG_BIN_SAR, (unsigned)REG_BIN_SHR, (unsigned)REG_BIN_AND,
           (unsigned)REG_BIN_XOR, (unsigned)REG_BIN_OR, lay.reg_bin_sub,
           lay.reg_bin_mul, lay.reg_bin_div, lay.reg_bin_mod, lay.reg_bin_lt,
@@ -3959,7 +4244,7 @@ int qjsaot_driver_main(int argc, char **argv) {
           lay.regvm_flag_trivial_ret, lay.regvm_flag_same_realm,
           lay.off_rc_back, lay.off_varref_pvalue, lay.class_c_function,
           lay.off_cfunc_c_function, lay.off_cfunc_magic, lay.off_regpic_misses,
-          lay.reg_pic_add_w, lay.off_rt_ic_epoch, lay.off_rt_lazy_json, lay.off_object_flags16,
+          lay.reg_pic_add_w, lay.off_rt_ic_epoch, lay.off_object_flags16,
           lay.object_extensible_mask, lay.object_noadd_mask,
           lay.object_inline_cap_mask, lay.object_inline_cap_shift, lay.off_rope_left,
           lay.off_rope_right, lay.off_ctx_ta_len_epoch, lay.class_array_iterator,
@@ -4041,7 +4326,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "extern char __start_aottext[] __asm(\"section$start$__TEXT$aottext\");\n"
         "extern char __stop_aottext[] __asm(\"section$end$__TEXT$aottext\");\n"
         "#else\n"
-        "#define E_TEXT __attribute__((section(\"aottext\")))\n"
+        "#ifndef E_TEXT\n#define E_TEXT __attribute__((section(\"aottext\")))\n#endif\n"
         "extern char __start_aottext[] __attribute__((weak));\n"
         "extern char __stop_aottext[] __attribute__((weak));\n"
         "#endif\n");
@@ -4122,6 +4407,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* One node per exit stub, linked the first time the stub is taken, with the
            number of times it was: the unit's statistics list the stubs that fire. */
         "typedef struct E_XNode { const char *hex, *kind; int pc; uint32_t cnt; struct E_XNode *next; const char *op; uint32_t nsh; } E_XNode;\n"
+        "typedef struct E_NoteD { const char *hex, *op, *why; int fi, pc; } E_NoteD;\n"
+        "typedef struct E_WhyD { const char *hex, *op; int pc, last, n; } E_WhyD;\n"
         /* Exit tally for the profitability gate's report: how often each (function, source pc) exit was taken, kept for every exit
            (not only under a stats flag) so that a function the gate switched off can name the exit that did it. */
         "#define E_XT_N 1024\n"
@@ -4290,25 +4577,44 @@ int qjsaot_driver_main(int argc, char **argv) {
         "          pc, tag, op ? op : \"?\", nsh);\n"
         "}\n"
         "static inline void e_xnode_reg(E_XNode *n) { n->next = e_xhead; e_xhead = n; }\n"
+        /* The bookkeeping of the other exits (notes, refusals, reasons) is out of line, one call per stub. The exit log counter stays inline: outlined, crypto lost 8%. */
+        /* E_LOGO_COLD (large units, set by the profile-guided build): the stub is one call to a cold helper that takes the descriptor. */
+        "#ifdef E_LOGO_COLD\n"
+        "static void __attribute__((noinline, cold, unused, preserve_most)) e_logo_c(E_XNode *n, int tag)\n"
+        "{\n"
+        "  int xl = 0;\n"
+        "  if (++n->cnt == 1) e_xnode_reg(n);\n"
+        "  if (e_exit_log_v != 0 && (e_exit_log_v == 2 || n->cnt == 1)) e_exit_log(n->hex, n->kind, n->pc, tag, &xl, n->op, 0);\n"
+        "}\n"
+        "#define E_EXIT_LOGO(hex, kind, pc, tag, op) do { static E_XNode e_xn_ = {(hex), (kind), (pc), 0, NULL, (op), 0}; e_logo_c(&e_xn_, (int)(tag)); } while (0)\n"
+        "#else\n"
         "#define E_EXIT_LOGO(hex, kind, pc, tag, op) do { static E_XNode e_xn_ = {(hex), (kind), (pc), 0, NULL, (op), 0}; \\\n"
         "    int e_xl_ = 0; \\\n"
         "    if (__builtin_expect(++e_xn_.cnt == 1, 0)) e_xnode_reg(&e_xn_); \\\n"
         "    if (__builtin_expect(e_exit_log_v != 0, 0) && (e_exit_log_v == 2 || e_xn_.cnt == 1)) \\\n"
         "      e_exit_log((hex), (kind), (pc), (int)(tag), &e_xl_, (op), 0); } while (0)\n"
+        "#endif\n"
         "#define E_EXIT_LOG(hex, kind, pc, tag) E_EXIT_LOGO(hex, kind, pc, tag, NULL)\n"
         /* An entry refusal at a property site: the node keeps the largest number of distinct shapes the site's cache ways held
            (read at the first 64 refusals and then at each power of two, so a hot refusal does not pay for it). */
+        "static int __attribute__((noinline, cold, unused, preserve_most)) e_refuse_pre(E_XNode *n)\n"
+        "{\n"
+        "  if (++n->cnt == 1) e_xnode_reg(n);\n"
+        "  return n->cnt <= 64 || (n->cnt & (n->cnt - 1)) == 0 || e_exit_log_v != 0;\n"
+        "}\n"
+        "static void __attribute__((noinline, cold, unused, preserve_most)) e_refuse_post(E_XNode *n, unsigned nsh)\n"
+        "{\n"
+        "  int l_ = 0;\n"
+        "  if (nsh > n->nsh) n->nsh = nsh;\n"
+        "  if (e_exit_log_v != 0 && (e_exit_log_v == 2 || n->cnt == 1)) e_exit_log(n->hex, \"refuse-site\", n->pc, -2, &l_, n->op, nsh);\n"
+        "}\n"
         "#define E_REFUSE_LOG(hex, pc, op, nsh_expr) do { static E_XNode e_xn_ = {(hex), \"refuse-site\", (pc), 0, NULL, (op), 0}; \\\n"
-        "    int e_xl_ = 0; unsigned e_n_ = 0; \\\n"
-        "    if (__builtin_expect(++e_xn_.cnt == 1, 0)) e_xnode_reg(&e_xn_); \\\n"
-        "    if (e_xn_.cnt <= 64 || (e_xn_.cnt & (e_xn_.cnt - 1)) == 0) { e_n_ = (nsh_expr); if (e_n_ > e_xn_.nsh) e_xn_.nsh = e_n_; } \\\n"
-        "    if (__builtin_expect(e_exit_log_v != 0, 0) && (e_exit_log_v == 2 || e_xn_.cnt == 1)) \\\n"
-        "      e_exit_log((hex), \"refuse-site\", (pc), -2, &e_xl_, (op), e_n_); } while (0)\n"
+        "    if (e_refuse_pre(&e_xn_)) e_refuse_post(&e_xn_, (nsh_expr)); } while (0)\n"
         /* An exit taken because some cache entry changed since the body validated its cells is not a
            failed speculation: the generic body fills what changed and the next entry passes. It does
            not count toward the switch-off. */
         "static int e_ep_exit;\n"
-        /* QJS_AOT_POSTCALLCOUNT: the number of post-call lazy/epoch checks executed, printed at exit */
+        /* QJS_AOT_POSTCALLCOUNT: the number of post-call epoch checks executed, printed at exit */
         "#ifdef QJS_AOT_POSTCALLCOUNT\n"
         "static unsigned long long e_pcn;\n"
         "__attribute__((destructor)) static void e_pcn_report(void) { fprintf(stderr, \"aot postcall-checks %%llu\\n\", e_pcn); }\n"
@@ -4342,8 +4648,14 @@ int qjsaot_driver_main(int argc, char **argv) {
         /* The entries a function's exits are measured against: its own entries and, where the build counts them (not the production
            unit build, see QJS_AOT_NOENTNOTE), the entries of its inlined copies. */
         "#define E_ENTS(fi) (e_ent[fi] + e_inl[fi])\n"
-        "#define E_EXIT_NOTE_AT(fi, pc_, hex_, op_, why_) do { if (e_ep_exit) { e_ep_exit = 0; break; } e_xt_note((hex_), (fi), (pc_), (op_), (why_)); \\\n"
-        "    if (++e_exi[fi] > e_gate_min() && (uint64_t)e_exi[fi] * e_gate_div() > E_ENTS(fi)) e_gate_note(fi); } while (0)\n"
+        "static void __attribute__((noinline, cold, unused, preserve_most)) e_exit_note_c(const E_NoteD *d)\n"
+        "{\n"
+        "  int fi = d->fi;\n"
+        "  if (e_ep_exit) { e_ep_exit = 0; return; }\n"
+        "  e_xt_note(d->hex, fi, d->pc, d->op, d->why);\n"
+        "  if (++e_exi[fi] > e_gate_min() && (uint64_t)e_exi[fi] * e_gate_div() > E_ENTS(fi)) e_gate_note(fi);\n"
+        "}\n"
+        "#define E_EXIT_NOTE_AT(fi, pc_, hex_, op_, why_) do { static const E_NoteD e_nd_ = {(hex_), (op_), (why_), (fi), (pc_)}; e_exit_note_c(&e_nd_); } while (0)\n"
         "#define E_EXIT_NOTE_PC(fi, pc_, hex_) E_EXIT_NOTE_AT(fi, pc_, hex_, \"region\", \"region-exit\")\n"
         "/* A HAND-OFF is not a deopt: it is the exit at an instruction the spec\n"
         "   body does not lower. Counting them toward the switch-off would turn off\n"
@@ -4359,10 +4671,19 @@ int qjsaot_driver_main(int argc, char **argv) {
            generic body that runs instead fills it and the next entry passes. It does not count toward the switch-off at 256,
            which was reached by such functions before the branch ever ran; a much larger limit still ends a cell that is never
            filled. */
+        "#ifdef E_LOGO_COLD\n"
+        "static void __attribute__((noinline, cold, unused, preserve_most)) e_refuse_soft_c(int fi)\n"
+        "{ if (e_osr_n[fi] < 200) e_osr_n[fi] += 32; if (++e_refs[fi] > 65536 && (uint64_t)e_refs[fi] * 2 > E_ENTS(fi)) e_gate_note(fi); }\n"
+        "static void __attribute__((noinline, cold, unused, preserve_most)) e_refuse_note_c(int fi)\n"
+        "{ if (e_osr_n[fi] < 200) e_osr_n[fi] += 32; if (++e_ref[fi] > 256 && (uint64_t)e_ref[fi] * 2 > E_ENTS(fi)) e_gate_note(fi); }\n"
+        "#define E_REFUSE_SOFT(fi) e_refuse_soft_c(fi)\n"
+        "#define E_REFUSE_NOTE(fi) e_refuse_note_c(fi)\n"
+        "#else\n"
         "#define E_REFUSE_SOFT(fi) do { if (e_osr_n[fi] < 200) e_osr_n[fi] += 32; if (++e_refs[fi] > 65536 && \\\n"
         "    (uint64_t)e_refs[fi] * 2 > E_ENTS(fi)) e_gate_note(fi); } while (0)\n"
         "#define E_REFUSE_NOTE(fi) do { if (e_osr_n[fi] < 200) e_osr_n[fi] += 32; if (++e_ref[fi] > 256 && \\\n"
         "    (uint64_t)e_ref[fi] * 2 > E_ENTS(fi)) e_gate_note(fi); } while (0)\n"
+        "#endif\n"
         "#ifdef QJS_AOT_PICSOFT\n#define E_REFUSE_NOTE_PIC(fi) E_REFUSE_SOFT(fi)\n#else\n#define E_REFUSE_NOTE_PIC(fi) E_REFUSE_NOTE(fi)\n#endif\n"
         /* The dynamic register check, compiled into the unit only with -DE_POISON.
            It compares every register an op call was not allowed to write
@@ -4519,11 +4840,12 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define E_PUT_SHAPE   0\n"
         "#define E_PUT_KIND    1\n"
         "#define E_PUT_PROTO   2\n"
-        "#define E_PUT_N 3\n"
+        "#define E_PUT_LAYOUT  3\n"
+        "#define E_PUT_N 4\n"
         "static unsigned long long e_put_why[E_PUT_N];\n"
         "static void e_put_why_note(int why) { e_put_why[why]++; }\n"
         "static const char *const e_put_why_names[E_PUT_N] = {\n"
-        "  \"shape\", \"kind-not-own-w\", \"receiver-prototype\"\n"
+        "  \"shape\", \"kind-not-own-w\", \"receiver-prototype\", \"layout-object\"\n"
         "};\n"
         "static void __attribute__((destructor)) e_put_why_dump(void)\n"
         "{\n"
@@ -4656,6 +4978,7 @@ int qjsaot_driver_main(int argc, char **argv) {
            the same (an integral float64 is an ordinary value everywhere), and a consumer that wants
            an int takes an integral float64 through Q2_I32_OK. */
         "#define E_BOX_F64(d) __JS_NewFloat64(d)\n"
+        "#define Q2_DKEY(d_) ({ double dk_ = (d_); int32_t ik_ = (dk_ >= 0.0 && dk_ <= 2147483647.0) ? (int32_t)dk_ : -1; (ik_ >= 0 && (double)ik_ == dk_ && !(dk_ == 0.0 && signbit(dk_))) ? JS_MKVAL(JS_TAG_INT, ik_) : __JS_NewFloat64(dk_); })\n"
         /* An int32 from a boxed value: an int is the one-compare fast arm; an integral float64
            (not -0, in range) converts; anything else is the caller's exit. */
         "#if defined(__SSE2__)\n"
@@ -4905,7 +5228,11 @@ int qjsaot_driver_main(int argc, char **argv) {
            receiver shape the profile established and the slot offset that came
            with it. NULL/0 unless the cell is an own (read) or own-writable
            (write) hit, because only those mean "this shape, this offset". */
+        "#ifdef E_LOGO_COLD\n"
+        "static __attribute__((noinline, cold)) const void *q2_cell_shape(const void *pic, int k)\n"
+        "#else\n"
         "static inline const void *q2_cell_shape(const void *pic, int k)\n"
+        "#endif\n"
         "{\n"
         "  const unsigned char *e;\n"
         "  uint16_t kind;\n"
@@ -4926,7 +5253,11 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return *(const void *const *)((const unsigned char *)pic + (size_t)(unsigned)k * "
         "QJS_AOT_SIZEOF_JSREGPIC);\n"
         "}\n\n"
+        "#ifdef E_LOGO_COLD\n"
+        "static __attribute__((noinline, cold)) const void *q2_cell_wshape(const void *pic, int k)\n"
+        "#else\n"
         "static inline const void *q2_cell_wshape(const void *pic, int k)\n"
+        "#endif\n"
         "{\n"
         "  const unsigned char *e;\n"
         "  if (pic == NULL || (unsigned)k == QJS_AOT_REG_IC_NONE) return "
@@ -5099,8 +5430,13 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  }\n"
         "  fprintf(stderr, \" assumed-held=%%u\\n\", held);\n"
         "}\n"
-        "#define E_EXIT_WHY(hex_, pc_, op_, pic_, site_, ns_, assumed_) do { static int e_wl_, e_wn_; \\\n"
-        "    if (__builtin_expect(e_xw != e_wl_ || e_wn_ == 0, 0) && e_wn_ < 8) { e_wl_ = e_xw; e_wn_++; e_why_pic((hex_), (pc_), (op_), (pic_), (site_), (ns_), (assumed_), e_xw); } e_xw = 0; } while (0)\n"
+        "static void __attribute__((noinline, cold, unused, preserve_most)) e_why_c(E_WhyD *d, const void *pic, int site, int ns, const void *assumed)\n"
+        "{\n"
+        "  if ((e_xw != d->last || d->n == 0) && d->n < 8) { d->last = e_xw; d->n++; e_why_pic(d->hex, d->pc, d->op, pic, site, ns, assumed, e_xw); }\n"
+        "  e_xw = 0;\n"
+        "}\n"
+        "#define E_EXIT_WHY(hex_, pc_, op_, pic_, site_, ns_, assumed_) do { static E_WhyD e_wd_ = {(hex_), (op_), (pc_), 0, 0}; \\\n"
+        "    e_why_c(&e_wd_, (pic_), (site_), (ns_), (assumed_)); } while (0)\n"
         "static inline int q2_holder2_bad_sh(const void *sh, void *const *holders, int nsites, int ci)\n"
         "{\n"
         "  const unsigned char *p1, *p2;\n"
@@ -5144,8 +5480,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      (const unsigned char *)q2_shape_of(v) + QJS_AOT_OFF_JSSHAPE_PROTO);\n"
         "  return h == NULL || *(const void *const *)(h + QJS_AOT_OFF_JSOBJECT_SHAPE) != holders[site];\n"
         "}\n\n"
-        /* A fast array's element read: class, bounds, hole and lazy-JSON
-           checks, then the element itself, borrowed. No reference is taken,
+        /* A fast array's element read: class, bounds and hole checks,
+           then the element itself, borrowed. No reference is taken,
            so the caller must consume it before the next safepoint, exactly
            like the cache-hit field read. */
         /* An element of a typed array, in range: the engine keeps the element
@@ -5402,7 +5738,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  v = (*(JSValue *const *)(p + "
         "QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n"
         "  if (JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED) return 0;\n"
-        "  if (lz && JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
         "  *out = v;\n"
         "  return 1;\n"
         "}\n\n"
@@ -5661,7 +5996,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  if (ap[QJS_AOT_OFF_JSOBJECT_ARR_KIND] >= 2) return 0;\n"
         "#endif\n"
         "  v = (*(const JSValue *const *)(ap + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[idx];\n"
-        "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
         "  *(uint32_t *)(pi + QJS_AOT_OFF_ARRAY_ITER_IDX) = idx + 1;\n"
         "  *out = v;\n"
         "  return 1;\n"
@@ -5670,7 +6004,7 @@ int qjsaot_driver_main(int argc, char **argv) {
            callee is the builtin, the array has the initial array shape (Array.prototype, `length` writable
            as its first property) and `length` equals the count. push needs room; pop needs an element
            that is not a hole. Anything else returns 0 and the call is made. */
-        "static const void *e_arrpush_fn, *e_arrpop_fn;\n"
+        "static const void *e_arrpush_fn, *e_arrpop_fn, *e_strreplace_fn;\n"
         "static inline __attribute__((always_inline)) int q2_builtin_is(JSValue callee, const void **cache, int which)\n"
         "{\n"
         "  const unsigned char *p;\n"
@@ -5756,13 +6090,20 @@ int qjsaot_driver_main(int argc, char **argv) {
         "    return 1;\n"
         "  }\n"
         "#endif\n"
-        "  if (count >= 0x7fffffffu || JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
+        "  if (count >= 0x7fffffffu) return 0;\n"
         "  if (count + 1 > *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_SIZE)) return qjs_aot_array_push_slow(ctx, arr, v, out);\n"
         "  q2_dup_y_(v);\n"
         "  (*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[count] = v;\n"
         "  *(uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT) = count + 1;\n"
         "  *lenp = JS_MKVAL(JS_TAG_INT, (int32_t)(count + 1));\n"
         "  *out = *lenp;\n"
+        "  return 1;\n"
+        "}\n"
+        "static inline __attribute__((always_inline)) int q2_replace_len(JSContext *ctx, JSValue callee, JSValue str, JSValue rx, JSValue rep, JSValue *out)\n"
+        "{\n"
+        "  int32_t n;\n"
+        "  if (!q2_builtin_is(callee, &e_strreplace_fn, 2) || !qjs_aot_replace_len(ctx, str, rx, rep, &n)) return 0;\n"
+        "  *out = JS_MKVAL(JS_TAG_INT, n);\n"
         "  return 1;\n"
         "}\n"
         "static inline __attribute__((always_inline)) int q2_array_pop0(JSContext *ctx, JSValue callee, JSValue arr, JSValue *out)\n"
@@ -5790,7 +6131,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#endif\n"
         "  if (QJS_AOT_ARR_ODD(p)) return 0;\n"
         "  v = (*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[count - 1];\n"
-        "  if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON || JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED) return 0;\n"
+        "  if (JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED) return 0;\n"
         "  *(uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT) = count - 1;\n"
         "  *lenp = JS_MKVAL(JS_TAG_INT, (int32_t)(count - 1));\n"
         "  *out = v;\n"
@@ -6043,8 +6384,15 @@ int qjsaot_driver_main(int argc, char **argv) {
         "    return NULL;\n"
         "  return p2;\n"
         "}\n"
-        "static inline __attribute__((always_inline)) int "
-        "q2_own_read_hit_k(const void *pic, void *const *holders,\n"
+        "#if defined(E_LOGO_COLD) && defined(E_ORH_SPLIT)\n"
+        "#define Q2_ORH_NAME q2_own_read_hit_full\n"
+        "#define Q2_ORH_ATTR __attribute__((noinline))\n"
+        "#else\n"
+        "#define Q2_ORH_NAME q2_own_read_hit_k\n"
+        "#define Q2_ORH_ATTR __attribute__((always_inline))\n"
+        "#endif\n"
+        "static inline Q2_ORH_ATTR int "
+        "Q2_ORH_NAME(const void *pic, void *const *holders,\n"
         "                       JSValue recv, int site, int nsites,\n"
         "                       JSValue *out, int lz, int *proto)\n"
         "{\n"
@@ -6110,9 +6458,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "QJS_AOT_OFF_JSOBJECT_PROP);\n"
         "  slot_off = *(const uint32_t *)(e + QJS_AOT_OFF_JSREGPIC_SLOT_OFF);\n"
         "  v = *(const JSValue *)(prop + slot_off);\n"
-        "  if (lz && JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) {\n"
-        "    return 0;\n"
-        "  }\n"
         "#if !QJS_DRC\n"
         "  if (JS_VALUE_GET_TAG(v) < 0) {\n"
         "    return 0; /* registers own: the slow path takes the reference */\n"
@@ -6121,6 +6466,31 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  *out = v;\n"
         "  return 1;\n"
         "}\n"
+        "#if defined(E_LOGO_COLD) && defined(E_ORH_SPLIT)\n"
+        "static inline __attribute__((always_inline)) int "
+        "q2_own_read_hit_k(const void *pic, void *const *holders,\n"
+        "                       JSValue recv, int site, int nsites,\n"
+        "                       JSValue *out, int lz, int *proto)\n"
+        "{\n"
+        "  if (pic != NULL && (unsigned)site != QJS_AOT_REG_IC_NONE && JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {\n"
+        "    const unsigned char *obj = (const unsigned char *)JS_VALUE_GET_PTR(recv);\n"
+        "    const unsigned char *e = (const unsigned char *)pic + (size_t)site * QJS_AOT_SIZEOF_JSREGPIC;\n"
+        "    if (*(const void *const *)e == *(const void *const *)(obj + QJS_AOT_OFF_JSOBJECT_SHAPE) &&\n"
+        "        *(const uint16_t *)(e + QJS_AOT_OFF_JSREGPIC_KIND) == QJS_AOT_REG_PIC_OWN) {\n"
+        "      JSValue v = *(const JSValue *)(*(const unsigned char *const *)(obj + QJS_AOT_OFF_JSOBJECT_PROP) +\n"
+        "                                     *(const uint32_t *)(e + QJS_AOT_OFF_JSREGPIC_SLOT_OFF));\n"
+        "      if (1\n"
+        "#if !QJS_DRC\n"
+        "          && JS_VALUE_GET_TAG(v) >= 0\n"
+        "#endif\n"
+        "          ) {\n"
+        "        *proto = 0; *out = v; return 1;\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "  return q2_own_read_hit_full(pic, holders, recv, site, nsites, out, lz, proto);\n"
+        "}\n"
+        "#endif\n"
         "static inline __attribute__((always_inline)) int "
         "q2_own_read_hit_lz(const void *pic, void *const *holders,\n"
         "                       JSValue recv, int site, int nsites,\n"
@@ -6196,8 +6566,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  *ent = q2_pe_of(*out);\n"
         "  return 1;\n"
         "}\n"
-        /* The lazy-JSON marker test is on unless the body in progress assumes no lazy
-           document exists (Q2_LZ is redefined around such a body). */
         "/* undefined into n slots, one 16-byte store each */\n"
         "typedef long long q2_v2_t __attribute__((vector_size(16), aligned(8), may_alias));\n"
         "#define Q2_FILL_UNDEF(p_, n_) do { const q2_v2_t u_ = { 0, (long long)JS_TAG_UNDEFINED }; int k_; \\\n"
@@ -6211,7 +6579,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "#define Q2_LZ 1\n"
         "#define q2_elem_hit(a, k, o) q2_elem_hit_lz(a, k, o, Q2_LZ)\n"
         "#define q2_own_read_hit(...) q2_own_read_hit_lz(__VA_ARGS__, Q2_LZ)\n"
-        "#define E_LAZY_SEEN(ctx_) (*(E_RTOF(ctx_) + QJS_AOT_OFF_RT_LAZY_JSON))\n"
         /* some cache entry has changed since this body's entry validated its cache cells */
         "#ifdef Q2_FORCE_EPOCH\n"
         "#define Q2_EPOCH_MOVED(ctx_) ((void)q2_ep, 1)\n"
@@ -6321,6 +6688,14 @@ int qjsaot_driver_main(int argc, char **argv) {
        takes the value) needs the engine. */
     fprintf(
         f,
+        "#if defined(E_LOGO_COLD) && !defined(E_KEEP_SETREG)\n"
+        "static __attribute__((noinline)) void q2_set_reg_last(JSContext *ctx, JSValue *fr, int off, JSValue v)\n"
+        "{\n"
+        "  int *rc = (int *)((uint8_t *)JS_VALUE_GET_PTR(v) - QJS_AOT_RC_BACK); (void)rc;\n"
+        "%1$s"
+        "  (qjs_aot_set_reg_p)(ctx, fr, off, v);\n"
+        "}\n"
+        "#endif\n"
         "static inline __attribute__((always_inline)) void q2_set_reg_p(JSContext *ctx, "
         "JSValue *fr, int off, JSValue v)\n"
         "{\n"
@@ -6335,7 +6710,12 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      *(JSValue *)((uint8_t *)fr + off) = v;\n"
         "      return;\n"
         "    }\n"
-        "%s"
+        "#if defined(E_LOGO_COLD) && !defined(E_KEEP_SETREG)\n"
+        "    q2_set_reg_last(ctx, fr, off, v);\n"
+        "    return;\n"
+        "#else\n"
+        "%1$s"
+        "#endif\n"
         "  }\n"
         "  (qjs_aot_set_reg_p)(ctx, fr, off, v);\n"
         "}\n"
@@ -6756,9 +7136,8 @@ int qjsaot_driver_main(int argc, char **argv) {
         "  return 0;\n"
         "}\n"
 );
-    /* The same helpers for a body that assumes no lazy JSON document exists: the lazy marker is
-       in no slot while it runs, so "counted" is one unsigned compare of the tag. Such a body
-       renames the helpers to these around itself (e_emit_spec_body_pass). */
+    /* The same helpers with "counted" as one unsigned compare of the tag. A body in the `_nl`
+       form renames the helpers to these around itself (e_emit_spec_body_pass). */
     fprintf(
         f,
         "#define Q2_HRCN(v_) ((unsigned)JS_VALUE_GET_TAG(v_) >= (unsigned)JS_TAG_FIRST)\n"
@@ -6939,7 +7318,10 @@ int qjsaot_driver_main(int argc, char **argv) {
         "    E_PUTWHY(E_PUT_PROTO);\n"
         "    return 0;\n"
         "  }\n"
-        "  if (Q2_OBJ_IN_LAYOUT(obj)) return 0;\n"
+        "  if (Q2_OBJ_IN_LAYOUT(obj)) {\n"
+        "    E_PUTWHY(E_PUT_LAYOUT);\n"
+        "    return 0;\n"
+        "  }\n"
         "  slot = (JSValue *)(*(unsigned char *const *)(obj + "
         "QJS_AOT_OFF_JSOBJECT_PROP) +\n"
         "                     *(const uint32_t *)(e + "
@@ -7178,7 +7560,6 @@ int qjsaot_driver_main(int argc, char **argv) {
         "      continue;\n"
         "    prop = *(const unsigned char *const *)(holder + QJS_AOT_OFF_JSOBJECT_PROP);\n"
         "    v = *(const JSValue *)(prop + *(const uint32_t *)(e + QJS_AOT_OFF_JSREGPIC_SLOT_OFF));\n"
-        "    if (JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) continue;\n"
         "    ks[k] = sh; vs[k] = v; es[k] = q2_entry_of(v);\n"
         "#else\n"
         "    (void)e; (void)sh; (void)holder; (void)prop; (void)v; (void)holders;\n"
@@ -7288,7 +7669,6 @@ int qjsaot_driver_main(int argc, char **argv) {
           "    return 0;\n"
           "  prop = *(const unsigned char *const *)(obj + QJS_AOT_OFF_JSOBJECT_PROP);\n"
           "  v = *(const JSValue *)(prop + (size_t)slot * QJS_AOT_SIZEOF_JSPROPERTY);\n"
-          "  if (lz && JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n"
           "#if !QJS_DRC\n"
           "  if (JS_VALUE_GET_TAG(v) < 0) return 0;\n"
           "#endif\n"
@@ -7651,7 +8031,7 @@ int qjsaot_driver_main(int argc, char **argv) {
             "extern char __start_aottext[] __asm(\"section$start$__TEXT$aottext\");\n"
             "extern char __stop_aottext[] __asm(\"section$end$__TEXT$aottext\");\n"
             "#else\n"
-            "#define E_TEXT __attribute__((section(\"aottext\")))\n"
+            "#ifndef E_TEXT\n#define E_TEXT __attribute__((section(\"aottext\")))\n#endif\n"
             "extern char __start_aottext[] __attribute__((weak));\n"
             "extern char __stop_aottext[] __attribute__((weak));\n"
             "#endif\n");
@@ -7934,9 +8314,6 @@ int qjsaot_driver_main(int argc, char **argv) {
           "  if (e_gate[fi]) { if (getenv(\"QJS_AOT_KTRACE\")) fprintf(stderr, \"kentry: fn %%d gated: e_gate (why %%d)\\n\", fi, (int)e_gwhy[fi]); return qjs_aot_gated_call(ctx_in, co, this_obj, argv, argc); }\n"
           "  if (needpic && *(void **)(*(uint8_t **)((uint8_t *)co + QJS_AOT_OFF_OBJECT_FUNC_BYTECODE) + QJS_AOT_OFF_FNBC_REGVM_PIC) == NULL)\n"
           "    return qjs_aot_call_interp(ctx_in, co, this_obj, argv, argc);\n"
-          "  if (E_LAZY_SEEN(*(JSContext **)(*(uint8_t **)((uint8_t *)co + QJS_AOT_OFF_OBJECT_FUNC_BYTECODE) + QJS_AOT_OFF_FNBC_REALM))) {\n"
-          "    if (getenv(\"QJS_AOT_KTRACE\")) fprintf(stderr, \"kentry: fn %%d gated: lazy seen\\n\", fi);\n"
-          "    return qjs_aot_gated_call(ctx_in, co, this_obj, argv, argc); }\n"
           "  if (q2_ktry[fi] < 256) {\n"
           "    q2_ktry[fi]++;\n"
           "    if (q2_kres(ctx_in, fi)) return fast(ctx_in, caller_f, co, this_obj, argv, argc);\n"
@@ -8229,6 +8606,7 @@ int qjsaot_driver_main(int argc, char **argv) {
     fprintf(f, "const uint32_t qjs_aot_site_count = %du;\n", g_deopt_site_next);
     fclose(f);
     qjsaot_number_guards(out);
+    e_emit_regexps(out, hot_cover);
 
     if (getenv("QJS_AOT_LAYOUTCENSUS") != NULL)
       fprintf(stderr, "layout census: site-slot-refused=%d\n", g_slot_refused);

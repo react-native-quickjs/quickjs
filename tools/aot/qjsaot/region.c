@@ -3555,7 +3555,7 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
                                   "      rgma_%d = *(JSValue *const *)(ap_ + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES); rgmc_%d = *(const uint32_t *)(ap_ + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT); rgmv_%d = 1; }\n", ob, ob, c->hex, k_, k_, k_);
               fprintf(o, "        { JSValue e_; if (__builtin_expect(JS_VALUE_GET_TAG(%sv%d) != JS_TAG_INT || (uint32_t)JS_VALUE_GET_INT(%sv%d) >= rgmc_%d, 0)) goto %s;\n"
                          "          e_ = rgma_%d[(uint32_t)JS_VALUE_GET_INT(%sv%d)];\n"
-                         "          if (__builtin_expect(JS_VALUE_GET_TAG(e_) == JS_TAG_UNINITIALIZED || JS_VALUE_GET_TAG(e_) == QJS_AOT_TAG_LAZY_JSON, 0)) goto %s;\n"
+                         "          if (__builtin_expect(JS_VALUE_GET_TAG(e_) == JS_TAG_UNINITIALIZED, 0)) goto %s;\n"
                          "          %sv%d = e_; }\n", I->pfx, u1, I->pfx, u1, k_, xl, k_, I->pfx, u1, xl, I->pfx, dv);
               break;
             }
@@ -3567,18 +3567,18 @@ static int rg_walk_inst_(RCtx *c, int ii, char (*rootcur)[40], const Q2Func *roo
                          "          rgma_%d = *(JSValue *const *)(ap_ + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES); rgmc_%d = *(const uint32_t *)(ap_ + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT); rgmv_%d = 1; }\n"
                          "        { JSValue e_; if (__builtin_expect(JS_VALUE_GET_TAG(%sv%d) != JS_TAG_INT || (uint32_t)JS_VALUE_GET_INT(%sv%d) >= rgmc_%d, 0)) goto %s;\n"
                          "          e_ = rgma_%d[(uint32_t)JS_VALUE_GET_INT(%sv%d)];\n"
-                         "          if (__builtin_expect(JS_VALUE_GET_TAG(e_) == JS_TAG_UNINITIALIZED || JS_VALUE_GET_TAG(e_) == QJS_AOT_TAG_LAZY_JSON, 0)) goto %s;\n"
+                         "          if (__builtin_expect(JS_VALUE_GET_TAG(e_) == JS_TAG_UNINITIALIZED, 0)) goto %s;\n"
                          "          %sv%d = e_; }\n",
                       k_, b_, b_, xl, k_, k_, k_, I->pfx, u1, I->pfx, u1, k_, xl, k_, I->pfx, u1, xl, I->pfx, dv);
               break;
             }
           }
           /* a dense fast array: one bounds check against the object's count, then the element
-             borrowed in place; a hole, lazy JSON, a packed or typed array takes the helper */
+             borrowed in place; a hole, a packed or typed array takes the helper */
           if (c->emit) fprintf(o, "        { JSValue e_; const unsigned char *ap_ = (const unsigned char *)JS_VALUE_GET_PTR(%sv%d);\n"
                                   "          if (__builtin_expect(JS_VALUE_GET_TAG(%sv%d) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(%sv%d) == JS_TAG_INT && *(const uint16_t *)(ap_ + QJS_AOT_OFF_JSOBJECT_CLASS_ID) == QJS_AOT_CLASS_ARRAY && (ap_[QJS_AOT_OFF_JSOBJECT_FAST_ARRAY_BYTE] & QJS_AOT_JSOBJECT_FAST_ARRAY_MASK) && !QJS_AOT_ARR_ODD(ap_) && (uint32_t)JS_VALUE_GET_INT(%sv%d) < *(const uint32_t *)(ap_ + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT), 1)) {\n"
                                   "            e_ = (*(JSValue *const *)(ap_ + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[(uint32_t)JS_VALUE_GET_INT(%sv%d)];\n"
-                                  "            if (__builtin_expect(JS_VALUE_GET_TAG(e_) == JS_TAG_UNINITIALIZED || JS_VALUE_GET_TAG(e_) == QJS_AOT_TAG_LAZY_JSON, 0)) goto %s;\n"
+                                  "            if (__builtin_expect(JS_VALUE_GET_TAG(e_) == JS_TAG_UNINITIALIZED, 0)) goto %s;\n"
                                   "          } else if (__builtin_expect(!q2_elem_hit_lz(%sv%d, %sv%d, &e_, 1), 0)) goto %s;\n"
                                   "          %sv%d = e_; }\n",
                                I->pfx, u0, I->pfx, u0, I->pfx, u1, I->pfx, u1, I->pfx, u1, xl, I->pfx, u0, I->pfx, u1, xl, I->pfx, dv);
@@ -6311,7 +6311,7 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
   fprintf(o, "      else if (cl_ == QJS_AOT_CLASS_INT16_ARRAY || cl_ == QJS_AOT_CLASS_UINT16_ARRAY) ((int16_t *)base_)[i] = (int16_t)n_;\n");
   fprintf(o, "      else ((int8_t *)base_)[i] = (int8_t)n_;\n");
   fprintf(o, "      *old = JS_UNDEFINED; return 1;\n    } }\n");
-  fprintf(o, "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_ARRAY || !(p[QJS_AOT_OFF_JSOBJECT_FAST_ARRAY_BYTE] & QJS_AOT_JSOBJECT_FAST_ARRAY_MASK) || QJS_AOT_ARR_ODD(p) || JS_VALUE_GET_TAG(v) == QJS_AOT_TAG_LAZY_JSON) return 0;\n");
+  fprintf(o, "  if (*(const uint16_t *)(p + QJS_AOT_OFF_JSOBJECT_CLASS_ID) != QJS_AOT_CLASS_ARRAY || !(p[QJS_AOT_OFF_JSOBJECT_FAST_ARRAY_BYTE] & QJS_AOT_JSOBJECT_FAST_ARRAY_MASK) || QJS_AOT_ARR_ODD(p)) return 0;\n");
   fprintf(o, "  i = (uint32_t)JS_VALUE_GET_INT(k);\n  count = *(const uint32_t *)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_COUNT);\n");
   fprintf(o, "  if (__builtin_expect(i < count, 1)) {\n    slot = &(*(JSValue **)(p + QJS_AOT_OFF_JSOBJECT_ARRAY_VALUES))[i];\n");
   fprintf(o, "    if (JS_VALUE_GET_TAG(*slot) == JS_TAG_UNINITIALIZED) return 0;\n    *old = *slot; q2_dup_p(v); *slot = v; return 1;\n  }\n");
@@ -6439,7 +6439,8 @@ static int region_emit1(FILE *f, const Q2Func *root, const char hex[33], int fi,
     int ti_, uses_this_ = 0;
     for (ti_ = 0; ti_ < root->ninsns && !uses_this_; ti_++)
       if (root->insns[ti_].rop == ROP_load_this || root->insns[ti_].rop == ROP_get_this_field || root->insns[ti_].rop == ROP_get_this_field2) uses_this_ = 1;
-    fprintf(o, "    if (__builtin_expect(E_LAZY_SEEN(ctx), 0)%s) return aot_g_%s(ctx, f, fr, entry_pc);\n", uses_this_ ? " || JS_VALUE_GET_TAG(f_this) != JS_TAG_OBJECT" : "", hex);
+    if (uses_this_)
+      fprintf(o, "    if (__builtin_expect(JS_VALUE_GET_TAG(f_this) != JS_TAG_OBJECT, 0)) return aot_g_%s(ctx, f, fr, entry_pc);\n", hex);
   }
   fprintf(o, "    E_ENTER_NOTE(%d);\n", fi);
   if (getenv("QJS_AOT_FASTSTATS") != NULL) fprintf(o, "    rgx_%s[%d]++;\n", hex, RG_MAXX);

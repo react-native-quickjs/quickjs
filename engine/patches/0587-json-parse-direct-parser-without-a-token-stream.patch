@@ -1,0 +1,384 @@
+Subject: JSON.parse without a reviver reads values straight from the bytes, the general parser redoing any input it does not finish
+
+What this does
+  - `json_obj_begin` / `json_obj_add`: the object building of `json_parse_value` (the depth's shape cache, adopting the expected shape, rebuilding the chain on a divergence) as functions, used by both parsers; the chain is extended only at its end
+  - `json_fast_value` / `json_fast_parse`: a recursive parser over the bytes for the no-reviver case, with no token stream (no position bookkeeping, no token freed per punctuation mark): whitespace, the three literals, strings, keys (with the expected-key hint) and numbers through the general parser's own readers, arrays staged and built in one shot, objects through `json_obj_add`. On anything it does not expect, a syntax error included, it frees what it built and gives up; an exception one of the readers threw is cleared (an uncatchable one is returned)
+  - `js_json_parse` tries it first on both the 8-bit and the UTF-8 input, and parses with the general parser when it gave up
+
+Why we need it
+  json_next_token and json_parse_value (token state, line and column bookkeeping, token frees, the dispatch per punctuation mark) were about 31% of parse cycles on the app-traffic benchmark. json_app parse only: -16.6% cycles, -19.4% instructions (after 0583).
+
+Soundness
+  The direct parser accepts a subset of what the general parser accepts (JSON whitespace only, the same readers for strings, keys and numbers, the same literal bytes, the same structure) and builds the value with the same object code, so an input it finishes gives the same value; every other input, including every invalid one, is parsed from the start by the general parser, which throws exactly as before. Differentials, old engine vs new: the 160,000 JSON inputs and the 400,015 numbers of 0581-0583, and 47 edge inputs (100,000-deep nesting, 18,000-byte nested objects, every JSON and non-JSON whitespace, NUL after the value, 100 KB strings, 50,000-element arrays, escaped keys equal to plain ones, malformed numbers and literals, truncated inputs, astral and 16-bit text) give identical results and error messages.
+
+diff --git a/quickjs.c b/quickjs.c
+index 1fc4eb7..323f250 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -106013,6 +106013,75 @@ static int json_obj_adopt_shape(JSContext *ctx, JSObject *p, JSShape *new_sh,
+     return 0;
+ }
+ 
++/* The shape cache of `depth` for a new object being built (see JSONShapeCache): *matched when the cached chain starts at its shape. */
++static JSONShapeCache *json_obj_begin(JSContext *ctx, JSParseState *s, int depth, JSObject *jsobj, int *matched)
++{
++    JSONShapeCache *jsc = json_shape_cache_at(ctx, s, depth);
++
++    *matched = 0;
++    if (jsc) {
++        if (!jsc->shapes) {
++            /* first object at this depth: remember its base shape */
++            if (json_shape_cache_reserve(ctx, jsc, 1) == 0)
++                jsc->shapes[0] = js_dup_shape(jsobj->shape);
++            else
++                jsc = NULL;
++        }
++        if (jsc && jsc->n > 0 && jsc->shapes[0] == jsobj->shape)
++            *matched = 1;
++    }
++    return jsc;
++}
++
++/* Add the k-th property (prop_name and prop_val, both owned and consumed) to the object being built at `depth`: the cached shape when
++   the transition is the expected one, else a define that rebuilds the cache from k. Returns < 0 on an exception. */
++static int json_obj_add(JSContext *ctx, JSParseState *s, int depth, JSValue val, JSObject *jsobj, int k, int *matched,
++                        JSAtom prop_name, JSValue prop_val)
++{
++    /* fetched here: a nested object may have grown the cache array */
++    JSONShapeCache *jsc = json_shape_cache_at(ctx, s, depth);
++    int ret;
++
++    if (jsc && *matched && k < jsc->n &&
++        jsc->atoms[k] == prop_name &&
++        jsc->shapes[k] == jsobj->shape &&
++        jsc->shapes[k + 1] != jsc->shapes[k]) {
++        /* expected transition: adopt the cached shape */
++        JSShape *nsh = jsc->shapes[k + 1];
++        if (json_obj_adopt_shape(ctx, jsobj, nsh, prop_val)) {
++            JS_FreeValue(ctx, prop_val);
++            JS_FreeAtom(ctx, prop_name);
++            return -1;
++        }
++        ret = 0;
++    } else {
++        if (jsc && *matched) {
++            /* diverged: drop the stale tail and rebuild */
++            int j;
++            if (k < jsc->n) {
++                for (j = k + 1; j <= jsc->n; j++)
++                    js_free_shape(ctx->rt, jsc->shapes[j]);
++                for (j = k; j < jsc->n; j++)
++                    JS_FreeAtom(ctx, jsc->atoms[j]);
++                jsc->n = k;
++            }
++            *matched = 0;
++        }
++        ret = JS_DefinePropertyValue(ctx, val, prop_name,
++                                     prop_val, JS_PROP_C_W_E);
++        /* the chain is extended only where it ends (an earlier reservation failure, or an object that did not start on it, leaves it as it is) */
++        if (ret >= 0 && jsc && jsc->n == k) {
++            if (json_shape_cache_reserve(ctx, jsc, k + 1) == 0) {
++                jsc->atoms[k] = JS_DupAtom(ctx, prop_name);
++                jsc->shapes[k + 1] = js_dup_shape(jsobj->shape);
++                jsc->n = k + 1;
++            }
++        }
++    }
++    JS_FreeAtom(ctx, prop_name);
++    return ret;
++}
++
+ /* 'pr' can be NULL */
+ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
+ {
+@@ -106049,19 +106118,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
+             }
+             jsobj = JS_VALUE_GET_OBJ(val);
+             k = 0;
+-            matched = 0;
+-            jsc = json_shape_cache_at(ctx, s, depth);
+-            if (jsc) {
+-                if (!jsc->shapes) {
+-                    /* first object at this depth: remember its base shape */
+-                    if (json_shape_cache_reserve(ctx, jsc, 1) == 0)
+-                        jsc->shapes[0] = js_dup_shape(jsobj->shape);
+-                    else
+-                        jsc = NULL;
+-                }
+-                if (jsc && jsc->n > 0 && jsc->shapes[0] == jsobj->shape)
+-                    matched = 1;
+-            }
++            jsc = json_obj_begin(ctx, s, depth, jsobj, &matched);
+             if (s->token.val != '}') {
+                 for(;;) {
+                     if (s->token.val == TOK_STRING || s->token.val == TOK_IDENT) {
+@@ -106097,46 +106154,9 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
+                         JS_FreeAtom(ctx, prop_name);
+                         goto fail;
+                     }
++                    ret = json_obj_add(ctx, s, depth, val, jsobj, k, &matched, prop_name, prop_val);
+                     /* re-fetch: a nested object may have grown the cache array */
+                     jsc = json_shape_cache_at(ctx, s, depth);
+-                    if (jsc && matched && k < jsc->n &&
+-                        jsc->atoms[k] == prop_name &&
+-                        jsc->shapes[k] == jsobj->shape &&
+-                        jsc->shapes[k + 1] != jsc->shapes[k]) {
+-                        /* expected transition: adopt the cached shape */
+-                        JSShape *nsh = jsc->shapes[k + 1];
+-                        if (json_obj_adopt_shape(ctx, jsobj, nsh, prop_val)) {
+-                            JS_FreeValue(ctx, prop_val);
+-                            JS_FreeAtom(ctx, prop_name);
+-                            goto fail;
+-                        }
+-                        ret = 0;
+-                    } else {
+-                        if (jsc && matched) {
+-                            /* diverged: drop the stale tail and rebuild */
+-                            int j;
+-                            if (k < jsc->n) {
+-                                for (j = k + 1; j <= jsc->n; j++)
+-                                    js_free_shape(ctx->rt, jsc->shapes[j]);
+-                                for (j = k; j < jsc->n; j++)
+-                                    JS_FreeAtom(ctx, jsc->atoms[j]);
+-                                jsc->n = k;
+-                            }
+-                            matched = 0;
+-                        }
+-                        ret = JS_DefinePropertyValue(ctx, val, prop_name,
+-                                                     prop_val, JS_PROP_C_W_E);
+-                        if (ret >= 0 && jsc) {
+-                            if (json_shape_cache_reserve(ctx, jsc, k + 1) == 0) {
+-                                jsc->atoms[k] = JS_DupAtom(ctx, prop_name);
+-                                jsc->shapes[k + 1] = js_dup_shape(jsobj->shape);
+-                                jsc->n = k + 1;
+-                            } else {
+-                                jsc = NULL;
+-                            }
+-                        }
+-                    }
+-                    JS_FreeAtom(ctx, prop_name);
+                     if (ret < 0)
+                         goto fail;
+                     k++;
+@@ -106309,6 +106329,200 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
+     return JS_EXCEPTION;
+ }
+ 
++/* The direct parser of JSON.parse without a reviver: bytes to values with no token stream (no position bookkeeping, no token to free
++   per punctuation mark). It uses the general parser's own string, key and number readers and its object building (the shape cache,
++   the expected keys), and gives up on anything it does not expect -- any syntax error included -- by returning -1; the caller then
++   parses the whole input again with the general parser, which gives every error and its message. */
++static inline const uint8_t *json_fast_ws(const uint8_t *p)
++{
++    while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')
++        p++;
++    return p;
++}
++
++static int json_fast_value(JSParseState *s, const uint8_t **pp, int depth, JSValue *out)
++{
++    JSContext *ctx = s->ctx;
++    const uint8_t *p = *pp;
++    JSValue val;
++
++    if (js_check_stack_overflow(ctx->rt, 0))
++        return -1;
++    switch (*p) {
++    case '"':
++        p++;
++        if (json_parse_string(s, &p))
++            return -1;
++        /* the string moves out of the token */
++        *out = s->token.u.str.str;
++        s->token.val = ' ';
++        *pp = p;
++        return 0;
++    case '-': case '0': case '1': case '2': case '3': case '4':
++    case '5': case '6': case '7': case '8': case '9':
++        {
++            const uint8_t *q = p + (*p == '-');
++            if (!is_digit(*q) || (q[0] == '0' && is_digit(q[1])))
++                return -1;
++            if (json_parse_number(s, &p))
++                return -1;
++            *out = s->token.u.num.val;
++            s->token.val = ' ';
++            *pp = p;
++            return 0;
++        }
++    case 't':
++        if (p[1] == 'r' && p[2] == 'u' && p[3] == 'e') { *out = JS_TRUE; p += 4; break; }
++        return -1;
++    case 'f':
++        if (p[1] == 'a' && p[2] == 'l' && p[3] == 's' && p[4] == 'e') { *out = JS_FALSE; p += 5; break; }
++        return -1;
++    case 'n':
++        if (p[1] == 'u' && p[2] == 'l' && p[3] == 'l') { *out = JS_NULL; p += 4; break; }
++        return -1;
++    case '[':
++        {
++            JSValue *elems = NULL, el;
++            int elems_size = 0, n = 0;
++            p = json_fast_ws(p + 1);
++            if (*p != ']') {
++                for (;;) {
++                    if (n >= elems_size) {
++                        int ns2 = elems_size ? elems_size * 2 : 8;
++                        JSValue *ne = js_realloc(ctx, elems, sizeof(JSValue) * ns2);
++                        if (!ne)
++                            goto arr_fail;
++                        elems = ne;
++                        elems_size = ns2;
++                    }
++                    if (json_fast_value(s, &p, depth + 1, &el))
++                        goto arr_fail;
++                    elems[n++] = el;
++                    p = json_fast_ws(p);
++                    if (*p == ']')
++                        break;
++                    if (*p != ',')
++                        goto arr_fail;
++                    p = json_fast_ws(p + 1);
++                }
++            }
++            val = js_new_array_from_owned(ctx, n, elems);
++            if (JS_IsException(val))
++                return -1;
++            *out = val;
++            p++;
++            break;
++        arr_fail:
++            while (n > 0)
++                JS_FreeValue(ctx, elems[--n]);
++            js_free(ctx, elems);
++            return -1;
++        }
++    case '{':
++        {
++            JSObject *jsobj;
++            JSONShapeCache *jsc;
++            JSAtom prop_name;
++            JSValue prop_val;
++            int k = 0, matched;
++
++            val = JS_NewObject(ctx);
++            if (JS_IsException(val))
++                return -1;
++            jsobj = JS_VALUE_GET_OBJ(val);
++            jsc = json_obj_begin(ctx, s, depth, jsobj, &matched);
++            p = json_fast_ws(p + 1);
++            if (*p != '}') {
++                for (;;) {
++                    if (*p != '"')
++                        goto obj_fail;
++                    p++;
++                    if (jsc && matched && jsc->atoms && k < jsc->n)
++                        s->json_key_hint = jsc->atoms[k];
++                    if (json_parse_key_string(s, &p)) {
++                        s->json_key_hint = JS_ATOM_NULL;
++                        goto obj_fail;
++                    }
++                    s->json_key_hint = JS_ATOM_NULL;
++                    if (s->token.val == TOK_IDENT) {
++                        prop_name = s->token.u.ident.atom;
++                    } else {
++                        prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
++                        JS_FreeValue(ctx, s->token.u.str.str);
++                        if (prop_name == JS_ATOM_NULL) {
++                            s->token.val = ' ';
++                            goto obj_fail;
++                        }
++                    }
++                    s->token.val = ' ';
++                    p = json_fast_ws(p);
++                    if (*p != ':') {
++                        JS_FreeAtom(ctx, prop_name);
++                        goto obj_fail;
++                    }
++                    p = json_fast_ws(p + 1);
++                    if (json_fast_value(s, &p, depth + 1, &prop_val)) {
++                        JS_FreeAtom(ctx, prop_name);
++                        goto obj_fail;
++                    }
++                    if (json_obj_add(ctx, s, depth, val, jsobj, k, &matched, prop_name, prop_val) < 0)
++                        goto obj_fail;
++                    jsc = json_shape_cache_at(ctx, s, depth);
++                    k++;
++                    p = json_fast_ws(p);
++                    if (*p == '}')
++                        break;
++                    if (*p != ',')
++                        goto obj_fail;
++                    p = json_fast_ws(p + 1);
++                }
++            }
++            *out = val;
++            p++;
++            break;
++        obj_fail:
++            JS_FreeValue(ctx, val);
++            return -1;
++        }
++    default:
++        return -1;
++    }
++    *pp = p;
++    return 0;
++}
++
++/* The whole input by json_fast_value; JS_UNINITIALIZED when it gave up (nothing pending: an exception one of its readers threw is
++   cleared, except an uncatchable one, which is returned as JS_EXCEPTION). */
++static JSValue json_fast_parse(JSContext *ctx, const char *buf, size_t buf_len, bool latin1)
++{
++    JSParseState s1, *s = &s1;
++    const uint8_t *p;
++    JSValue val = JS_UNDEFINED;
++    int ok;
++
++    js_parse_init(ctx, s, buf, buf_len, "<input>", 1);
++    s->json_latin1 = latin1;
++    p = json_fast_ws((const uint8_t *)buf);
++    ok = json_fast_value(s, &p, 0, &val) == 0;
++    if (ok) {
++        p = json_fast_ws(p);
++        if (p != s->buf_end) {
++            JS_FreeValue(ctx, val);
++            ok = 0;
++        }
++    }
++    json_shape_cache_free(ctx, s);
++    if (ok)
++        return val;
++    if (JS_HasException(ctx)) {
++        JSValue exc = JS_GetException(ctx);
++        if (JS_IsUncatchableError(exc))
++            return JS_Throw(ctx, exc);
++        JS_FreeValue(ctx, exc);
++    }
++    return JS_UNINITIALIZED;
++}
++
+ static JSValue JS_ParseJSON_internal2(JSContext *ctx, const char *buf, size_t buf_len,
+                                       const char *filename, JSONParseRecord *pr, bool latin1)
+ {
+@@ -107567,6 +107781,9 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
+         /* the tokenizer reads the byte after the end (a number's last digit test): it must be the terminator */
+         if (!jp->is_wide_char && str8(jp)[jp->len] == 0 && !js_lazy_json_should_enable(ctx, jp->len)) {
+             JSValue exc;
++            obj = json_fast_parse(ctx, (const char *)str8(jp), jp->len, true);
++            if (!JS_IsUninitialized(obj))
++                return obj;
+             obj = JS_ParseJSON_internal2(ctx, (const char *)str8(jp), jp->len, "<input>", NULL, true);
+             if (!JS_IsException(obj))
+                 return obj;
+@@ -107625,7 +107842,9 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
+         json_free_parse_record(ctx, pr);
+         JS_FreeValue(ctx, root);
+     } else {
+-        obj = JS_ParseJSON_internal(ctx, str, len, "<input>", NULL);
++        obj = json_fast_parse(ctx, str, len, false);
++        if (JS_IsUninitialized(obj))
++            obj = JS_ParseJSON_internal(ctx, str, len, "<input>", NULL);
+     }
+     JS_FreeCString(ctx, str);
+     return obj;

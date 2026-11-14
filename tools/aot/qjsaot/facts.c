@@ -79,6 +79,7 @@ int qjs_aot_prof_site(
     const uint8_t dg[16], int site, int *nshapes, uint64_t shapes[4]);
 int qjs_aot_prof_site_own(const uint8_t dg[16], int site);
 int qjs_aot_prof_site_proto(const uint8_t dg[16], int site);
+int qjs_aot_prof_site_multirecv(const uint8_t dg[16], int site);
 int qjs_aot_prof_site_slots(const uint8_t dg[16], int site, int nshapes, int *slots,
                             int cap);
 const void *qjs_aot_prof_shape(int id, int *proto, char *digest, int *nfields,
@@ -714,11 +715,13 @@ static int build_groups(const Q2Func *fn, EFacts *f) {
     const uint8_t *dg = e_site_dg(fn, sites[k].site, &osite);
     if (!qjs_aot_prof_site(dg, osite, &ns, shapes)) continue;
     if (ns >= 2 && ns <= 4 && qjs_aot_prof_site_own(dg, osite) &&
+        (sites[k].write || getenv("QJS_AOT_NOMULTIRECV") != NULL || !qjs_aot_prof_site_multirecv(dg, osite)) &&
         !qjs_aot_prof_unexecuted(dg, in->opc)) {
       sites[k].poly = 1; /* served by the polymorphic cache, not grouped */
       continue;
     }
     if (ns != 1) continue; /* never filled, or too many shapes: no group */
+    if (!sites[k].write && getenv("QJS_AOT_NOMULTIRECV") == NULL && qjs_aot_prof_site_multirecv(dg, osite)) continue; /* the receivers vary: the one recorded shape would exit for the rest */
     /* Only an own readable or writable slot has a fixed offset to group on. */
     if (qjs_aot_prof_site_proto(dg, osite) && !sites[k].write &&
         getenv("QJS_AOT_NOPROTOGROUP") == NULL) {
@@ -855,6 +858,9 @@ int e_ta_class(const Q2Func *fn, const Q2Insn *in) {
     unsigned m, k;
     if (fn->prof[i].pc != in->pc) continue;
     if (!(fn->prof[i].elem & Q2_ELEM_TA)) return 0;
+    /* The site saw a JS array as well (the profile keeps the storage kind of every array receiver): a region of one typed-array class
+       would leave on every array, and the function would be switched off. The two-way element read serves both. */
+    if (fn->prof[i].pk != 0) return 0;
     m = fn->prof[i].ta;
     if (m == 0 || (m & (m - 1)) != 0) return 0;
     k = (unsigned)__builtin_ctz(m);
@@ -977,6 +983,7 @@ static int pm_exit_load(const Q2Func *fn, EFacts *f, const Q2Insn *in, const Sit
     return 0;
   dg_p = e_site_dg(fn, ref[0].site, &osite_p);
   return dg_p != NULL && qjs_aot_prof_site_proto(dg_p, osite_p) && !qjs_aot_layout_site(dg_p, osite_p, &lay_p, &slot_p) &&
+         (getenv("QJS_AOT_NOMULTIRECV") != NULL || !qjs_aot_prof_site_multirecv(dg_p, osite_p)) &&
          e_facts_site_group(f, ref[0].site) < 0 && !e_facts_site_poly(f, ref[0].site);
 }
 

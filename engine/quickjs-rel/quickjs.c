@@ -31,6 +31,11 @@
 #include <inttypes.h>
 #include <string.h>
 #include <assert.h>
+#include <float.h>
+#if defined(__SSE2__)
+/* Before the malloc/free poison: gcc's copy includes mm_malloc.h. */
+#include <emmintrin.h>
+#endif
 
 #if QJS_AOT_PROFILE && !defined(_WIN32)
 #include <dlfcn.h> /* dladdr */
@@ -56,10 +61,6 @@
 #if !defined(_WIN32) && (QJS_AOT_PROFILE || QJS_FNSAMPLE)
 #include <link.h>  /* dl_iterate_phdr, for the executable's load base */
 #endif
-#endif
-
-#ifndef QJS_JSON_LAZY_DEFAULT
-#define QJS_JSON_LAZY_DEFAULT 0
 #endif
 
 #if !defined(_MSC_VER)
@@ -90,6 +91,24 @@ static void fn_sample_name(const struct JSFunctionBytecode *b);
 
 #include "libregexp.h"
 #include "dtoa.h"
+
+/* A cycle count for the GC's time accounting and the statistics counters: the time-stamp counter on x86; elsewhere a monotonic
+   clock scaled to nominal 3 GHz cycles, so the cycle-denominated allowances keep about the same meaning */
+static inline uint64_t js_cycles(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    return __builtin_ia32_rdtsc();
+#elif defined(_WIN32)
+    LARGE_INTEGER c, f;
+    QueryPerformanceCounter(&c);
+    QueryPerformanceFrequency(&f);
+    return (uint64_t)((double)c.QuadPart * (3e9 / (double)f.QuadPart));
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 3000000000u + (uint64_t)ts.tv_nsec * 3u;
+#endif
+}
 
 #if QJS_REGVM
 /* The register ISA and lowering inventory, needed by the register interpreter
@@ -405,6 +424,7 @@ typedef struct JSString JSString;
 typedef struct JSString JSAtomStruct;
 typedef struct JSStringRope JSStringRope;
 typedef struct JSMegaEntry JSMegaEntry;
+typedef struct JSPutAddEntry JSPutAddEntry;
 /* QJS_DRC: the runtime's candidate list needs the name before the
    struct definition below. */
 typedef struct JSVarRef JSVarRef;
@@ -631,7 +651,6 @@ struct JSRuntime {
     JSMallocState malloc_state;
     JSArenaState arena_state;
     const char *rt_info;
-    int json_lazy_enabled;
 
     int atom_hash_size; /* power of two */
     int atom_count;
@@ -801,9 +820,6 @@ struct JSRuntime {
        an is_prototype object. Add-transition IC entries snapshot it and only hit while
        it is unchanged. Saturates at JS_IC_EPOCH_MAX (then transition filling stops). */
     uint32_t ic_watchpoint_epoch;
-    /* Set once a lazily parsed JSON document has been created in this runtime: values it
-       holds can be lazy markers, which compiled code tests for only while this is set. */
-    uint8_t lazy_json_seen;
     /* Bumped whenever a register property cache entry is cleared or refilled. A compiled
        function that validated its cache cells at some epoch may trust them while it is
        unchanged. */
@@ -909,6 +925,7 @@ struct JSRuntime {
     size_t regvm_chunks_bytes;   /* data bytes of the chunks in the live chain */
 #endif
     JSMegaEntry *mega_cache;
+    JSPutAddEntry *put_add_cache;
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
@@ -1355,6 +1372,7 @@ typedef struct JSReReq {
     LRERequired r;
     bool lit8_ok;          /* every unit of r.lit fits in 8 bits */
     uint8_t lit8[LRE_REQ_MAX];
+    const LreAotEntry *aot; /* the matcher this program carries for the bytecode, or NULL */
 } JSReReq;
 
 struct JSContext {
@@ -1730,6 +1748,22 @@ struct JSMegaEntry {
     JSAtom atom;
     uint32_t off_depth;
     uint32_t shape_epoch;
+};
+
+/* The add-transition cache shared by every store site: receiver shape + atom -> the shape after the add and the slot. A site whose
+   receivers have many shapes (a base constructor run for every subclass) keeps one transition in its own entry and misses on the
+   rest; this table holds them all. Both shapes are held by a counted reference, like the site entries' shapes, so an entry never
+   names a freed shape; it is good while no prototype interceptor has appeared (ic_watchpoint_epoch), the condition the per-site
+   entry already depends on. */
+#ifndef JS_PUTADD_BITS
+#define JS_PUTADD_BITS 10
+#endif
+struct JSPutAddEntry {
+    JSShape *shape;
+    JSShape *to_shape;
+    JSAtom atom;
+    uint32_t off;
+    uint32_t wp_epoch;
 };
 
 /* AOT ABI version, shared by the profiler digest and the AOT runtime. The
@@ -3153,6 +3187,7 @@ static void async_func_mark(JSRuntime *rt, JSAsyncFunctionState *s,
                             JS_MarkFunc *mark_func);
 static int JS_AddIntrinsicBasicObjects(JSContext *ctx);
 static void js_free_shape(JSRuntime *rt, JSShape *sh);
+static void js_putadd_release(JSRuntime *rt);
 static void js_free_shape_null(JSRuntime *rt, JSShape *sh);
 #if QJS_AOT_PROFILE
 static void aot_note_shape_freed(JSShape *sh);
@@ -4382,7 +4417,6 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     ms.malloc_count++;
     ms.malloc_size += rt->mf.js_malloc_usable_size(rt) + MALLOC_OVERHEAD;
     rt->malloc_state = ms;
-    rt->json_lazy_enabled = QJS_JSON_LAZY_DEFAULT;
     js_arena_init(rt);
     rt->malloc_gc_threshold = GC_MIN_STEP;
     rt->gc_pace_streak_cap = JS_GC_PACE_STREAK_DEFAULT;
@@ -4393,7 +4427,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     rt->gc_young_streak = 0;
     rt->gc_need_full = false;
     rt->gc_full_after = 0;
-    rt->gc_t0 = __builtin_ia32_rdtsc();
+    rt->gc_t0 = js_cycles();
     rt->gc_spent = 0;
     rt->gc_after_last = 0;
     rt->gc_yield_ok = true;
@@ -4762,10 +4796,11 @@ void JS_SetRuntimeInfo(JSRuntime *rt, const char *s)
         rt->rt_info = s;
 }
 
+/* Kept for API compatibility: JSON.parse is always eager, so this does nothing. */
 void JS_SetJSONLazyEnabled(JSRuntime *rt, bool enabled)
 {
-    if (rt)
-        rt->json_lazy_enabled = enabled;
+    (void)rt;
+    (void)enabled;
 }
 
 static void js_gc_promote_all_code(JSRuntime *rt);
@@ -4857,7 +4892,7 @@ static void y_formless_args_slow(JSValue this_obj, const JSValue *argv, int na)
         } } while (0)
 #define Y_VAL(v) (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(v)))
 static int y_tsc_on = -1;
-static inline uint64_t y_tsc(void) { if (unlikely(y_tsc_on < 0)) y_tsc_on = getenv("QJS_Y_STATS") != NULL; return y_tsc_on ? __builtin_ia32_rdtsc() : 0; }
+static inline uint64_t y_tsc(void) { if (unlikely(y_tsc_on < 0)) y_tsc_on = getenv("QJS_Y_STATS") != NULL; return y_tsc_on ? js_cycles() : 0; }
 #define Y_CHUNK_OF(p) ((YChunk *)((uintptr_t)(p) & ~((uintptr_t)y_chunk_sz - 1)))
 void qjs_y_trip(JSContext *ctx) { ctx->rt->zct_limit = 0; ctx->rt->zct_nobj += 1; }
 static void y_vec_push(YChunk ***v, uint32_t *n, uint32_t *cap, YChunk *c) {
@@ -5221,6 +5256,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     bool leak = false;
     int i;
 
+    js_putadd_release(rt);
     if (rt->forin_shape) {
         js_free_shape(rt, rt->forin_shape);
         rt->forin_shape = NULL;
@@ -5526,6 +5562,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     js_free_rt(rt, rt->shape_hash);
 #if !JS_MEGA_DISABLE
     js_free_rt(rt, rt->mega_cache);
+    js_free_rt(rt, rt->put_add_cache);
 #if QJS_REGVM_RECORD
     regvm_arena_free(rt);
     rt->regvm_frames = NULL;
@@ -9842,6 +9879,68 @@ static void js_megacache_fill(JSRuntime *rt, JSShape *recv_shape, JSAtom atom,
 }
 #endif
 
+static inline uint32_t js_putadd_slot(JSShape *shape, JSAtom atom)
+{
+    return (((uintptr_t)shape >> 5) ^ (uint32_t)atom * 2654435761u) & ((1u << JS_PUTADD_BITS) - 1);
+}
+
+static inline JSPutAddEntry *js_putadd_probe(JSRuntime *rt, JSShape *shape, JSAtom atom)
+{
+    JSPutAddEntry *e;
+    if (!rt->put_add_cache)
+        return NULL;
+    e = &rt->put_add_cache[js_putadd_slot(shape, atom)];
+    if (e->shape != shape || e->atom != atom || e->wp_epoch != rt->ic_watchpoint_epoch)
+        return NULL;
+    return e;
+}
+
+static void js_putadd_fill(JSRuntime *rt, JSShape *shape, JSAtom atom, JSShape *to_shape, uint32_t off)
+{
+    JSPutAddEntry *e;
+    if (rt->ic_watchpoint_epoch >= JS_IC_EPOCH_MAX)
+        return;
+    if (!rt->put_add_cache) {
+        rt->put_add_cache = js_calloc_rt(rt, 1u << JS_PUTADD_BITS, sizeof(*rt->put_add_cache));
+        if (!rt->put_add_cache)
+            return;
+    }
+    e = &rt->put_add_cache[js_putadd_slot(shape, atom)];
+    if (e->shape == shape && e->to_shape == to_shape && e->atom == atom) {
+        e->off = off;
+        e->wp_epoch = rt->ic_watchpoint_epoch;
+        return;
+    }
+    {
+        JSShape *old_a = e->shape, *old_b = e->to_shape;
+        e->shape = js_dup_shape(shape);
+        e->to_shape = js_dup_shape(to_shape);
+        e->atom = atom;
+        e->off = off;
+        e->wp_epoch = rt->ic_watchpoint_epoch;
+        if (old_a)
+            js_free_shape(rt, old_a);
+        if (old_b)
+            js_free_shape(rt, old_b);
+    }
+}
+
+static void js_putadd_release(JSRuntime *rt)
+{
+    uint32_t i;
+    if (!rt->put_add_cache)
+        return;
+    for (i = 0; i < (1u << JS_PUTADD_BITS); i++) {
+        JSPutAddEntry *e = &rt->put_add_cache[i];
+        JSShape *a = e->shape, *b = e->to_shape;
+        e->shape = e->to_shape = NULL;
+        if (a)
+            js_free_shape(rt, a);
+        if (b)
+            js_free_shape(rt, b);
+    }
+}
+
 #ifdef QJS_ICSTAT
 static void js_icstat_dump(void)
 {
@@ -12417,7 +12516,16 @@ static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
     uint32_t i, k;
     struct list_head *el;
     __builtin_unwind_init();
+#if defined(__x86_64__)
     __asm__ volatile("mov %%rsp, %0" : "=r"(lo));
+#elif defined(__aarch64__)
+    __asm__ volatile("mov %0, sp" : "=r"(lo));
+#else
+    {
+        volatile uintptr_t here = 0;
+        lo = (uintptr_t)&here;
+    }
+#endif
     ss_n = 0;
     ss_sw_n = 0;
     ss_sw_sorted = 0;
@@ -13406,7 +13514,7 @@ static JSObject **gc_y_set; static size_t gc_y_cap;
 static JSObject **gc_y_stk; static size_t gc_y_stk_cap;
 static size_t gc_young_n, gc_young_g;
 static uint64_t gc_ph[6];
-#define GC_PH(i) do { if (unlikely(gc_stat_on > 0)) { uint64_t t_ = __builtin_ia32_rdtsc(); if (i) gc_ph[i - 1] += t_ - gc_ph_t; gc_ph_t = t_; } } while (0)
+#define GC_PH(i) do { if (unlikely(gc_stat_on > 0)) { uint64_t t_ = js_cycles(); if (i) gc_ph[i - 1] += t_ - gc_ph_t; gc_ph_t = t_; } } while (0)
 static uint64_t gc_ph_t;
 #define GC_YOUNG_OLD_RUN 256
 
@@ -13684,7 +13792,7 @@ static void js_run_gc(JSRuntime *rt, bool young)
     size_t sz0 = rt->malloc_state.malloc_size;
     gc_stat_init();
     if (unlikely(gc_stat_on))
-        t0 = __builtin_ia32_rdtsc();
+        t0 = js_cycles();
 #if QJS_REGVM && QJS_DRC_VALIDATE
     js_drc_validate_roots(rt);
 #endif
@@ -13712,7 +13820,7 @@ static void js_run_gc(JSRuntime *rt, bool young)
 static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0)
 {
     uint64_t t1 = 0, t2 = 0, t3 = 0, t4 = 0, tp = 0;
-    uint64_t c_in = __builtin_ia32_rdtsc();
+    uint64_t c_in = js_cycles();
     size_t s_in = rt->malloc_state.malloc_size;
     if (unlikely(gc_stat_on))
         t1 = c_in;
@@ -13732,7 +13840,7 @@ static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0)
         uint64_t g = 0, ex = 0;
         int k = young;
 
-        tp = __builtin_ia32_rdtsc();
+        tp = js_cycles();
         if (young)
             g = gc_young_g;
         else
@@ -13749,12 +13857,12 @@ static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0)
         gc_stat[k].examined += ex;
         if (ex > gc_stat[k].max_examined)
             gc_stat[k].max_examined = ex;
-        t2 = __builtin_ia32_rdtsc();
+        t2 = js_cycles();
     }
     /* free the GC objects in a cycle */
     gc_free_cycles(rt);
     if (unlikely(gc_stat_on))
-        t3 = __builtin_ia32_rdtsc();
+        t3 = js_cycles();
     js_arena_trim(rt);
     if (!young) {
         rt->gc_young_streak = 0;
@@ -13769,12 +13877,12 @@ static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0)
 
         rt->gc_yield_ok = freed >= (swept >> 4);
         rt->gc_after_last = s_out;
-        rt->gc_spent += __builtin_ia32_rdtsc() - c_in;
+        rt->gc_spent += js_cycles() - c_in;
     }
     if (unlikely(gc_stat_on)) {
         int k = young;
 
-        t4 = __builtin_ia32_rdtsc();
+        t4 = js_cycles();
         gc_stat[k].n++;
         gc_stat[k].c_pin += t1 - t0;
         gc_stat[k].c_pass += tp - t1;
@@ -13827,7 +13935,7 @@ static bool js_gc_admit(JSRuntime *rt)
         return true;
     window = js_gc_pick_young(rt) ? (size > rt->gc_after_last ? size - rt->gc_after_last : 0) : size;
     est = (uint64_t)window * GC_ADMIT_CYC_PER_BYTE;
-    budget = (__builtin_ia32_rdtsc() - rt->gc_t0) / 16 + GC_ADMIT_ALLOWANCE;
+    budget = (js_cycles() - rt->gc_t0) / 16 + GC_ADMIT_ALLOWANCE;
     if (rt->gc_spent + est <= budget)
         return true;
     gc_admit_refused++;
@@ -13851,7 +13959,7 @@ static void js_gc_auto_pinned(JSRuntime *rt)
     gc_stat_init();
     if (young)
         rt->gc_young_streak++;
-    js_gc_passes(rt, young, unlikely(gc_stat_on) ? __builtin_ia32_rdtsc() : 0, sz0);
+    js_gc_passes(rt, young, unlikely(gc_stat_on) ? js_cycles() : 0, sz0);
     if (young && js_gc_full_due(rt))
         rt->gc_need_full = true;
     js_gc_rearm_pace(rt, sz0, rt->malloc_state.malloc_size);
@@ -15920,8 +16028,6 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     return js_autoinit_one(ctx, p, pr, prs);
 }
 
-static int js_lazy_marker_is(JSValueConst v);
-static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject *holder);
 
 static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                                       JSAtom prop, JSValueConst this_obj,
@@ -16008,8 +16114,6 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
                     continue;
                 }
             } else {
-                if (js_lazy_marker_is(pr->u.value))
-                    return js_lazy_materialize_slot(ctx, &pr->u.value, p);
                 return js_dup(pr->u.value);
             }
         }
@@ -16589,13 +16693,7 @@ retry:
                     goto retry;
                 }
             } else {
-                if (js_lazy_marker_is(pr->u.value)) {
-                    desc->value = js_lazy_materialize_slot(ctx, &pr->u.value, p);
-                    if (JS_IsException(desc->value))
-                        return -1;
-                } else {
-                    desc->value = js_dup(pr->u.value);
-                }
+                desc->value = js_dup(pr->u.value);
             }
         } else {
             if (pflags) {
@@ -16820,18 +16918,12 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
             v = JS_ARR_VALS_RD(p)[idx];
             if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED))
                 return false;
-            if (js_lazy_marker_is(v))
-                *pval = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
-            else
-                *pval = js_dup(v);
+            *pval = js_dup(v);
             return true;
         }
     case JS_CLASS_ARGUMENTS:
         if (unlikely(idx >= p->u.array.count)) return false;
-        if (js_lazy_marker_is(JS_ARR_VALS(p)[idx]))
-            *pval = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
-        else
-            *pval = js_dup(JS_ARR_VALS(p)[idx]);
+        *pval = js_dup(JS_ARR_VALS(p)[idx]);
         return true;
     case JS_CLASS_MAPPED_ARGUMENTS:
         if (unlikely(idx >= p->u.array.count)) return false;
@@ -18899,13 +18991,16 @@ static int aot_nnotes, aot_capnotes;
 static uint16_t aot_tag_class(JSValue v);
 
 /* The notes name shapes by address and hold no reference (a counted one would turn every in-place shape edit into a copy). A freed shape is
-   taken out at its free (aot_note_shape_freed): its note is marked dead, so a new shape at the same address starts a new note, and a note
-   slot that named it as the value shape becomes "several". Two open-addressed tables find a shape's note and the shapes that were ever noted
-   as a value shape; neither deletes (a dead note keeps its place in the probe chain). */
-#define AOT_NOTE_DEAD ((JSShape *)(uintptr_t)1)
-static int32_t *aot_nh;          /* shape -> note index + 1 */
-static uintptr_t *aot_vh;        /* shapes noted as a value shape */
-static uint32_t aot_nh_mask, aot_vh_mask, aot_vh_n;
+   taken out at its free (aot_note_shape_freed): its note is deleted, so a new shape at the same address starts a new note, and a note slot
+   that named it as the value shape becomes "several". The notes array holds only live shapes (a deleted note's place takes the last note), so
+   a program that makes and frees shapes all the time keeps it as small as its live shapes. Two open-addressed tables find a shape's note and
+   the live shapes that were noted as a value shape; a deletion leaves a tombstone, and a table is rebuilt without them when it fills. */
+#define AOT_NH_TOMB (-1)
+#define AOT_VH_TOMB ((uintptr_t)1)
+static int32_t *aot_nh;          /* shape -> note index + 1, or AOT_NH_TOMB */
+static uintptr_t *aot_vh;        /* shapes noted as a value shape, or AOT_VH_TOMB */
+static uint32_t aot_nh_mask, aot_vh_mask, aot_nh_used, aot_vh_used;  /* used: live entries plus tombstones */
+static int aot_note_last = -1;   /* the note aot_note_of found last */
 
 static uint32_t aot_ph(const void *p, uint32_t mask)
 {
@@ -18914,15 +19009,20 @@ static uint32_t aot_ph(const void *p, uint32_t mask)
 
 static void aot_vh_add(JSShape *sh)
 {
-    uint32_t h;
-    if (aot_vh == NULL || (aot_vh_n + 1) * 2 > aot_vh_mask + 1) {
+    uint32_t h, tomb = UINT32_MAX;
+    if (aot_vh == NULL || (aot_vh_used + 1) * 2 > aot_vh_mask + 1) {
         uintptr_t *old = aot_vh;
-        uint32_t om = aot_vh_mask, nm = old ? om * 2 + 1 : 1023, i;
-        uintptr_t *nt = (calloc)((size_t)nm + 1, sizeof(*nt));
+        uint32_t om = aot_vh_mask, live = 0, nm = 1023, i;
+        uintptr_t *nt;
+        for (i = 0; old && i <= om; i++)
+            live += old[i] > AOT_VH_TOMB;
+        while ((live + 1) * 4 > nm + 1)
+            nm = nm * 2 + 1;
+        nt = (calloc)((size_t)nm + 1, sizeof(*nt));
         if (nt == NULL)
             return;
         for (i = 0; old && i <= om; i++)
-            if (old[i]) {
+            if (old[i] > AOT_VH_TOMB) {
                 h = aot_ph((void *)old[i], nm);
                 while (nt[h]) h = (h + 1) & nm;
                 nt[h] = old[i];
@@ -18930,29 +19030,48 @@ static void aot_vh_add(JSShape *sh)
         (free)(old);
         aot_vh = nt;
         aot_vh_mask = nm;
+        aot_vh_used = live;
     }
     h = aot_ph(sh, aot_vh_mask);
     while (aot_vh[h]) {
         if (aot_vh[h] == (uintptr_t)sh)
             return;
+        if (aot_vh[h] == AOT_VH_TOMB && tomb == UINT32_MAX)
+            tomb = h;
         h = (h + 1) & aot_vh_mask;
     }
-    aot_vh[h] = (uintptr_t)sh;
-    aot_vh_n++;
+    if (tomb != UINT32_MAX) {
+        aot_vh[tomb] = (uintptr_t)sh;
+    } else {
+        aot_vh[h] = (uintptr_t)sh;
+        aot_vh_used++;
+    }
 }
 
-static int aot_vh_has(JSShape *sh)
+/* Takes `sh` out of the value-shape table; whether it was there. */
+static int aot_vh_del(JSShape *sh)
 {
     uint32_t h;
     if (aot_vh == NULL)
         return 0;
     h = aot_ph(sh, aot_vh_mask);
     while (aot_vh[h]) {
-        if (aot_vh[h] == (uintptr_t)sh)
+        if (aot_vh[h] == (uintptr_t)sh) {
+            aot_vh[h] = AOT_VH_TOMB;
             return 1;
+        }
         h = (h + 1) & aot_vh_mask;
     }
     return 0;
+}
+
+/* The table entry of the note at `idx`. */
+static uint32_t aot_nh_slot(int idx)
+{
+    uint32_t h = aot_ph(aot_notes[idx].sh, aot_nh_mask);
+    while (aot_nh[h] != idx + 1)
+        h = (h + 1) & aot_nh_mask;
+    return h;
 }
 
 static int aot_nh_find(JSShape *sh)
@@ -18962,21 +19081,25 @@ static int aot_nh_find(JSShape *sh)
         return -1;
     h = aot_ph(sh, aot_nh_mask);
     while (aot_nh[h]) {
-        if (aot_notes[aot_nh[h] - 1].sh == sh)
+        if (aot_nh[h] > 0 && aot_notes[aot_nh[h] - 1].sh == sh)
             return aot_nh[h] - 1;
         h = (h + 1) & aot_nh_mask;
     }
     return -1;
 }
 
-static void aot_nh_insert(JSShape *sh, int idx)
+/* Enters the note at `idx` (already in aot_notes) into the table; 0 when the table could not grow. */
+static int aot_nh_insert(JSShape *sh, int idx)
 {
     uint32_t h;
-    if (aot_nh == NULL || (uint32_t)(aot_nnotes + 1) * 2 > aot_nh_mask + 1) {
-        uint32_t nm = aot_nh ? aot_nh_mask * 2 + 1 : 1023, i;
-        int32_t *nt = (calloc)((size_t)nm + 1, sizeof(*nt));
+    if (aot_nh == NULL || (aot_nh_used + 1) * 2 > aot_nh_mask + 1) {
+        uint32_t nm = 1023, i;
+        int32_t *nt;
+        while ((uint32_t)(aot_nnotes + 1) * 4 > nm + 1)
+            nm = nm * 2 + 1;
+        nt = (calloc)((size_t)nm + 1, sizeof(*nt));
         if (nt == NULL)
-            return;
+            return 0;
         for (i = 0; i < (uint32_t)aot_nnotes; i++) {
             if (i == (uint32_t)idx)
                 continue;
@@ -18987,20 +19110,32 @@ static void aot_nh_insert(JSShape *sh, int idx)
         (free)(aot_nh);
         aot_nh = nt;
         aot_nh_mask = nm;
+        aot_nh_used = (uint32_t)aot_nnotes - 1;
     }
     h = aot_ph(sh, aot_nh_mask);
-    while (aot_nh[h]) h = (h + 1) & aot_nh_mask;
+    while (aot_nh[h] > 0) h = (h + 1) & aot_nh_mask;
+    if (aot_nh[h] == 0)
+        aot_nh_used++;
     aot_nh[h] = idx + 1;
+    return 1;
 }
 
 static void aot_note_shape_freed(JSShape *sh)
 {
-    int i;
+    int i, last;
     if (aot_nnotes == 0)
         return;
-    if ((i = aot_nh_find(sh)) >= 0)
-        aot_notes[i].sh = AOT_NOTE_DEAD;
-    if (aot_vh_has(sh)) {
+    if ((i = aot_nh_find(sh)) >= 0) {
+        aot_nh[aot_nh_slot(i)] = AOT_NH_TOMB;
+        last = aot_nnotes - 1;
+        if (i != last) {
+            aot_nh[aot_nh_slot(last)] = i + 1;
+            aot_notes[i] = aot_notes[last];
+        }
+        aot_nnotes--;
+        aot_note_last = -1;
+    }
+    if (aot_vh_del(sh)) {
         int k, sl;
         for (k = 0; k < aot_nnotes; k++)
             for (sl = 0; sl < AOT_NOTE_SLOTS; sl++)
@@ -19013,10 +19148,9 @@ static void aot_note_shape_freed(JSShape *sh)
 
 static AotNote *aot_note_of(JSShape *sh)
 {
-    static int last = -1;
     int i;
-    if (last >= 0 && aot_notes[last].sh == sh)
-        return &aot_notes[last];
+    if (aot_note_last >= 0 && aot_notes[aot_note_last].sh == sh)
+        return &aot_notes[aot_note_last];
     if ((i = aot_nh_find(sh)) >= 0)
         goto found;
     if (aot_nnotes == aot_capnotes) {
@@ -19030,9 +19164,12 @@ static AotNote *aot_note_of(JSShape *sh)
     memset(&aot_notes[aot_nnotes], 0, sizeof(aot_notes[0]));
     aot_notes[aot_nnotes].sh = sh;
     i = aot_nnotes++;
-    aot_nh_insert(sh, i);
+    if (!aot_nh_insert(sh, i)) {
+        aot_nnotes--;
+        return NULL;
+    }
 found:
-    last = i;
+    aot_note_last = i;
     return &aot_notes[i];
 }
 
@@ -23598,6 +23735,204 @@ static JSValue js_bigint_to_string(JSContext *ctx, JSValueConst val)
 
 /*---- floating point number to string conversions ----*/
 
+/* Write sign, then R with k fraction digits (R > 0, k >= 0), trailing fraction zeros dropped, in the fixed notation of
+   Number.prototype.toString; returns the length (buf is NUL-terminated). */
+static int dtoa_fixed_out(char *buf, bool neg, uint64_t r, int k)
+{
+    char dig[24];
+    int nd = 0, i, n = 0;
+
+    static const char d2[201] =
+        "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+        "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
+        "8081828384858687888990919293949596979899";
+
+    while (k > 0 && r % 10 == 0) {
+        r /= 10;
+        k--;
+    }
+    /* least significant first, two digits at a time */
+    while (r >= 100) {
+        unsigned t = (unsigned)(r % 100);
+        r /= 100;
+        dig[nd++] = d2[2 * t + 1];
+        dig[nd++] = d2[2 * t];
+    }
+    if (r >= 10) {
+        dig[nd++] = d2[2 * r + 1];
+        dig[nd++] = d2[2 * r];
+    } else {
+        dig[nd++] = (char)('0' + r);
+    }
+    if (neg)
+        buf[n++] = '-';
+    if (nd <= k) {
+        buf[n++] = '0';
+        buf[n++] = '.';
+        for (i = 0; i < k - nd; i++)
+            buf[n++] = '0';
+        for (i = nd - 1; i >= 0; i--)
+            buf[n++] = dig[i];
+    } else {
+        for (i = nd - 1; i >= 0; i--) {
+            buf[n++] = dig[i];
+            if (i == k && k > 0)
+                buf[n++] = '.';
+        }
+    }
+    buf[n] = '\0';
+    return n;
+}
+
+#ifdef __SIZEOF_INT128__
+/* For a = |d| = m * 2^q, normal, non-integral, below 2^53, the shortest decimal in a's rounding interval when it has 16 or 17
+   significant digits, nearest to a (ties to even), in exact 128-bit integer arithmetic. Returns 1 with *pr / *pk (R and its
+   fraction digits), 2 when one of 15 or fewer digits exists (the caller's float loop finds it), -1 out of range.
+   In units of 2^(q-2): a is V = 4m and the interval is [V - lo, V + 2] (lo = 1 at a power of two, where the gap below is half the
+   gap above, else 2), closed when m is even (round-half-even maps the ends to a), open otherwise. At the scale k where
+   X = a * 10^k has 17 integer digits (T = V * 10^k, S = 2 - q, floor(X) = T >> S), the interval holds the integers
+   lowB..highB; a decimal of 17 - t significant digits in it is a multiple of 10^t there, so 15 or fewer digits exist when a
+   multiple of 100 is in range, else 16 when a multiple of 10 is, else 17. The nearest one to X is the multiple just below or
+   just above X; their distances are compared exactly. */
+static int dtoa_exact_shortest(uint64_t m, int q, uint64_t *pr, int *pk)
+{
+    static const uint64_t p10[20] = {
+        1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL,
+        10000000000ULL, 100000000000ULL, 1000000000000ULL, 10000000000000ULL, 100000000000000ULL,
+        1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL, 1000000000000000000ULL,
+        10000000000000000000ULL,
+    };
+    typedef unsigned __int128 u128;
+    int S = 2 - q, k, tries, e2, e10;
+    u128 V = (u128)m << 2, T = 0, pk10 = 0, one, mask, lo_n, hi_n, A, B;
+    uint64_t rf = 0, lo, lowB, highB, unit, cl, ch, c;
+    bool closed = (m & 1) == 0, okl, okh;
+
+    if (S < 3 || S > 120)
+        return -1;
+    lo = (m == ((uint64_t)1 << 52)) ? 1 : 2;
+    /* 2^e2 <= a < 2^(e2 + 1); e10 estimates floor(log10(a)) to within one, corrected exactly below */
+    e2 = q + 52;
+    e10 = e2 >= 0 ? (e2 * 78913) >> 18 : -((-e2 * 78913 + (1 << 18) - 1) >> 18);
+    k = 16 - e10;
+    for (tries = 0; tries < 8; tries++) {
+        if (k < 0 || k > 21)
+            return -1;
+        pk10 = k <= 19 ? (u128)p10[k] : (u128)p10[19] * p10[k - 19];
+        T = V * pk10;
+        if ((T >> S) >> 64)
+            return -1;
+        rf = (uint64_t)(T >> S);
+        if (rf < p10[16]) {
+            k++;
+            continue;
+        }
+        if (rf >= p10[17]) {
+            k--;
+            continue;
+        }
+        break;
+    }
+    if (tries == 8)
+        return -1;
+    one = (u128)1 << S;
+    mask = one - 1;
+    lo_n = (V - lo) * pk10;
+    hi_n = (V + 2) * pk10;
+    lowB = (uint64_t)(lo_n >> S) + (((lo_n & mask) != 0) || !closed);
+    highB = (uint64_t)(hi_n >> S) - (((hi_n & mask) == 0) && !closed);
+    if ((lowB + 99) / 100 * 100 <= highB)
+        return 2;
+    for (unit = 10;; unit = 1) {
+        cl = rf / unit * unit;
+        ch = cl + unit;
+        A = ((u128)(rf - cl) << S) + (T & mask); /* X - cl, in units of 2^-S */
+        B = ((u128)unit << S) - A;              /* ch - X */
+        okl = cl >= lowB && cl <= highB;
+        okh = ch >= lowB && ch <= highB;
+        if (okl && okh) {
+            if (A < B)
+                okh = false;
+            else if (A > B)
+                okl = false;
+            else if ((cl / unit) & 1)
+                okl = false;
+            else
+                okh = false;
+        }
+        if (okl)
+            c = cl;
+        else if (okh)
+            c = ch;
+        else if (unit == 10)
+            continue;
+        else
+            return -1;
+        if (c >= p10[17])
+            return -1;
+        *pr = c / unit;
+        *pk = k - (unit == 10);
+        return 1;
+    }
+}
+#endif
+
+/* The shortest round-trip decimal of d in the fixed notation of Number.prototype.toString, when 1e-6 <= |d| < 1e15; 0 (nothing
+   written) when it is not found here.
+   - At most 15 significant digits: for the smallest k with R = round(|d| * 10^k) and R / 10^k == |d| (both exact doubles,
+     R <= 2^53 and k <= 15, so the division is rounded once and the test is the round trip), R/10^k is the answer: no decimal with
+     fewer fraction digits round-trips, and at most one decimal of 15 or fewer significant digits rounds to a given double, so it is
+     also the one nearest to d.
+   - 16 or 17: dtoa_exact_shortest, which also says when 15 or fewer exist, so the float loop runs only then. */
+static int js_dtoa_short(char *buf, double d)
+{
+    static const double p10[16] = { 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15 };
+    double a = fabs(d), v;
+    uint64_t r;
+    int k;
+
+    if (!(a >= 1e-6 && a < 1e15))
+        return 0;
+#ifdef __SIZEOF_INT128__
+    {
+        uint64_t u, m;
+        int be, q, ret;
+        memcpy(&u, &a, sizeof(u));
+        be = (int)(u >> 52);
+        m = (u & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
+        q = be - 1075;
+        /* non-integral: below 1 (q <= -53), or some of the -q fraction bits set */
+        if (q < 0 && (q <= -53 || (m & ((((uint64_t)1) << -q) - 1)) != 0)) {
+            ret = dtoa_exact_shortest(m, q, &r, &k);
+            if (ret == 1)
+                return dtoa_fixed_out(buf, d < 0, r, k);
+            /* 2: 15 digits or fewer, found by the float loop; -1: out of range, the float loop or js_dtoa */
+        }
+    }
+#endif
+    for (k = 0; k <= 15; k++) {
+        v = a * p10[k];
+        if (v >= 9007199254740992.0)
+            return 0;
+        r = (uint64_t)(v + 0.5);
+        if ((double)r / p10[k] == a)
+            break;
+    }
+    if (k > 15 || r == 0)
+        return 0;
+    {
+        uint64_t t = r;
+        int nd = 0;
+        while (t != 0) {
+            nd++;
+            t /= 10;
+        }
+        if (nd > 15)
+            return 0;
+    }
+    return dtoa_fixed_out(buf, d < 0, r, k);
+}
+
 static JSValue js_dtoa2(JSContext *ctx,
                         double d, int radix, int n_digits, int flags)
 {
@@ -23605,6 +23940,11 @@ static JSValue js_dtoa2(JSContext *ctx,
     int len, len_max;
     JSValue res;
     JSDTOATempMem dtoa_mem;
+    if (radix == 10 && flags == JS_DTOA_FORMAT_FREE) {
+        len = js_dtoa_short(static_buf, d);
+        if (len > 0)
+            return js_new_string8_len(ctx, static_buf, len);
+    }
     len_max = js_dtoa_max_len(d, radix, n_digits, flags);
 
     /* longer buffer may be used if radix != 10 */
@@ -23728,13 +24068,45 @@ static const uint8_t json_quote_needs_escape[256] = {
     [0x5c] = 1,
 };
 
+/* str8 with the common case (a normal string, as every StringBuffer's is) inline */
+static inline __attribute__((always_inline)) uint8_t *json_str8(JSString *p)
+{
+    return likely(p->kind == JS_STRING_KIND_NORMAL) ? (uint8_t *)&p[1] : str8(p);
+}
+
+/* string_buffer_putc8 with its common case inline: room left in an 8-bit buffer */
+static inline __attribute__((always_inline)) int json_putc8(StringBuffer *b, uint32_t c)
+{
+    if (likely(b->len < b->size && !b->is_wide_char)) {
+        json_str8(b->str)[b->len++] = c;
+        return 0;
+    }
+    return string_buffer_putc8(b, c);
+}
+
+static inline const uint8_t *json_scan_plain(const uint8_t *q, const uint8_t *end, bool latin1);
+
 static int json_quote_str(StringBuffer *b, JSString *p)
 {
     char buf[16];
     uint32_t c;
     int i;
 
-    if (string_buffer_putc8(b, '\"'))
+    /* an 8-bit string with nothing to escape, into an 8-bit buffer with room: one scan, one copy */
+    if (!p->is_wide_char && !b->is_wide_char && b->size - b->len >= (int)p->len + 2) {
+        const uint8_t *s8 = json_str8(p);
+        uint32_t n = p->len;
+        if (json_scan_plain(s8, s8 + n, true) == s8 + n) {
+            uint8_t *d = json_str8(b->str) + b->len;
+            d[0] = '\"';
+            memcpy(d + 1, s8, n);
+            d[n + 1] = '\"';
+            b->len += n + 2;
+            return 0;
+        }
+    }
+
+    if (json_putc8(b, '\"'))
         return -1;
 
     if (!p->is_wide_char) {
@@ -23763,9 +24135,9 @@ static int json_quote_str(StringBuffer *b, JSString *p)
             case '\"':
             case '\\':
             quote8:
-                if (string_buffer_putc8(b, '\\'))
+                if (json_putc8(b, '\\'))
                     return -1;
-                if (string_buffer_putc8(b, c))
+                if (json_putc8(b, c))
                     return -1;
                 break;
             default: /* remaining control chars < 0x20 */
@@ -23775,7 +24147,7 @@ static int json_quote_str(StringBuffer *b, JSString *p)
                 break;
             }
         }
-        return string_buffer_putc8(b, '\"');
+        return json_putc8(b, '\"');
     }
 
 
@@ -23790,9 +24162,9 @@ static int json_quote_str(StringBuffer *b, JSString *p)
         case '\"':
         case '\\':
         quote:
-            if (string_buffer_putc8(b, '\\'))
+            if (json_putc8(b, '\\'))
                 return -1;
-            if (string_buffer_putc8(b, c))
+            if (json_putc8(b, c))
                 return -1;
             break;
         default:
@@ -23807,7 +24179,7 @@ static int json_quote_str(StringBuffer *b, JSString *p)
             break;
         }
     }
-    return string_buffer_putc8(b, '\"');
+    return json_putc8(b, '\"');
 }
 
 static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
@@ -28014,10 +28386,7 @@ static JSValue js_u3_el_recv(JSContext *ctx, JSStackFrame *sf,
         if (likely(p->class_id == JS_CLASS_ARRAY &&
                    idx < p->u.array.count && JS_ARR_GENERIC(p) &&
                    !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
-            if (js_lazy_marker_is(JS_ARR_VALS(p)[idx]))
-                val = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
-            else
-                val = js_dup(JS_ARR_VALS(p)[idx]);
+            val = js_dup(JS_ARR_VALS(p)[idx]);
             JS_FreeValue(ctx, key);
             return val;
         }
@@ -28229,11 +28598,7 @@ JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_get_field(JSContext *ctx, uint8_t
                 /* found */
                 if (unlikely(prs->flags & JS_PROP_TMASK))
                     goto get_field_slow_path;
-                if (js_lazy_marker_is(pr->u.value)) {
-                    val = js_lazy_materialize_slot(ctx, &pr->u.value, p);
-                } else {
-                    val = js_dup(pr->u.value);
-                }
+                val = js_dup(pr->u.value);
                 break;
             }
             if (unlikely(p->is_exotic)) {
@@ -29135,13 +29500,16 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
  * counted reference does not stop an unhashed shape from being mutated in
  * place; a hashed one with refcount >= 2 is copy-on-write, which the hit path
  * needs. The hash is recomputed from the property list because `sh->hash` is
- * only maintained while `is_hashed`.
+ * only maintained while `is_hashed`. A shape with a deleted property is left
+ * as it is: every delete makes its own copy, which no transition reaches, so
+ * hashing them puts one more equal shape in the same bucket per object and
+ * each free walks the chain. Its sites take the uncached path.
  */
 static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh)
 {
     uint32_t h, i;
 
-    if (sh->is_hashed)
+    if (sh->is_hashed || sh->deleted_prop_count != 0)
         return;
     if (2 * (rt->shape_hash_count + 1) > rt->shape_hash_size)
         resize_shape_hash(rt, rt->shape_hash_bits + 1);
@@ -29213,10 +29581,6 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
     }
     /* A data property, and not an array/string `length`. */
     if (prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH))
-        return;
-    /* The hit path sends a lazy slot to the slow path, so caching one would
-       only bounce. */
-    if (js_lazy_marker_is(pr->u.value))
         return;
 
     rsh = p->shape;
@@ -29474,8 +29838,6 @@ static inline __attribute__((always_inline)) int regvm_poly_read_hit(
     } else {
         return 0;
     }
-    if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON))
-        return 0;
     *out = v;
     *phit = e;
     return 1;
@@ -29491,8 +29853,7 @@ static __attribute__((noinline)) int regvm_mega_read(JSRuntime *rt, JSObject *p,
         !(p->class_id == JS_CLASS_ARRAY && !__JS_AtomIsTaggedInt(atom)))
         return 0;
     if (js_megacache_probe(rt, p, atom, &holder, &offset) &&
-        !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK) &&
-        !js_lazy_marker_is(holder->prop[offset].u.value)) {
+        !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK)) {
         *out = holder->prop[offset].u.value;
         return 1;
     }
@@ -29608,8 +29969,7 @@ static __attribute__((noinline)) JSValue regvm_get_field_ic_slow0(JSContext *ctx
              (recv_obj->class_id == JS_CLASS_ARRAY &&
               !__JS_AtomIsTaggedInt(atom))) &&
             js_megacache_probe(ctx->rt, recv_obj, atom, &holder, &offset) &&
-            !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK) &&
-            !js_lazy_marker_is(holder->prop[offset].u.value))
+            !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK))
             return js_dup(holder->prop[offset].u.value);
     }
     val = JS_GetPropertyInternal(ctx, recv, atom, recv, false);
@@ -29644,7 +30004,7 @@ uint64_t js_regvm_put_hit, js_regvm_put_direct, js_regvm_put_slow, js_regvm_put_
 static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
                                JSRegPIC **ppic, JSValue recv, JSAtom atom,
                                int site, JSShape *pre_sh, uint32_t pre_count,
-                               int prof_was_own)
+                               int prof_was_own, int site_ok)
 {
     JSRuntime *rt = ctx->rt;
     JSObject *p;
@@ -29694,7 +30054,7 @@ regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
         /* Saturated: the epoch can no longer say that a prototype changed. The store is replayed as "append this property"
            only when it was a plain add (see ic_store_is_plain_add). */
         int plain_add = rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX && ic_store_is_plain_add(pre_sh, atom);
-        if (plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
+        if (site_ok && plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
             int s2 = b->regvm_pic_count + site;
             AOT_THRASH(b, site);
 regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
@@ -29702,6 +30062,8 @@ regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
                               (uint32_t)(pr - p->prop));
             pic[s2].misses = (uint16_t)rt->ic_watchpoint_epoch;
         }
+        if (!site_ok && plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1)
+            js_putadd_fill(rt, pre_sh, atom, nsh, (uint32_t)(pr - p->prop));
     }
 }
 
@@ -29710,32 +30072,11 @@ regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
    appeared. Grow the property array if needed, install the new shape, and
    write the slot with a duplicated value. Returns 1 on a hit, 0 on a miss, -1
    after an allocation threw. */
-static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
-                                   JSRegPIC *pic, JSObject *p, JSValue v,
-                                   int site, int yok)
+static inline __attribute__((always_inline)) int regvm_put_add_apply_i(JSContext *ctx, JSFunctionBytecode *b, JSObject *p, JSValue v,
+                                                                       int site, int yok, JSShape *nsh, uint32_t off)
 {
-    JSRegPIC *e;
-    JSShape *nsh, *osh;
-    uint32_t off;
+    JSShape *osh = p->shape;
 
-    if (b->regvm_pic == NULL || b->regvm_pic_count == 0)
-        return 0;
-    e = &pic[b->regvm_pic_count + site];
-    if (e->shape != p->shape || e->kind != REG_PIC_ADD_W)
-        return 0;
-    if (!p->extensible || p->is_exotic)
-        return 0;
-    /* a property added to a prototype is the generic add's to make: it moves the watchpoint epoch */
-    if (unlikely(p->is_prototype))
-        return 0;
-    if (e->misses != (uint16_t)ctx->rt->ic_watchpoint_epoch)
-        return 0;                   /* a prototype interceptor appeared */
-    /* a nursery cell owns no shape reference and counts none of its edges until
-       it is promoted; the swap below moves counted references, so it is the
-       ordinary object's to make */
-    nsh = b->regvm_pic_holder[b->regvm_pic_count + site];
-    off = e->slot_off / (uint32_t)sizeof(JSProperty);
-    osh = p->shape;
     if (yok && Y_YOUNG(p)) {
         if ((uint32_t)nsh->prop_size <= p->prop_inline_cap && !p->gv_watched) {
             /* The cell takes the new shape without a reference and the value without a count; the value's own count is the caller's,
@@ -29775,6 +30116,38 @@ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
     return 1;
 }
 
+/* The shared table's replay is off the interpreter's hot path: one out-of-line copy. */
+static __attribute__((noinline)) int regvm_put_add_apply(JSContext *ctx, JSFunctionBytecode *b, JSObject *p, JSValue v,
+                                                         int site, int yok, JSShape *nsh, uint32_t off)
+{
+    return regvm_put_add_apply_i(ctx, b, p, v, site, yok, nsh, off);
+}
+
+static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
+                                   JSRegPIC *pic, JSObject *p, JSValue v,
+                                   int site, int yok)
+{
+    JSRegPIC *e;
+
+    if (b->regvm_pic == NULL || b->regvm_pic_count == 0)
+        return 0;
+    e = &pic[b->regvm_pic_count + site];
+    if (e->shape != p->shape || e->kind != REG_PIC_ADD_W)
+        return 0;
+    if (!p->extensible || p->is_exotic)
+        return 0;
+    /* a property added to a prototype is the generic add's to make: it moves the watchpoint epoch */
+    if (unlikely(p->is_prototype))
+        return 0;
+    if (e->misses != (uint16_t)ctx->rt->ic_watchpoint_epoch)
+        return 0;                   /* a prototype interceptor appeared */
+    /* a nursery cell owns no shape reference and counts none of its edges until
+       it is promoted; the swap below moves counted references, so it is the
+       ordinary object's to make */
+    return regvm_put_add_apply_i(ctx, b, p, v, site, yok, b->regvm_pic_holder[b->regvm_pic_count + site],
+                               e->slot_off / (uint32_t)sizeof(JSProperty));
+}
+
 /* The register store for a site-bearing instruction. The pre-add shape is
    snapshotted before the store so a fresh add can be cached as a
    transition. */
@@ -29789,6 +30162,7 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b,
     int ret;
     JSShape *sprof_pre = NULL;      /* profile only: the receiver's shape before the store, referenced */
     int sprof_cnt = 0, sprof_own = 0;
+    int site_ok = 1;
 
     if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
         JSObject *po = JS_VALUE_GET_OBJ(recv);
@@ -29810,10 +30184,23 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b,
 #endif
         if (*ppic != NULL && b->regvm_pic_count != 0)
             e2 = &(*ppic)[b->regvm_pic_count + site];
-        /* Snapshot only when the site has no transition yet or holds this exact
-           pre-add shape; a polymorphic site is left alone. */
-        if ((e2 == NULL || e2->kind == REG_PIC_EMPTY || e2->shape == po->shape) &&
-            po->extensible && !po->is_exotic && po->shape->is_hashed) {
+        /* A store whose receiver shape and atom the shared add-transition table knows is replayed from it: the site's own entry
+           holds one transition, and a base constructor run for many subclasses sees one receiver shape per subclass. */
+        if (po->extensible && !po->is_exotic && !po->is_prototype && po->shape->is_hashed &&
+            e2 != NULL && e2->kind != REG_PIC_EMPTY && e2->shape != po->shape) {
+            JSPutAddEntry *pe = js_putadd_probe(rt, po->shape, atom);
+            if (pe != NULL) {
+                int ah = regvm_put_add_apply(ctx, b, po, val, site, 0, pe->to_shape, pe->off);
+                if (ah != 0) {
+                    ret = ah < 0 ? -1 : 0;
+                    goto stored;
+                }
+            }
+        }
+        /* Snapshot for the shared table always, and for the site's own entry only when it has no transition yet or holds this
+           exact pre-add shape (a polymorphic site's entry is left alone). */
+        site_ok = e2 == NULL || e2->kind == REG_PIC_EMPTY || e2->shape == po->shape;
+        if (po->extensible && !po->is_exotic && po->shape->is_hashed) {
             JSProperty *pr0;
             if (!find_own_property(&pr0, po, atom)) {
                 pre_sh = js_dup_shape(po->shape);
@@ -29825,9 +30212,10 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b,
                                   JS_PROP_THROW_STRICT);
     if (likely(ret >= 0))
         regvm_put_pic_fill(ctx, b, ppic, recv, atom, site, pre_sh, pre_count,
-                           prof_was_own);
+                           prof_was_own, site_ok);
     if (pre_sh)
         js_free_shape(rt, pre_sh);
+ stored:
 #if QJS_AOT_PROFILE
     if (AOT_PROF_ON(b)) {
         int cls = AOT_STORE_OTHER, slot = -1;
@@ -29897,12 +30285,8 @@ static inline __attribute__((always_inline)) int regvm_own_read_hit(
 #if QJS_DRC
     /* A register read borrows the property's reference. Only the lazy-JSON
        marker still goes to the slow path. */
-    if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON))
-        return 0;
 #else
     if (unlikely(JS_VALUE_GET_TAG(v) < 0)) {
-        if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON))
-            return 0;                   /* the slow path materializes it */
         JS_REF_COUNT(JS_VALUE_GET_PTR(v))++;
     }
 #endif
@@ -30753,6 +31137,7 @@ typedef struct FnSampleEntry {
     const JSFunctionBytecode *b;
     char name[120];
     char pos[80];
+    char dg[33];
     uint32_t samples;
     uint32_t in_unit;
     uint8_t named;
@@ -30988,6 +31373,14 @@ static void fn_sample_name(const struct JSFunctionBytecode *b)
         JS_AtomGetStrRT(fn_sample_rt, e->name, sizeof(e->name), b->func_name);
     else
         snprintf(e->name, sizeof(e->name), "<anon>");
+    {
+        uint8_t d[16];
+        int di;
+
+        js_aot_digest((JSFunctionBytecode *)b, d);
+        for (di = 0; di < 16; di++)
+            snprintf(e->dg + di * 2, 3, "%02x", d[di]);
+    }
     e->named = 1;
 }
 
@@ -31061,8 +31454,8 @@ static void fn_sample_stop(JSRuntime *rt)
 #else
                 st = "absent";
 #endif
-                fprintf(f, "F %u %u key=%d state=%s %s %s\n", e->samples,
-                        e->in_unit, i, st,
+                fprintf(f, "F %u %u key=%d state=%s dg=%s %s %s\n", e->samples,
+                        e->in_unit, i, st, e->dg,
                         e->named ? e->name : "<anon>", e->pos);
             }
             /* P <key> <pc hex>, one per in-JS sample, in sample order. */
@@ -31294,7 +31687,12 @@ static JSAotRbcEnt *rbc_tab;
 static uint32_t rbc_cap, rbc_n, rbc_used;
 #define RBC_TOMB ((JSFunctionBytecode *)1)
 static uint32_t rbc_hash(const uint8_t *d) { uint64_t h; memcpy(&h, d, 8); return (uint32_t)((h * 0x9E3779B97F4A7C15ull) >> 40); }
-static void rbc_add(const uint8_t *d, JSFunctionBytecode *b)
+/* The table is process-wide and only the runtime that owns the unit registers in it; the lock covers the moment before ownership is
+   settled, when runtimes on several threads bind their first bytecodes together. */
+static int rbc_lock_word;
+static void rbc_lock(void) { while (__atomic_exchange_n(&rbc_lock_word, 1, __ATOMIC_ACQUIRE)) ; }
+static void rbc_unlock(void) { __atomic_store_n(&rbc_lock_word, 0, __ATOMIC_RELEASE); }
+static void rbc_add_locked(const uint8_t *d, JSFunctionBytecode *b)
 {
     uint32_t i;
     if ((rbc_used + 1) * 2 > rbc_cap) {
@@ -31315,19 +31713,32 @@ static void rbc_add(const uint8_t *d, JSFunctionBytecode *b)
     if (!rbc_tab[i].b) rbc_used++;
     memcpy(rbc_tab[i].d, d, 16); rbc_tab[i].b = b; rbc_n++;
 }
+static void rbc_add(const uint8_t *d, JSFunctionBytecode *b)
+{
+    rbc_lock();
+    rbc_add_locked(d, b);
+    rbc_unlock();
+}
 static void rbc_del(JSFunctionBytecode *b)
 {
     uint32_t k;
+    rbc_lock();
     for (k = 0; k < rbc_cap; k++)
         if (rbc_tab[k].b == b) { rbc_tab[k].b = RBC_TOMB; rbc_n--; }
+    rbc_unlock();
 }
 static JSFunctionBytecode *rbc_find(const uint8_t *d)
 {
     uint32_t i;
-    if (!rbc_cap) return NULL;
-    for (i = rbc_hash(d) & (rbc_cap - 1); rbc_tab[i].b; i = (i + 1) & (rbc_cap - 1))
-        if (rbc_tab[i].b != RBC_TOMB && memcmp(rbc_tab[i].d, d, 16) == 0) return rbc_tab[i].b;
-    return NULL;
+    JSFunctionBytecode *r = NULL;
+    /* Backtrace building only (never a signal handler), so the lock is uncontended and off every hot path. */
+    rbc_lock();
+    if (rbc_cap) {
+        for (i = rbc_hash(d) & (rbc_cap - 1); rbc_tab[i].b; i = (i + 1) & (rbc_cap - 1))
+            if (rbc_tab[i].b != RBC_TOMB && memcmp(rbc_tab[i].d, d, 16) == 0) { r = rbc_tab[i].b; break; }
+    }
+    rbc_unlock();
+    return r;
 }
 static JSFunctionBytecode *rat_bc(const uint8_t *d)
 {
@@ -32190,7 +32601,6 @@ static uint8_t *REGVM_CC regvm_t_get_global(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_get_global_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_get_element_slow(REGVM_ARGS);
-static uint8_t *REGVM_CC regvm_t_get_element_lazy_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_get_field(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_get_field_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_get_field_own(REGVM_ARGS);
@@ -33447,6 +33857,13 @@ static inline void regvm_light_seal(JSRuntime *rt, JSRegRun *lf)
         if (top > rt->regvm_frames_top)
             rt->regvm_frames_top = top;
     }
+}
+
+/* The seal for the native-entry call sites in the call machinery, kept out of
+   line so those hot paths carry one test and a call. */
+static __attribute__((noinline)) void regvm_light_seal_out(JSRuntime *rt, JSRegRun *lf)
+{
+    regvm_light_seal(rt, lf);
 }
 
 /* Build the callee light frame and return it, or NULL when the chunk is full.
@@ -34938,18 +35355,6 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_element_slow(REGV
     T_SET_NEXT_P(d, val, T_SZ_RRR);
 }
 
-/* cold: a lazy-JSON slot must be materialised before it is read, which can
-   recurse and allocate. */
-static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_element_lazy_slow(
-    REGVM_ARGS)
-{
-    int d = T_REG(1);
-    JSObject *p = JS_VALUE_GET_OBJ(FR(T_REG(3)));
-    uint32_t idx = JS_VALUE_GET_INT(FR(T_REG(5)));
-    JSValue val = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
-    T_SET_NEXT_P(d, val, T_SZ_RRR);
-}
-
 static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
 {
     int d = T_REG(1);
@@ -34968,9 +35373,6 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
 #ifdef QJS_REGVM_COUNT
             js_regvm_elem[0]++;
 #endif
-            if (unlikely(js_lazy_marker_is(JS_ARR_VALS_RD(p)[idx])))
-                __attribute__((musttail))
-                    return regvm_t_get_element_lazy_slow(REGVM_PASS);
             AOT_PROF_ELEM(f->b, JS_ARR_VALS_RD(p)[idx], 0);
             AOT_PROF_PACKED(f->b, p);
             T_SET_NEXT_B(d,JS_ARR_VALS_RD(p)[idx], T_SZ_RRR);
@@ -35095,7 +35497,7 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
                 JSValue v = *(JSValue *)((char *)p->prop + e->slot_off); \
                 if (likely(JS_VALUE_GET_TAG(v) >= 0)) { \
                     T_SET_NEXT_B(d, v, T_SZ_RRAS); \
-                } else if (likely(JS_VALUE_GET_TAG(v) != JS_TAG_LAZY_JSON)) { \
+                } else { \
                     T_OWN_STORE(d, v, T_SZ_RRAS); \
                 } \
             } \
@@ -35318,7 +35720,7 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS)
             v1 = *(JSValue *)((char *)p->prop + e->slot_off);
             if (likely(JS_VALUE_GET_TAG(v1) >= 0)) {
                 goto have_v1;
-            } else if (likely(JS_VALUE_GET_TAG(v1) != JS_TAG_LAZY_JSON)) {
+            } else {
 #if !QJS_DRC
                 JS_REF_COUNT(JS_VALUE_GET_PTR(v1))++;
 #endif
@@ -35349,7 +35751,7 @@ static uint8_t *REGVM_CC regvm_t_get_field_chain_own(REGVM_ARGS)
                 v2 = *(JSValue *)((char *)p->prop + e->slot_off);
                 if (likely(JS_VALUE_GET_TAG(v2) >= 0)) {
                     T_SET_NEXT_B(d2, v2, T_SZ_CHAIN);
-                } else if (likely(JS_VALUE_GET_TAG(v2) != JS_TAG_LAZY_JSON)) {
+                } else {
 #if !QJS_DRC
                     JS_REF_COUNT(JS_VALUE_GET_PTR(v2))++;
 #endif
@@ -36876,6 +37278,22 @@ static void js_regvm_thread_check_sizes(void);
 #endif
 #endif /* QJS_REGVM_THREAD */
 
+/* Fill the registers no analysis named. Such a register is only ever released,
+   never read as a value, so any valid uncounted word will do -- but it must be
+   one: all-bits-zero is the integer 0 only in the 16-byte encoding, and in the
+   8-byte one it is a double's bits pattern. */
+static inline void regvm_fill_unwritten(JSValue *regs, int n)
+{
+#if QJS_NAN_BOXING64
+    int k;
+
+    for (k = 0; k < n; k++)
+        regs[k] = JS_MKVAL(JS_TAG_INT, 0);
+#else
+    memset(regs, 0, (size_t)n * sizeof(JSValue));
+#endif
+}
+
 #if QJS_REGVM_RECORD
 /*
  * --- nested register frames
@@ -37394,22 +37812,6 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
  */
 /* always_inline: both callers are already framed, and a twelve-argument call
    would pass some arguments on the stack. */
-/* Fill the registers no analysis named. Such a register is only ever released,
-   never read as a value, so any valid uncounted word will do -- but it must be
-   one: all-bits-zero is the integer 0 only in the 16-byte encoding, and in the
-   8-byte one it is a double's bits pattern. */
-static inline void regvm_fill_unwritten(JSValue *regs, int n)
-{
-#if QJS_NAN_BOXING64
-    int k;
-
-    for (k = 0; k < n; k++)
-        regs[k] = JS_MKVAL(JS_TAG_INT, 0);
-#else
-    memset(regs, 0, (size_t)n * sizeof(JSValue));
-#endif
-}
-
 /* A static block of `undefined` words. Every register must hold a valid,
    uncounted word before the frame runs; filling the frame from this template
    is one memcpy. */
@@ -37970,6 +38372,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 js_aot_enter_count++;
                 if (unlikely(y_formless) && aot_entry_pc == 0) {
                     int nr = regvm_frame_regs(b), k;
+                    Y_FORMLESS_ARGS(this_obj, argv, argc);
                     for (k = 0; k < nr; k++)
                         if (JS_VALUE_GET_TAG(regs[k]) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(regs[k])) && Y_YOUNG(JS_VALUE_GET_PTR(regs[k])))
                             y_promote_now(JS_VALUE_GET_OBJ(regs[k]));
@@ -39364,11 +39767,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
 #ifdef QJS_REGVM_COUNT
                         js_regvm_elem[0]++;
 #endif
-                        if (unlikely(js_lazy_marker_is(JS_ARR_VALS_RD(p)[idx])))
-                            val = js_lazy_materialize_slot(ctx,
-                                    &JS_ARR_VALS_RD(p)[idx], p);
-                        else
-                            val = js_dup(JS_ARR_VALS_RD(p)[idx]);
+                        val = js_dup(JS_ARR_VALS_RD(p)[idx]);
                     } else if (js_get_fast_array_element(ctx, p, idx, &val)) {
                         /* the remaining fast classes: arguments, mapped
                            arguments and the typed arrays */
@@ -43534,6 +43933,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JSValue aot_ret;
             js_aot_enter_count++;
             Y_FORMLESS_ARGS(this_obj, argv, argc);
+            if (rt->regvm_cur != NULL)
+                regvm_light_seal_out(rt, rt->regvm_cur);
             aot_ret = ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
                                              (JSValue *)argv, argc);
             return aot_ret;
@@ -44611,8 +45012,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #ifdef IC_VERIFY
                                     ic_verify_read(p, atom, p, ic[k].offset);
 #endif
-                                    if (js_lazy_marker_is(p->prop[ic[k].offset].u.value))
-                                        goto get_loc_field_nr_slow;
                                     val = js_dup(p->prop[ic[k].offset].u.value);
                             }
                             *sp++ = val;
@@ -44630,8 +45029,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 uint32_t offset;
                                 if (js_megacache_probe(ctx->rt, recv, atom,
                                                        &holder, &offset) &&
-                                    !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK) &&
-                                    !js_lazy_marker_is(holder->prop[offset].u.value)) {
+                                    !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK)) {
                                     *sp++ = js_dup(holder->prop[offset].u.value);
                                     BREAK;
                                 }
@@ -44642,10 +45040,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 if (prs) {
                                     if (unlikely(prs->flags & JS_PROP_TMASK))
                                         goto get_loc_field_nr_slow;
-                                    if (js_lazy_marker_is(pr->u.value))
-                                        val = js_lazy_materialize_slot(ctx, &pr->u.value, p);
-                                    else
-                                        val = js_dup(pr->u.value);
+                                    val = js_dup(pr->u.value);
 #if JS_ENABLE_IC
                                     if (p == recv)
                                         ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
@@ -45357,8 +45752,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #ifdef IC_VERIFY
                                 ic_verify_read(p, atom, p, ic[k].offset);
 #endif
-                                if (js_lazy_marker_is(p->prop[ic[k].offset].u.value))
-                                    goto get_field_ic_slow;
                                 val = js_dup(p->prop[ic[k].offset].u.value);
                             }
                             JS_FreeValue(ctx, sp[-1]);
@@ -45377,8 +45770,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             uint32_t offset;
                             if (js_megacache_probe(ctx->rt, recv, atom,
                                                    &holder, &offset) &&
-                                !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK) &&
-                                !js_lazy_marker_is(holder->prop[offset].u.value)) {
+                                !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK)) {
                                 val = js_dup(holder->prop[offset].u.value);
                                 JS_FreeValue(ctx, sp[-1]);
                                 sp[-1] = val;
@@ -45391,10 +45783,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             if (prs) {
                                 if (unlikely(prs->flags & JS_PROP_TMASK))
                                     goto get_field_ic_slow;
-                                if (js_lazy_marker_is(pr->u.value))
-                                    val = js_lazy_materialize_slot(ctx, &pr->u.value, p);
-                                else
-                                    val = js_dup(pr->u.value);
+                                val = js_dup(pr->u.value);
 #if JS_ENABLE_IC
                                 if (p == recv)
                                     ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
@@ -45501,8 +45890,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #ifdef IC_VERIFY
                                 ic_verify_read(p, atom, p, ic[k].offset);
 #endif
-                                if (js_lazy_marker_is(p->prop[ic[k].offset].u.value))
-                                    goto get_field2_ic_slow;
                                 val = js_dup(p->prop[ic[k].offset].u.value);
                             }
                             *sp++ = val;
@@ -45520,8 +45907,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             uint32_t offset;
                             if (js_megacache_probe(ctx->rt, recv, atom,
                                                    &holder, &offset) &&
-                                !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK) &&
-                                !js_lazy_marker_is(holder->prop[offset].u.value)) {
+                                !(get_shape_prop(holder->shape)[offset].flags & JS_PROP_TMASK)) {
                                 *sp++ = js_dup(holder->prop[offset].u.value);
                                 BREAK;
                             }
@@ -45532,10 +45918,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             if (prs) {
                                 if (unlikely(prs->flags & JS_PROP_TMASK))
                                     goto get_field2_ic_slow;
-                                if (js_lazy_marker_is(pr->u.value))
-                                    val = js_lazy_materialize_slot(ctx, &pr->u.value, p);
-                                else
-                                    val = js_dup(pr->u.value);
+                                val = js_dup(pr->u.value);
 #if JS_ENABLE_IC
                                 if (p == recv)
                                     ic_read_update_guarded(ctx->rt, b, ic, ic_idx, recv,
@@ -45885,10 +46268,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count && JS_ARR_GENERIC(p) &&
                                !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
-                        if (js_lazy_marker_is(JS_ARR_VALS(p)[idx]))
-                            val = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
-                        else
-                            val = js_dup(JS_ARR_VALS(p)[idx]);
+                        val = js_dup(JS_ARR_VALS(p)[idx]);
                         JS_FreeValue(ctx, sp[-2]);
                         sp[-2] = val;
                         sp--;
@@ -45948,14 +46328,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            !js_array_slot_is_hole(
                                JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                    JS_VALUE_GET_INT(var_buf[idx])]))) {
-                    if (js_lazy_marker_is(JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
-                                              JS_VALUE_GET_INT(var_buf[idx])]))
-                        val = js_lazy_materialize_slot(ctx,
-                                  &JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
-                                       JS_VALUE_GET_INT(var_buf[idx])],
-                                  JS_VALUE_GET_OBJ(sp[-1]));
-                    else
-                        val = js_dup(JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
+                    val = js_dup(JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                          JS_VALUE_GET_INT(var_buf[idx])]);
                 } else {
                     sf->cur_pc = pc;
@@ -45990,14 +46363,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                            !js_array_slot_is_hole(
                                JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                    JS_VALUE_GET_INT(arg_buf[idx])]))) {
-                    if (js_lazy_marker_is(JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
-                                              JS_VALUE_GET_INT(arg_buf[idx])]))
-                        val = js_lazy_materialize_slot(ctx,
-                                  &JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
-                                       JS_VALUE_GET_INT(arg_buf[idx])],
-                                  JS_VALUE_GET_OBJ(sp[-1]));
-                    else
-                        val = js_dup(JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
+                    val = js_dup(JS_ARR_VALS(JS_VALUE_GET_OBJ(sp[-1]))[
                                          JS_VALUE_GET_INT(arg_buf[idx])]);
                 } else {
                     sf->cur_pc = pc;
@@ -46022,10 +46388,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (likely(p->class_id == JS_CLASS_ARRAY &&
                                idx < p->u.array.count && JS_ARR_GENERIC(p) &&
                                !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
-                        if (js_lazy_marker_is(JS_ARR_VALS(p)[idx]))
-                            sp[-1] = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(p)[idx], p);
-                        else
-                            sp[-1] = js_dup(JS_ARR_VALS(p)[idx]);
+                        sp[-1] = js_dup(JS_ARR_VALS(p)[idx]);
                         BREAK;
                     }
                     if (js_get_fast_array_element(ctx, p, idx, &val)) {
@@ -47146,6 +47509,8 @@ JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                 if (js_poll_interrupts(ctx))
                     return JS_EXCEPTION;
                 Y_FORMLESS_ARGS(this_obj, argv, argc);
+                if (rt->regvm_cur != NULL)
+                    regvm_light_seal_out(rt, rt->regvm_cur);
                 res = ((JSAotNFn)b->aot_nfn)(ctx, rt->regvm_cur, p, this_obj, (JSValue *)argv, argc);
                 if (rt->current_stack_frame == NULL && regvm_light_head(rt->regvm_cur) == NULL)
                     js_drc_safepoint(rt);
@@ -49065,10 +49430,16 @@ typedef struct JSToken {
 /* Expected-transition cache for JSON.parse: the shape chain built for the
    previous object at the same nesting depth is reused instead of hashing every
    add-transition. */
+#define JSON_KCACHE_N 256
+
 typedef struct JSONShapeCache {
     int n;              /* number of valid transitions (keys) */
     int cap;
     JSAtom *atoms;      /* atoms[k] = the k-th key */
+    uint8_t *plain;     /* plain[k]: atoms[k] is an 8-bit string of bytes a key needs no escape for (printable ASCII, no quote or backslash);
+                           2 when also k16[k] holds it */
+    uint8_t (*k16)[16]; /* k16[k]: a plain key of at most 14 bytes, its closing quote, zeros, and its length in byte 15 */
+    uint32_t gen;       /* bumped whenever entries below n are dropped, so a reader can tell its entry k still holds */
     JSShape **shapes;   /* shapes[k] = shape after k keys; shapes[n] is valid */
 } JSONShapeCache;
 
@@ -49089,6 +49460,10 @@ typedef struct JSParseState {
     const uint8_t *eol;  // most recently seen end-of-line character
     const uint8_t *mark; // first token character, invariant: eol < mark
     bool json_key_mode;
+    bool json_latin1;   /* JSON.parse of an 8-bit string's own bytes: a byte >= 0x80 is that code point, not UTF-8 */
+    JSAtom json_key_hint; /* JSON.parse: the key the shape being built expects next (only during json_next_key_token) */
+    bool json_key_hint_plain; /* ... and its string needs no escape, so the input only has to hold the same bytes */
+    JSAtom *json_kcache;  /* JSON.parse: JSON_KCACHE_N recent keys by a hash of their bytes (each holds a count), allocated at the first key */
 
     /* JSON.parse shape-reuse cache, indexed by object nesting depth */
     JSONShapeCache *json_shapes;
@@ -49577,7 +49952,7 @@ static __exception int js_parse_template_part(JSParseState *s,
             break;
         }
         if (c == '\\') {
-            if (string_buffer_putc8(b, c))
+            if (json_putc8(b, c))
                 goto fail;
             if (p >= s->buf_end)
                 goto unexpected_eof;
@@ -49799,7 +50174,7 @@ static __exception int js_parse_regexp(JSParseState *s)
             /* XXX: incorrect as the first character in a class */
             in_class = false;
         } else if (c == '\\') {
-            if (string_buffer_putc8(b, c))
+            if (json_putc8(b, c))
                 goto fail;
             c = *p++;
             if (c == '\n' || c == '\r')
@@ -50478,6 +50853,32 @@ static int json_parse_error(JSParseState *s, const uint8_t *curp, const char *ms
                           msg, position, line, (int)(p - line_start) + 1);
 }
 
+/* The first byte in [q, end) that ends a run a JSON string copies as it is: a quote, a backslash, a control character, or (unless
+   latin1) a byte >= 0x80; `end` when there is none. Sixteen bytes at a time where SSE2 is there, never reading past `end`. */
+static inline const uint8_t *json_scan_plain(const uint8_t *q, const uint8_t *end, bool latin1)
+{
+#if defined(__SSE2__)
+    const __m128i vq = _mm_set1_epi8('"'), vb = _mm_set1_epi8('\\'), v20 = _mm_set1_epi8(0x20), z = _mm_setzero_si128();
+    while (end - q >= 16) {
+        __m128i x = _mm_loadu_si128((const __m128i *)q);
+        /* signed compare: < 0x20 is a control character or (as a negative) a byte >= 0x80 */
+        __m128i lo = _mm_cmplt_epi8(x, v20);
+        __m128i m;
+        int mask;
+        if (latin1)
+            lo = _mm_andnot_si128(_mm_cmplt_epi8(x, z), lo);
+        m = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(x, vq), _mm_cmpeq_epi8(x, vb)), lo);
+        mask = _mm_movemask_epi8(m);
+        if (mask)
+            return q + __builtin_ctz(mask);
+        q += 16;
+    }
+#endif
+    while (q < end && *q != '"' && *q != '\\' && *q >= 0x20 && (*q < 0x80 || latin1))
+        q++;
+    return q;
+}
+
 static int json_parse_string(JSParseState *s, const uint8_t **pp)
 {
     const uint8_t *p, *p_next;
@@ -50490,9 +50891,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
     /* Fast path: a pure-ASCII string with no escapes can be built directly from
        the source range, skipping the StringBuffer entirely. */
     {
-        const uint8_t *q = p;
-        while (q < s->buf_end && *q != '"' && *q != '\\' && *q >= 0x20 && *q < 0x80)
-            q++;
+        const uint8_t *q = json_scan_plain(p, s->buf_end, s->json_latin1);
         if (q < s->buf_end && *q == '"') {
             JSValue str = js_new_string8_len(s->ctx, (const char *)p, q - p);
             if (JS_IsException(str))
@@ -50515,9 +50914,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
 
         // Fast path: batch consecutive ASCII characters
         const uint8_t *p_start = p;
-        while (p < s->buf_end && *p != '"' && *p != '\\' && *p >= 0x20 && *p < 0x80) {
-            p++;
-        }
+        p = json_scan_plain(p, s->buf_end, s->json_latin1);
 
         // Write batched ASCII in one call
         if (p > p_start) {
@@ -50564,7 +50961,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
                 goto fail;
             }
         } else
-        if (c >= 0x80) {
+        if (c >= 0x80 && !s->json_latin1) {
             c = utf8_decode(p - 1, &p_next);
             if (p_next == p) {
                 json_parse_error(s, p - 1, "Bad UTF-8 sequence");
@@ -50589,17 +50986,80 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
 }
 
 /* Parse an ordinary JSON object key without first allocating a JSString. */
+/* Whether the atom's string is exactly the bytes [p, p + len) (8-bit, not a tagged integer). */
+static inline bool json_atom_is_bytes(JSContext *ctx, JSAtom a, const uint8_t *p, uint32_t len)
+{
+    JSString *ap;
+    const uint8_t *q;
+    uint32_t i;
+
+    if (__JS_AtomIsTaggedInt(a))
+        return false;
+    ap = ctx->rt->atom_array[a];
+    if (ap->is_wide_char || ap->len != len)
+        return false;
+    q = str8(ap);
+    for (i = 0; i < len; i++)
+        if (q[i] != p[i])
+            return false;
+    return true;
+}
+
 static int json_parse_key_string(JSParseState *s, const uint8_t **pp)
 {
     const uint8_t *start = *pp;
     const uint8_t *p = start;
 
+    /* the key the shape being built expects, matched in one pass: the input holds the atom's bytes, each one a byte the scan below
+       accepts (printable ASCII, no quote, no backslash), then the closing quote */
+    if (s->json_key_hint != JS_ATOM_NULL && !__JS_AtomIsTaggedInt(s->json_key_hint)) {
+        JSString *ap = s->ctx->rt->atom_array[s->json_key_hint];
+        /* a hint is only ever a plain key (JSONShapeCache.plain), so equal bytes are bytes the scan accepts */
+        if ((size_t)(s->buf_end - start) > ap->len) {
+            uint32_t n = ap->len;
+            if (start[n] == '"' && memcmp(str8(ap), start, n) == 0) {
+                s->token.val = TOK_IDENT;
+                s->token.u.ident.atom = JS_DupAtom(s->ctx, s->json_key_hint);
+                s->token.u.ident.has_escape = false;
+                s->token.u.ident.is_reserved = false;
+                *pp = start + n + 1;
+                return 0;
+            }
+        }
+    }
     while (p < s->buf_end && *p != '"' && *p != '\\' &&
            *p >= 0x20 && *p < 0x80)
         p++;
     if (p < s->buf_end && *p == '"') {
-        JSAtom atom = JS_NewAtomLen(s->ctx, (const char *)start,
-                                    p - start);
+        JSAtom atom = JS_ATOM_NULL, hint = s->json_key_hint;
+        uint32_t len = (uint32_t)(p - start), h, i;
+        /* the key the shape being built expects: its bytes compared with the atom's own, no hashing or table lookup */
+        if (hint != JS_ATOM_NULL && json_atom_is_bytes(s->ctx, hint, start, len))
+            atom = JS_DupAtom(s->ctx, hint);
+        if (atom == JS_ATOM_NULL) {
+            /* else a key seen recently in this parse: a small table by a cheap hash of the bytes, checked byte for byte */
+            h = len;
+            for (i = 0; i < len; i++)
+                h = h * 31 + start[i];
+            h = (h ^ (h >> 11)) & (JSON_KCACHE_N - 1);
+            if (!s->json_kcache) {
+                s->json_kcache = js_mallocz(s->ctx, sizeof(JSAtom) * JSON_KCACHE_N);
+                if (!s->json_kcache)
+                    return -1;
+            }
+            if (s->json_kcache[h] != JS_ATOM_NULL && json_atom_is_bytes(s->ctx, s->json_kcache[h], start, len)) {
+                atom = JS_DupAtom(s->ctx, s->json_kcache[h]);
+            } else {
+                atom = JS_NewAtomLen(s->ctx, (const char *)start, len);
+                if (atom == JS_ATOM_NULL)
+                    return -1;
+                if (!__JS_AtomIsTaggedInt(atom)) {
+                    if (s->json_kcache[h] != JS_ATOM_NULL)
+                        JS_FreeAtom(s->ctx, s->json_kcache[h]);
+                    s->json_kcache[h] = JS_DupAtom(s->ctx, atom);
+                }
+            }
+        }
         if (atom == JS_ATOM_NULL)
             return -1;
         s->token.val = TOK_IDENT;
@@ -50612,14 +51072,57 @@ static int json_parse_key_string(JSParseState *s, const uint8_t **pp)
     return json_parse_string(s, pp);
 }
 
+/* The correctly rounded double of (neg ? -1 : 1) * w * 10^e, w < 10^19 and nonzero, when it can be had without strtod; false
+   otherwise.
+   - w <= 2^53 and |e| <= 22: w and 10^|e| are exact doubles, and one multiply or divide rounds once (Clinger's fast path).
+   - x87 long double (64-bit significand), |e| <= 27: w and 10^|e| are exact there, so one operation gives r, the true value
+     rounded once to 64 bits; rounding r to a double is then the correct rounding of the true value unless r is itself a midpoint
+     between two doubles (a midpoint needs only 54 bits, so any midpoint strictly between the true value and r would be nearer
+     than r, which r excludes). That case, low 11 bits of r's significand exactly 0x400, is left to strtod. */
+static inline bool json_wexp_to_double(bool neg, uint64_t w, int e, double *out)
+{
+    static const double pow10[23] = {
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+        1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    };
+    double d;
+
+    if (w <= ((uint64_t)1 << 53) && e >= -22 && e <= 22) {
+        d = (double)w;
+        d = e < 0 ? d / pow10[-e] : d * pow10[e];
+        *out = neg ? -d : d;
+        return true;
+    }
+#if (defined(__x86_64__) || defined(__i386__)) && LDBL_MANT_DIG == 64
+    if (e >= -27 && e <= 27) {
+        static const long double lpow10[28] = {
+            1e0L, 1e1L, 1e2L, 1e3L, 1e4L, 1e5L, 1e6L, 1e7L, 1e8L, 1e9L, 1e10L, 1e11L, 1e12L, 1e13L,
+            1e14L, 1e15L, 1e16L, 1e17L, 1e18L, 1e19L, 1e20L, 1e21L, 1e22L, 1e23L, 1e24L, 1e25L, 1e26L, 1e27L,
+        };
+        long double r = (long double)w;
+        uint64_t m;
+        r = e < 0 ? r / lpow10[-e] : r * lpow10[e];
+        memcpy(&m, &r, sizeof(m)); /* the explicit 64-bit significand */
+        if ((m & 0x7ff) == 0x400)
+            return false;
+        d = (double)r;
+        *out = neg ? -d : d;
+        return true;
+    }
+#endif
+    return false;
+}
+
 static int json_parse_number(JSParseState *s, const uint8_t **pp)
 {
     const uint8_t *p = *pp;
     const uint8_t *p_start = p;
     bool neg = false;
     bool is_float = false;
-    uint64_t ival = 0;
-    int ndigits = 0;
+    uint64_t w = 0;     /* the significant digits, while there are at most 19 */
+    int nd = 0;         /* significant digits seen (leading zeros excluded) */
+    int ndigits = 0;    /* integer-part digits */
+    int e = 0;          /* decimal exponent of w */
 
     if (*p == '+' || *p == '-') {
         neg = (*p == '-');
@@ -50633,10 +51136,13 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
         return json_parse_error(s, p, "Unexpected number");
 
     while (is_digit(*p)) {
-        /* accumulate the integer value while it stays exact in a double
-           (<= 15 digits < 2^53); longer numbers fall back to strtod */
-        if (ndigits <= 15)
-            ival = ival * 10 + (*p - '0');
+        if (w != 0 || *p != '0') {
+            if (nd < 19)
+                w = w * 10 + (*p - '0');
+            else
+                e++;
+            nd++;
+        }
         ndigits++;
         p++;
     }
@@ -50646,36 +51152,55 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
         p++;
         if (!is_digit(*p))
             return json_parse_error(s, p, "Unterminated fractional number");
-        while (is_digit(*p))
+        while (is_digit(*p)) {
+            if (w != 0 || *p != '0') {
+                if (nd < 19) {
+                    w = w * 10 + (*p - '0');
+                    e--;
+                }
+                nd++;
+            } else {
+                e--;
+            }
             p++;
+        }
     }
     if (*p == 'e' || *p == 'E') {
+        bool eneg = false;
+        int ex = 0;
         is_float = true;
         p++;
         if (*p == '+' || *p == '-')
-            p++;
+            eneg = *p++ == '-';
         if (!is_digit(*p))
             return json_parse_error(s, p, "Exponent part is missing a number");
-        while (is_digit(*p))
+        while (is_digit(*p)) {
+            if (ex < 100000)
+                ex = ex * 10 + (*p - '0');
             p++;
+        }
+        e += eneg ? -ex : ex;
     }
     s->token.val = TOK_NUMBER;
     if (!is_float && ndigits <= 15) {
         /* integer fast path: avoids a second (locale-aware) strtod scan */
-        if (ival == 0) {
+        if (w == 0) {
             /* preserve -0 as a float64 negative zero */
             s->token.u.num.val = neg ? js_float64(-0.0) : js_int32(0);
-        } else if (!neg && ival <= INT32_MAX) {
-            s->token.u.num.val = js_int32((int32_t)ival);
-        } else if (neg && ival <= (uint64_t)INT32_MAX + 1) {
-            s->token.u.num.val = js_int32((int32_t)(0 - (int64_t)ival));
+        } else if (!neg && w <= INT32_MAX) {
+            s->token.u.num.val = js_int32((int32_t)w);
+        } else if (neg && w <= (uint64_t)INT32_MAX + 1) {
+            s->token.u.num.val = js_int32((int32_t)(0 - (int64_t)w));
         } else {
-            double d = (double)ival;
+            double d = (double)w;
             s->token.u.num.val = js_float64(neg ? -d : d);
         }
     } else {
         double d;
-        d = strtod((const char *)p_start, NULL);
+        if (w == 0)
+            d = neg ? -0.0 : 0.0;
+        else if (nd > 19 || !json_wexp_to_double(neg, w, e, &d))
+            d = strtod((const char *)p_start, NULL);
         s->token.u.num.val = js_float64(d);
     }
     *pp = p;
@@ -50764,59 +51289,6 @@ fail:
         return -1;
     return -1;
 }
-
-/* Keep large integer-only arrays on the optimized eager path.  The lazy
-   representation is useful for object-heavy documents, but adds tape and
-   marker work that is unnecessary when every element is a number. */
-static int json_is_integer_array(const char *buf, size_t len)
-{
-    const uint8_t *p = (const uint8_t *)buf;
-    const uint8_t *end = p + len;
-    int count = 0;
-
-    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-        p++;
-    if (p >= end || *p++ != '[')
-        return 0;
-    for (;;) {
-        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-            p++;
-        if (p >= end)
-            return 0;
-        if (*p == ']') {
-            p++;
-            break;
-        }
-        if (*p == '-')
-            p++;
-        if (p >= end || *p < '0' || *p > '9')
-            return 0;
-        if (*p == '0') {
-            p++;
-            if (p < end && *p >= '0' && *p <= '9')
-                return 0;
-        } else {
-            do {
-                p++;
-            } while (p < end && *p >= '0' && *p <= '9');
-        }
-        count = 1;
-        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-            p++;
-        if (p >= end)
-            return 0;
-        if (*p == ']') {
-            p++;
-            break;
-        }
-        if (*p++ != ',')
-            return 0;
-    }
-    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-        p++;
-    return count && p == end;
-}
-
 /* 'c' is the first character. Return JS_ATOM_NULL in case of error */
 static JSAtom json_parse_ident(JSParseState *s, const uint8_t **pp, int c)
 {
@@ -50950,6 +51422,25 @@ static __exception int json_next_token(JSParseState *s)
     case '$':
         if (s->json_key_mode)
             goto def_token;
+        /* the three JSON literals by their bytes: the predefined atoms, no identifier scan or atom table lookup */
+        atom = JS_ATOM_NULL;
+        if (c == 't' && p[1] == 'r' && p[2] == 'u' && p[3] == 'e' &&
+            !(p[4] < 128 && ((lre_id_continue_table_ascii[p[4] >> 5] >> (p[4] & 31)) & 1)) && p[4] < 128) {
+            atom = JS_ATOM_true; p += 4;
+        } else if (c == 'n' && p[1] == 'u' && p[2] == 'l' && p[3] == 'l' &&
+                   !(p[4] < 128 && ((lre_id_continue_table_ascii[p[4] >> 5] >> (p[4] & 31)) & 1)) && p[4] < 128) {
+            atom = JS_ATOM_null; p += 4;
+        } else if (c == 'f' && p[1] == 'a' && p[2] == 'l' && p[3] == 's' && p[4] == 'e' &&
+                   !(p[5] < 128 && ((lre_id_continue_table_ascii[p[5] >> 5] >> (p[5] & 31)) & 1)) && p[5] < 128) {
+            atom = JS_ATOM_false; p += 5;
+        }
+        if (atom != JS_ATOM_NULL) {
+            s->token.u.ident.atom = atom;
+            s->token.u.ident.has_escape = false;
+            s->token.u.ident.is_reserved = false;
+            s->token.val = TOK_IDENT;
+            break;
+        }
         /* identifier : only pure ascii characters are accepted */
         p++;
         atom = json_parse_ident(s, &p, c);
@@ -51016,7 +51507,16 @@ static int json_next_key_token(JSParseState *s)
     s->json_key_mode = true;
     ret = json_next_token(s);
     s->json_key_mode = saved;
+    s->json_key_hint = JS_ATOM_NULL;
     return ret;
+}
+
+/* The key read next with the one the depth's shape cache expects at position k as a hint (json_parse_key_string checks it byte for byte) */
+static int json_next_key_token_hint(JSParseState *s, const JSONShapeCache *c, int k)
+{
+    if (c && c->atoms && k < c->n && c->plain[k])
+        s->json_key_hint = c->atoms[k];
+    return json_next_key_token(s);
 }
 
 #ifndef QJS_DISABLE_PARSER
@@ -66062,6 +66562,10 @@ static int regvm_homes_mode(void)
 #if QJS_AOT && !QJS_REGVM
 #error "QJS_AOT needs QJS_REGVM"
 #endif
+/* Compiled code is entered against the threaded chain's activation record. */
+#if QJS_AOT && !QJS_REGVM_THREAD
+#error "QJS_AOT needs QJS_REGVM_THREAD"
+#endif
 /* The parser emits a debugger trap per statement when a debugger is attached
    at parse time, and a trap changes the register bytecode and its digest, so a
    unit built with the interface on binds against a different program than the
@@ -67425,7 +67929,6 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->reg_pic_own = REG_PIC_OWN;
     out->reg_pic_proto = REG_PIC_PROTO;
     out->reg_ic_none = REG_IC_NONE;
-    out->tag_lazy_json = (uint32_t)(int32_t)JS_TAG_LAZY_JSON;
     out->reg_bin_add = REG_BIN_ADD;
     out->reg_bin_sub = REG_BIN_SUB;
     out->reg_bin_mul = REG_BIN_MUL;
@@ -67589,8 +68092,9 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     {
         /* `extensible` and `fast_array` likewise, and the context's `std_array_prototype`. */
         JSObject o;
-        static JSContext c0; /* all zero: only the bit under test is set while it is searched for */
-        JSContext *c = &c0;
+        /* all zero: only the bit under test is set while it is searched for; per call, since
+           two runtimes on two threads derive the hash at the same time */
+        JSContext *c = calloc(1, sizeof(JSContext));
         const uint8_t *q = (const uint8_t *)&o;
         size_t i;
 
@@ -67626,6 +68130,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
             }
             c->std_array_prototype = 0;
         }
+        (free)(c);
     }
     /* The light-frame header a generated native entry writes itself. It builds
        the same frame `regvm_light_fill` builds, field for field, so the
@@ -67647,19 +68152,20 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_rt_drc_pend_i = (uint32_t)offsetof(JSRuntime, drc_pend_i);
     out->off_rt_drc_in_reconcile = (uint32_t)offsetof(JSRuntime, drc_in_reconcile);
     {
-        static JSRuntime r0; /* all zero: only the phase under test is set while it is searched for */
-        const uint8_t *q = (const uint8_t *)&r0;
+        /* all zero: only the phase under test is set while it is searched for (per call, see above) */
+        JSRuntime *r0p = calloc(1, sizeof(JSRuntime));
+        const uint8_t *q = (const uint8_t *)r0p;
         size_t i;
 
-        r0.gc_phase = (JSGCPhaseEnum)255;
+        r0p->gc_phase = (JSGCPhaseEnum)255;
         out->off_rt_gc_phase = 0;
-        for (i = 0; i < sizeof(r0); i++) {
+        for (i = 0; i < sizeof(JSRuntime); i++) {
             if (q[i] != 0) {
                 out->off_rt_gc_phase = (uint32_t)i;
                 break;
             }
         }
-        r0.gc_phase = JS_GC_PHASE_NONE;
+        (free)(r0p);
     }
     out->class_object = JS_CLASS_OBJECT;
     out->off_rt_blkcache = (uint32_t)offsetof(JSRuntime, arena_state.cache);
@@ -67781,7 +68287,6 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_regpic_misses = (uint32_t)offsetof(JSRegPIC, misses);
     out->reg_pic_add_w = REG_PIC_ADD_W;
     out->off_rt_ic_epoch = (uint32_t)offsetof(JSRuntime, ic_watchpoint_epoch);
-    out->off_rt_lazy_json = (uint32_t)offsetof(JSRuntime, lazy_json_seen);
     out->off_rt_shape_free_epoch = (uint32_t)offsetof(JSRuntime, shape_free_epoch);
     _Static_assert(offsetof(JSRuntime, shape_obs_epoch) == offsetof(JSRuntime, shape_free_epoch) + sizeof(uint32_t), "units read shape_obs_epoch right after shape_free_epoch");
     out->off_fnbc_regvm_len = (uint32_t)offsetof(JSFunctionBytecode, regvm_len);
@@ -69050,8 +69555,6 @@ static void aot_dump_contents(FILE *f, JSRuntime *rt, int nshapes)
             if (prs[i].atom == JS_ATOM_NULL || (prs[i].flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
                 continue;
             v = p->prop[i].u.value;
-            if (js_lazy_marker_is(v))
-                continue;
             bit = aot_tag_class(v);
             c->types |= bit;
             if (bit == AOT_TYPE_OBJECT) {
@@ -69075,7 +69578,7 @@ static void aot_dump_contents(FILE *f, JSRuntime *rt, int nshapes)
     for (k = 0; k < aot_nnotes; k++) {
         AotNote *nt = &aot_notes[k];
         int sl;
-        if (nt->sh == AOT_NOTE_DEAD || !nt->sh->aot_prof_seen || nt->sh->aot_prof_id >= nshapes)
+        if (!nt->sh->aot_prof_seen || nt->sh->aot_prof_id >= nshapes)
             continue;
         for (sl = 0; sl < AOT_NOTE_SLOTS && sl < AOT_PROF_MAX_SLOTS; sl++) {
             AotCont *c = &tab[(size_t)nt->sh->aot_prof_id * AOT_PROF_MAX_SLOTS + (size_t)sl];
@@ -69568,6 +70071,8 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
     }
 }
 
+static void re_st_prof_dump(FILE *f);
+
 void js_aot_prof_dump(JSRuntime *rt)
 {
     int pass;
@@ -69583,6 +70088,7 @@ void js_aot_prof_dump(JSRuntime *rt)
     fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u callres=1 sitekinds=1 gwrites=1 vmode=%u\n",
             QJS_AOT_ABI, REGVM_FORMAT_VERSION, QJS_DRC,
             QJS_REGVM_THREAD, QJS_REGVM_RECORD, QJS_NAN_BOXING64);
+    re_st_prof_dump(f);
     {
         /* A context is needed only to name atoms; the dump runs at teardown, when
            the runtime's contexts are still alive. */
@@ -69699,28 +70205,29 @@ static uint32_t js_aot_unit_layout_hash(void)
    with no other sign; one line on stderr, once per process, names
    the cause and both hashes. */
 static int aot_unit_refused_reported;
+/* How many times the unit was refused (each runtime asks), reported at teardown under QJS_AOT_STATS. */
+static uint64_t aot_unit_refused_count;
 
 static int aot_unit_present(void)
 {
 #if defined(__GNUC__)
     int has_unit = (&qjs_aot_count != NULL) && (&qjs_aot_layout != NULL);
+    uint32_t eh;
 
     if (!has_unit)
         return 0;
-    if (qjs_aot_abi == QJS_AOT_ABI && qjs_aot_layout == js_aot_unit_layout_hash())
+    /* Derived once, so the compare and the message see the same value. */
+    eh = js_aot_unit_layout_hash();
+    if (qjs_aot_abi == QJS_AOT_ABI && qjs_aot_layout == eh)
         return 1;
-    if (!aot_unit_refused_reported) {
-        aot_unit_refused_reported = 1;
-        if (qjs_aot_abi != QJS_AOT_ABI)
-            fprintf(stderr,
-                    "quickjs: AOT unit refused: ABI mismatch (unit %u, engine %u)\n",
-                    (unsigned)qjs_aot_abi, (unsigned)QJS_AOT_ABI);
-        else
-            fprintf(stderr,
-                    "quickjs: AOT unit refused: engine layout mismatch "
-                    "(unit %u, engine %u)\n",
-                    (unsigned)qjs_aot_layout,
-                    (unsigned)js_aot_unit_layout_hash());
+    __atomic_add_fetch(&aot_unit_refused_count, 1, __ATOMIC_RELAXED);
+    if (!__atomic_exchange_n(&aot_unit_refused_reported, 1, __ATOMIC_RELAXED)) {
+        fprintf(stderr,
+                "quickjs: AOT unit refused: %s (compared: abi unit %u engine %u, "
+                "layout unit %u engine %u)\n",
+                qjs_aot_abi != QJS_AOT_ABI ? "ABI mismatch" : "engine layout mismatch",
+                (unsigned)qjs_aot_abi, (unsigned)QJS_AOT_ABI,
+                (unsigned)qjs_aot_layout, (unsigned)eh);
     }
     return 0;
 #else
@@ -69898,6 +70405,7 @@ const uint64_t *qjs_aot_icount_table(unsigned *n)
 
 void js_aot_stats_dump(JSRuntime *rt)
 {
+    uint64_t refused = __atomic_load_n(&aot_unit_refused_count, __ATOMIC_RELAXED);
     int present = aot_unit_present();
     unsigned count = present ? (unsigned)qjs_aot_count : 0u;
     JSAotRun *r = rt->aot_run;
@@ -69906,6 +70414,9 @@ void js_aot_stats_dump(JSRuntime *rt)
     char swbuf[64];
     uint64_t sw = 0;
 
+    if (refused)
+        fprintf(stderr, "aot refusals: unit refused at %llu bind checks\n", (unsigned long long)refused);
+    fprintf(stderr, "aot registry: rbc_cap=%u rbc_n=%u\n", (unsigned)rbc_cap, (unsigned)rbc_n);
     if (r) {
         for (i = 0; i < r->cell_count; i++)
             if (r->cells[i])
@@ -70207,7 +70718,12 @@ static void js_aot_bind(JSFunctionBytecode *b)
     if (!b->regvm_compiled || b->regvm_len <= 0 || b->is_lazy)
         return;
     js_aot_digest(b, digest);
-    rbc_add(digest, b);
+    {
+        /* A runtime that does not own the unit interprets and registers nothing: its bytecodes must not be found by the owner's frames. */
+        JSRuntime *own = __atomic_load_n(&js_aot_unit_owner, __ATOMIC_ACQUIRE);
+        if (own == NULL || own == b->realm->rt)
+            rbc_add(digest, b);
+    }
     /* A constructor of a contracted layout is marked whether or not the unit
        compiled it: its function object is what the layout's chain is built from. */
     if (&qjs_aot_layout_ctor != NULL && qjs_aot_layout_ctor(digest))
@@ -70419,7 +70935,7 @@ QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
                     JSValue v = JS_ARR_VALS(ap)[d->idx];
 #endif
 
-                    if (likely(!js_lazy_marker_is(v))) {
+                    {
                         d->idx++;
                         fr[w + 2] = v;
                         fr[w + 3] = JS_FALSE;
@@ -70450,9 +70966,14 @@ QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void)
     return (const void *)js_array_iterator_next;
 }
 
+static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv,
+                                 int is_replaceAll);
+
 QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which)
 {
-    return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop : NULL;
+    return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop :
+           which == 2 ? (const void *)js_string_replace : NULL;
 }
 
 /* The push of a compiled body that does not fit the array's capacity (or its packed element kind): the builtin itself, on a receiver the
@@ -72565,10 +73086,11 @@ JSValue qjs_aot_wrap_init(JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSVa
     }
     init = (JSObject *)wc[AOT_WC_INIT];
     cb2 = init->u.func.function_bytecode;
-    if (cb2->aot_nfn != NULL && argc >= cb2->arg_count)
+    if (cb2->aot_nfn != NULL && argc >= cb2->arg_count) {
+        regvm_light_seal_out(ctx->rt, caller_f);
         ret = ((JSValue (*)(JSContext *, JSRegRun *, JSObject *, JSValue, JSValue *, int))cb2->aot_nfn)(
             ctx, caller_f, init, thisv, argv, argc);
-    else
+    } else
         ret = JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, init), thisv, argc, vc(argv));
     if (JS_IsException(ret))
         return ret;
@@ -73163,7 +73685,6 @@ __attribute__((always_inline)) void qjs_aot_set_reg_b(JSContext *ctx, JSValue *f
 #endif
 
 #if QJS_DRC && defined(__SSE2__) && !defined(JS_NAN_BOXING) && !QJS_NAN_BOXING64
-#include <emmintrin.h>
 static inline void JSValue_store16(JSValue *d, JSValue v)
 {
     __m128i x;
@@ -73306,12 +73827,13 @@ QJS_AOT_STUB int qjs_aot_binary_rr(JSContext *ctx, JSRegRun *f, int sub, JSValue
                                    JSValue b, int d, int ra, JSValue *out)
 {
     int own1 = (sub & 0x100) != 0;
+    int unique = (sub & 0x200) != 0;   /* the generator has shown that no other register of the frame holds the string */
 
     sub &= 0xff;
     if (regvm_num_fast(sub, a, b, out))
         return 1;
     if (sub == REG_BIN_ADD) {
-        int ar = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b, 0, own1);
+        int ar = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b, unique, own1);
 
         ACC_NOTE();
         if (ar > 0)
@@ -73556,8 +74078,7 @@ __attribute__((always_inline)) int qjs_aot_get_element(JSValue recv, JSValue k, 
         uint32_t idx = JS_VALUE_GET_INT(k);
 
         if (likely(p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count && JS_ARR_GENERIC(p) &&
-                   !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]) &&
-                   !js_lazy_marker_is(JS_ARR_VALS(p)[idx]))) {
+                   !js_array_slot_is_hole(JS_ARR_VALS(p)[idx]))) {
             *out = js_dup(JS_ARR_VALS(p)[idx]);
             return 1;
         }
@@ -73684,7 +74205,7 @@ QJS_AOT_STUB int qjs_aot_elem_num(JSValue *data, uint32_t i, double *out, int *i
 {
     JSValue v = data[i];
 
-    if (js_array_slot_is_hole(v) || js_lazy_marker_is(v))
+    if (js_array_slot_is_hole(v))
         return 0;
     return qjs_aot_to_num(v, out, isint);
 }
@@ -74793,8 +75314,6 @@ QJS_AOT_STUB int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic
         return 1;
     }
     v = *(JSValue *)((char *)holder->prop + pe->slot_off);
-    if (JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON)
-        return 0;
     /* Borrowed, like js_gv_cell_peek: the holder's slot owns the value and the
        guards revalidate it on every hit, so the entry takes no reference. */
     e->expect = v;
@@ -93612,7 +94131,7 @@ static JSValue js_function_constructor(JSContext *ctx, JSValueConst new_target,
     StringBuffer b_s, *b = &b_s;
 
     string_buffer_init(ctx, b, 0);
-    string_buffer_putc8(b, '(');
+    json_putc8(b, '(');
 
     if (func_kind == JS_FUNC_ASYNC || func_kind == JS_FUNC_ASYNC_GENERATOR) {
         string_buffer_puts8(b, "async ");
@@ -93620,14 +94139,14 @@ static JSValue js_function_constructor(JSContext *ctx, JSValueConst new_target,
     string_buffer_puts8(b, "function");
 
     if (func_kind == JS_FUNC_GENERATOR || func_kind == JS_FUNC_ASYNC_GENERATOR) {
-        string_buffer_putc8(b, '*');
+        json_putc8(b, '*');
     }
     string_buffer_puts8(b, " anonymous(");
 
     n = argc - 1;
     for(i = 0; i < n; i++) {
         if (i != 0) {
-            string_buffer_putc8(b, ',');
+            json_putc8(b, ',');
         }
         if (string_buffer_concat_value(b, argv[i]))
             goto fail;
@@ -95633,7 +96152,7 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
             for (i = 0; i < n; i++) {
                 if (i > 0) {
                     if (c >= 0)
-                        string_buffer_putc8(b, c);
+                        json_putc8(b, c);
                     else
                         string_buffer_concat(b, p, 0, p->len);
                 }
@@ -95651,7 +96170,7 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
     for(i = 0; i < n; i++) {
         if (i > 0) {
             if (c >= 0) {
-                string_buffer_putc8(b, c);
+                json_putc8(b, c);
             } else {
                 string_buffer_concat(b, p, 0, p->len);
             }
@@ -96127,8 +96646,30 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
         goto exception;
 
     if (splice) {
+        JSValue *sp_vals;
+        uint32_t sp_count;
+        bool sp_fast = false;
+
         new_len = len + item_count - del_count;
-        if (item_count != del_count) {
+        /* A dense array of values with the deleted run already copied out: the tail moves in one memmove, the deleted values are
+           released, and the inserted values are stored into the slots the move left stale. */
+        if (item_count != del_count && js_get_fast_array(ctx, obj, &sp_vals, &sp_count) && sp_count == len &&
+            JS_VALUE_GET_OBJ(obj)->extensible && new_len <= INT32_MAX && start + del_count <= len &&
+            (new_len <= (int64_t)JS_VALUE_GET_OBJ(obj)->u.array.u1.size ||
+             expand_fast_array(ctx, JS_VALUE_GET_OBJ(obj), (uint32_t)new_len) == 0)) {
+            JSObject *sp = JS_VALUE_GET_OBJ(obj);
+
+            sp_vals = JS_ARR_VALS(sp);
+            for (k = start; k < start + del_count; k++)
+                JS_FreeValue(ctx, sp_vals[k]);
+            memmove(sp_vals + start + item_count, sp_vals + start + del_count,
+                    (size_t)(len - (start + del_count)) * sizeof(JSValue));
+            for (i = 0; i < item_count; i++)
+                sp_vals[start + i] = js_dup(argv[i + 2]);
+            sp->u.array.count = (uint32_t)new_len;
+            sp_fast = true;
+        }
+        if (!sp_fast && item_count != del_count) {
             if (JS_CopySubArray(ctx, obj, start + item_count,
                                 start + del_count, len - (start + del_count),
                                 item_count <= del_count ? +1 : -1) < 0)
@@ -96139,7 +96680,7 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
                     goto exception;
             }
         }
-        for (i = 0; i < item_count; i++) {
+        for (i = 0; !sp_fast && i < item_count; i++) {
             if (JS_SetPropertyInt64(ctx, obj, start + i, js_dup(argv[i + 2])) < 0)
                 goto exception;
         }
@@ -96581,6 +97122,7 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
                         !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1)))) {
                 if (js_poll_interrupts(ctx))
                     goto exception;
+                regvm_light_seal_out(rt, rt->regvm_cur);
                 res = ((JSAotNFn)b->aot_nfn)(ctx, rt->regvm_cur, JS_VALUE_GET_OBJ(psc->method),
                                              JS_UNDEFINED, (JSValue *)argv, 2);
             } else {
@@ -96906,10 +97448,7 @@ static JSValue js_array_iterator_next(JSContext *ctx, JSValueConst this_val,
                 val = js_arr_packed_get(ap, i2);
             else
 #endif
-            if (js_lazy_marker_is(JS_ARR_VALS(ap)[i2]))
-                val = js_lazy_materialize_slot(ctx, &JS_ARR_VALS(ap)[i2], ap);
-            else
-                val = js_dup(JS_ARR_VALS(ap)[i2]);
+            val = js_dup(JS_ARR_VALS(ap)[i2]);
             if (it->kind == JS_ITERATOR_KIND_VALUE)
                 return val;
             {
@@ -97856,7 +98395,7 @@ static JSValue js_iterator_proto_join(JSContext *ctx, JSValueConst this_val,
             break;
         if (!first) {
             if (c >= 0)
-                string_buffer_putc8(b, c);
+                json_putc8(b, c);
             else
                 string_buffer_concat(b, p, 0, p->len);
         }
@@ -99553,9 +100092,12 @@ typedef struct ReStEntry {
     uint16_t srclen;
     char src[102];
     uint64_t created, compiles, compile_cyc;
+    uint8_t *bc;        /* a copy of the compiled bytecode (the profile carries it), NULL if not seen or too long */
+    uint32_t bclen;
     uint64_t bcalls[RE_ST_NB], bcyc[RE_ST_NB];
     uint64_t mcalls, mcyc, mhits, mlen, mscan_hit, mscan_miss, mslen, mslen_max;
     uint64_t mstrat[4];
+    uint64_t mwide;     /* matcher attempts on a subject of 16-bit units */
 } ReStEntry;
 
 #define RE_ST_SLOTS 4096
@@ -99579,7 +100121,7 @@ static void re_st_report(void);
 static inline uint64_t re_st_tsc(void)
 {
 #if defined(__x86_64__)
-    return __builtin_ia32_rdtsc();
+    return js_cycles();
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -99587,18 +100129,21 @@ static inline uint64_t re_st_tsc(void)
 #endif
 }
 
+/* QJS_AOT_PROFILE_OUT also switches the census on (without the report): the profile then carries the matcher cycles and bytecode of every
+   pattern that ran, for the generator's matcher selection. */
 static __attribute__((constructor)) void re_st_init(void)
 {
-    const char *e = getenv("QJS_RE_STATS");
-    if (!e || !*e || (e[0] == '0' && !e[1]))
+    const char *e = getenv("QJS_RE_STATS"), *p = getenv("QJS_AOT_PROFILE_OUT");
+    int report = e && *e && !(e[0] == '0' && !e[1]);
+    if (!report && !(p && *p))
         return;
     re_st_on = 1;
-    if (!(e[0] == '1' && !e[1]))
+    if (report && !(e[0] == '1' && !e[1]))
         re_st_path = strdup(e);
     re_st_tab = calloc(RE_ST_SLOTS, sizeof(ReStEntry));
     if (!re_st_tab)
         re_st_on = 0;
-    else
+    else if (report)
         atexit(re_st_report);
 }
 
@@ -99647,7 +100192,31 @@ static ReStEntry *re_st_entry(JSRegExp *re)
     ReStEntry *e = re_st_find(strv(re->pattern), re->pattern->len,
                               re->pattern->is_wide_char, lre_get_flags(bc));
     e->capcnt = (uint16_t)lre_get_capture_count(bc);
+    if (!e->bc && re->bytecode->len <= 3500 && !re->bytecode->is_wide_char) {
+        e->bc = calloc(1, re->bytecode->len);
+        if (e->bc) {
+            memcpy(e->bc, bc, re->bytecode->len);
+            e->bclen = re->bytecode->len;
+        }
+    }
     return e;
+}
+
+/* The profile's regexp section: `X <matcher cycles> <attempts on 16-bit subjects> <hex bytecode>` per pattern that ran. */
+static void re_st_prof_dump(FILE *f)
+{
+    uint32_t i, k;
+    if (!re_st_tab)
+        return;
+    for (i = 0; i < RE_ST_SLOTS; i++) {
+        ReStEntry *e = &re_st_tab[i];
+        if (!e->used || !e->bc || !e->mcalls)
+            continue;
+        fprintf(f, "X %llu %llu ", (unsigned long long)e->mcyc, (unsigned long long)e->mwide);
+        for (k = 0; k < e->bclen; k++)
+            fprintf(f, "%02x", e->bc[k]);
+        fputc('\n', f);
+    }
 }
 
 /* one matcher attempt, called with the same arguments as the matcher */
@@ -99662,6 +100231,7 @@ static int re_st_match_done(JSRegExp *re, JSString *str, int start_index,
     e->mcalls++;
     e->mcyc += dt;
     e->mslen += str->len;
+    e->mwide += str->is_wide_char;
     if ((uint64_t)str->len > e->mslen_max)
         e->mslen_max = str->len;
     if (strategy >= 0 && strategy < 4)
@@ -99948,7 +100518,7 @@ static JSValue js_string___GetSubstitution(JSContext *ctx, JSValueConst this_val
         j0 = j++;
         c = string_get(rp, j++);
         if (c == '$') {
-            string_buffer_putc8(b, '$');
+            json_putc8(b, '$');
         } else if (c == '&') {
             if (string_buffer_concat_value(b, matched))
                 goto exception;
@@ -100862,14 +101432,14 @@ static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(str))
         return JS_EXCEPTION;
     string_buffer_init(ctx, b, 7);
-    string_buffer_putc8(b, '<');
+    json_putc8(b, '<');
     string_buffer_puts8(b, defs[magic].tag);
     if (defs[magic].attr) {
         // r += " " + attr + "=\"" + value + "\"";
         JSValue value;
         int i;
 
-        string_buffer_putc8(b, ' ');
+        json_putc8(b, ' ');
         string_buffer_puts8(b, defs[magic].attr);
         string_buffer_puts8(b, "=\"");
         value = JS_ToStringCheckObject(ctx, argv[0]);
@@ -100888,14 +101458,14 @@ static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst this_val,
             }
         }
         JS_FreeValue(ctx, value);
-        string_buffer_putc8(b, '\"');
+        json_putc8(b, '\"');
     }
     // return r + ">" + str + "</" + tag + ">";
-    string_buffer_putc8(b, '>');
+    json_putc8(b, '>');
     string_buffer_concat_value_free(b, str);
     string_buffer_puts8(b, "</");
     string_buffer_puts8(b, defs[magic].tag);
-    string_buffer_putc8(b, '>');
+    json_putc8(b, '>');
     return string_buffer_end(b);
 }
 
@@ -102202,11 +102772,11 @@ static JSValue js_regexp_toString(JSContext *ctx, JSValueConst this_val,
         return JS_ThrowTypeErrorNotAnObject(ctx);
 
     string_buffer_init(ctx, b, 0);
-    string_buffer_putc8(b, '/');
+    json_putc8(b, '/');
     pattern = JS_GetProperty(ctx, this_val, JS_ATOM_source);
     if (string_buffer_concat_value_free(b, pattern))
         goto fail;
-    string_buffer_putc8(b, '/');
+    json_putc8(b, '/');
     flags = JS_GetProperty(ctx, this_val, JS_ATOM_flags);
     if (string_buffer_concat_value_free(b, flags))
         goto fail;
@@ -102262,8 +102832,8 @@ static JSValue js_regexp_escape(JSContext *ctx, JSValueConst this_val,
         c = p->is_wide_char ? (uint32_t)str16(p)[i] : (uint32_t)str8(p)[i];
         if (c < 33) {
             if (c >= 9 && c <= 13) {
-                string_buffer_putc8(b, '\\');
-                string_buffer_putc8(b, "tnvfr"[c - 9]);
+                json_putc8(b, '\\');
+                json_putc8(b, "tnvfr"[c - 9]);
             } else {
                 goto hex2;
             }
@@ -102276,9 +102846,9 @@ static JSValue js_regexp_escape(JSContext *ctx, JSValueConst this_val,
             } else if (strchr(",-=<>#&!%:;@~'`\"", c)) {
                 goto hex2;
             } else if (c != '_') {
-                string_buffer_putc8(b, '\\');
+                json_putc8(b, '\\');
             }
-            string_buffer_putc8(b, c);
+            json_putc8(b, c);
         } else if (c < 256) {
         hex2:
             snprintf(s, sizeof(s), "\\x%02x", c);
@@ -102366,6 +102936,26 @@ static inline bool js_regexp_atom_starts_at(JSString *str, int start,
     return true;
 }
 
+/* Index of the first unit equal to c in s[0..n), or -1, eight units at a time where SSE2 is there. */
+static inline int js_regexp_find_u16(const uint16_t *s, unsigned c, int n)
+{
+    int i = 0;
+#if defined(__SSE2__)
+    {
+        __m128i vc = _mm_set1_epi16((short)c);
+        for (; i + 8 <= n; i += 8) {
+            int mask = _mm_movemask_epi8(_mm_cmpeq_epi16(_mm_loadu_si128((const __m128i *)(s + i)), vc));
+            if (mask)
+                return i + (__builtin_ctz((unsigned)mask) >> 1);
+        }
+    }
+#endif
+    for (; i < n; i++)
+        if (s[i] == c)
+            return i;
+    return -1;
+}
+
 /* Return the first index in [from, to) where character 'c' occurs, or -1. */
 static inline int js_regexp_indexof_char_range(JSString *str, int c,
                                                      int from, int to)
@@ -102375,10 +102965,8 @@ static inline int js_regexp_indexof_char_range(JSString *str, int c,
     if (str->is_wide_char) {
         if (c > 0xffff)
             return -1;
-        for(i = from; i < to; i++) {
-            if (str16(str)[i] == c)
-                return i;
-        }
+        i = js_regexp_find_u16(str16(str) + from, (unsigned)c, to - from);
+        return i < 0 ? -1 : from + i;
     } else if ((c & ~0xff) == 0) {
         const uint8_t *p = memchr(str8(str) + from, c, to - from);
 
@@ -102501,6 +103089,7 @@ static inline int js_regexp_match_atom(JSContext *ctx,
 /* Match a pattern with a required literal prefix: scan for the prefix, then
    run the interpreter anchored at each hit. */
 static int js_regexp_match_prefix(JSContext *ctx, uint8_t **capture,
+                                  const LreAotEntry *aot,
                                   const uint8_t *re_bytecode,
                                   const uint8_t *prefix, JSString *str,
                                   int start_index)
@@ -102523,9 +103112,9 @@ static int js_regexp_match_prefix(JSContext *ctx, uint8_t **capture,
             if (candidate < 0)
                 break;
             if (js_regexp_atom_starts_at(str, candidate, prefix)) {
-                ret = lre_exec_at(capture, re_bytecode,
-                                  get_u32(prefix + LRE_META_ENTRY_OFFSET),
-                                  str8(str), candidate, str->len, shift, ctx);
+                ret = lre_exec_at_ex(aot, capture, re_bytecode,
+                                     get_u32(prefix + LRE_META_ENTRY_OFFSET),
+                                     str8(str), candidate, str->len, shift, ctx);
                 if (ret != 0)
                     return ret;
             }
@@ -102600,6 +103189,7 @@ static int js_regexp_first_set_scan8(JSContext *ctx, const uint8_t *bitmap,
    for 8-bit strings), then run the interpreter anchored there. Handles
    patterns like \d+, \w+, [class]... that have no literal prefix. */
 static int js_regexp_match_first_set(JSContext *ctx, uint8_t **capture,
+                                     const LreAotEntry *aot,
                                      const uint8_t *re_bytecode,
                                      const uint8_t *fs, JSString *str,
                                      int start_index)
@@ -102619,8 +103209,8 @@ static int js_regexp_match_first_set(JSContext *ctx, uint8_t **capture,
                 return LRE_RET_TIMEOUT;
             if (candidate >= len)
                 break;
-            ret = lre_exec_at(capture, re_bytecode, entry, s, candidate,
-                              len, 0, ctx);
+            ret = lre_exec_at_ex(aot, capture, re_bytecode, entry, s, candidate,
+                                 len, 0, ctx);
             if (ret != 0)
                 return ret;
             candidate++;
@@ -102633,8 +103223,8 @@ static int js_regexp_match_first_set(JSContext *ctx, uint8_t **capture,
         c = string_get(str, candidate);
         in_set = (c <= 0xff) ? ((bitmap[c >> 3] >> (c & 7)) & 1) : has_wide;
         if (in_set) {
-            ret = lre_exec_at(capture, re_bytecode, entry,
-                              str8(str), candidate, len, shift, ctx);
+            ret = lre_exec_at_ex(aot, capture, re_bytecode, entry,
+                                 str8(str), candidate, len, shift, ctx);
             if (ret != 0)
                 return ret;
         }
@@ -102702,6 +103292,7 @@ static const JSReReq *js_regexp_req(JSContext *ctx, JSRegExp *re)
     if (!bc->is_wide_char) {
         int i;
         lre_analyze2(str8(bc), bc->len, &e->r);
+        e->aot = lre_aot_find(str8(bc), bc->len);
         e->lit8_ok = true;
         for (i = 0; i < e->r.len; i++) {
             if (e->r.lit[i] > 0xff)
@@ -102775,6 +103366,21 @@ static int js_regexp_find_literal(const JSReReq *e, JSString *str, int from)
         return -1;
     } else {
         const uint16_t *s = str16(str);
+        if (!ci) {
+            /* the rare unit by vector search, then the literal around it */
+            int lim = n - m + 1;
+            i = from;
+            while (i < lim) {
+                int k = js_regexp_find_u16(s + i + r, u, lim - i);
+                if (k < 0)
+                    return -1;
+                i += k;
+                if (js_regexp_lit_at(e, str, i))
+                    return i;
+                i++;
+            }
+            return -1;
+        }
         for (i = from; i + m <= n; i++) {
             unsigned c = s[i + r];
             if (ci)
@@ -102831,8 +103437,8 @@ static int js_regexp_match_bounded(JSContext *ctx, uint8_t **capture,
         if (s < next)
             s = next;
         for (; s <= at; s++) {
-            rc = lre_exec_at(capture, d->bytecode, e->r.entry, str8(str), s,
-                             str->len, str->is_wide_char, ctx);
+            rc = lre_exec_at_ex(e->aot, capture, d->bytecode, e->r.entry, str8(str), s,
+                                str->len, str->is_wide_char, ctx);
             if (rc != 0)
                 return rc;
         }
@@ -102867,8 +103473,8 @@ static int js_regexp_match_generic(JSContext *ctx, uint8_t **capture,
                 if (s[k] != e->r.apre[k])
                     return 0;
         }
-        return lre_exec_at(capture, d->bytecode, e->r.entry, str8(str), 0,
-                           str->len, str->is_wide_char, ctx);
+        return lre_exec_at_ex(e->aot, capture, d->bytecode, e->r.entry, str8(str), 0,
+                              str->len, str->is_wide_char, ctx);
     }
     {
         int rc = js_regexp_match_bounded(ctx, capture, d, e, str, start_index);
@@ -102877,8 +103483,8 @@ static int js_regexp_match_generic(JSContext *ctx, uint8_t **capture,
     }
     if (!js_regexp_req_start(e, str, &start_index))
         return 0;
-    return lre_exec(capture, d->bytecode, str8(str), start_index,
-                    str->len, str->is_wide_char, ctx);
+    return lre_exec_ex(e ? e->aot : NULL, capture, d->bytecode, str8(str), start_index,
+                       str->len, str->is_wide_char, ctx);
 }
 
 /* Run one match attempt starting at 'start_index', choosing the fastest
@@ -102887,23 +103493,30 @@ static inline int
 js_regexp_match_raw(JSContext *ctx, uint8_t **capture, const JSRegExpExecData *d,
                     JSRegExp *re, JSString *str, int start_index)
 {
+    const LreAotEntry *e_aot = NULL;
+
     switch (d->strategy) {
     case JS_REGEXP_MATCH_ATOM:
         return js_regexp_match_atom(ctx, capture, str, d->metadata, re->pattern,
                                     start_index);
     case JS_REGEXP_MATCH_PREFIX:
-        return js_regexp_match_prefix(ctx, capture, d->bytecode, d->metadata,
-                                      str, start_index);
+        {
+            const JSReReq *e = lre_aot_count ? js_regexp_req(ctx, re) : NULL;
+            return js_regexp_match_prefix(ctx, capture, e ? e->aot : NULL,
+                                          d->bytecode, d->metadata,
+                                          str, start_index);
+        }
     case JS_REGEXP_MATCH_FIRST_SET:
         {
             const JSReReq *e = js_regexp_req(ctx, re);
             int rc = js_regexp_match_bounded(ctx, capture, d, e, str, start_index);
+            e_aot = e ? e->aot : NULL;
             if (rc != JS_REGEXP_NOT_BOUNDED)
                 return rc;
             if (!js_regexp_req_start(e, str, &start_index))
                 return 0;
         }
-        return js_regexp_match_first_set(ctx, capture, d->bytecode,
+        return js_regexp_match_first_set(ctx, capture, e_aot, d->bytecode,
                                          d->metadata, str, start_index);
     case JS_REGEXP_MATCH_GENERIC:
     default:
@@ -103025,6 +103638,7 @@ static void js_regexp_snapshot(JSContext *ctx)
         n++;
     }
     atoms[n++] = JS_ATOM_Symbol_match;
+    atoms[n++] = JS_ATOM_Symbol_replace;
     for (i = 0; i < n; i++) {
         idx[i] = js_regexp_snap_slot(ctx, proto, atoms[i], &getter[i]);
         if (idx[i] < 0)
@@ -103349,7 +103963,7 @@ static void js_regexp_substitute(StringBuffer *b, JSString *rp, JSString *sp,
         j0 = j++;
         c = string_get(rp, j++);
         if (c == '$') {
-            string_buffer_putc8(b, '$');
+            json_putc8(b, '$');
         } else if (c == '&') {
             string_buffer_concat(b, sp, e[0], e[1]);
         } else if (c == '`') {
@@ -103421,6 +104035,50 @@ static JSValue js_regexp_replace_fast(JSContext *ctx, JSObject *rxo,
         return js_dup(S);
     }
     has_dollar = !functional && string_indexof_char(rp, '$', 0) >= 0;
+    if (!functional && !has_dollar && !sp->is_wide_char && !rp->is_wide_char) {
+        /* 8-bit subject and replacement without `$`: the result length is known from the match vector, so the string is allocated once at its
+           size and filled by copying the spans (no growing buffer, no trimming realloc) */
+        int64_t total = 0;
+        JSString *out;
+        uint8_t *w;
+        for (mi = 0; mi < m.n; mi++) {
+            const int32_t *e = m.v + mi * m.stride;
+            if (e[0] >= next) {
+                total += (int64_t)(e[0] - next) + rp->len;
+                next = e[1];
+            }
+        }
+        total += (int64_t)sp->len - next;
+        if (total == 0) {
+            js_re_matches_free(&m);
+            return js_empty_string(ctx->rt);
+        }
+        if (total > JS_STRING_LEN_MAX) {
+            js_re_matches_free(&m);
+            return JS_ThrowRangeError(ctx, "invalid string length");
+        }
+        out = js_alloc_string(ctx, (int)total, 0);
+        if (!out) {
+            js_re_matches_free(&m);
+            return JS_EXCEPTION;
+        }
+        w = str8(out);
+        next = 0;
+        for (mi = 0; mi < m.n; mi++) {
+            const int32_t *e = m.v + mi * m.stride;
+            if (e[0] >= next) {
+                memcpy(w, str8(sp) + next, (size_t)(e[0] - next));
+                w += e[0] - next;
+                memcpy(w, str8(rp), rp->len);
+                w += rp->len;
+                next = e[1];
+            }
+        }
+        memcpy(w, str8(sp) + next, (size_t)(sp->len - next));
+        w[sp->len - next] = 0;
+        js_re_matches_free(&m);
+        return JS_MKPTR(JS_TAG_STRING, out);
+    }
     string_buffer_init(ctx, b, 0);
     if (functional && ncap + 2 > (int)countof(args_stack)) {
         args = js_malloc(ctx, sizeof(args[0]) * (ncap + 2));
@@ -104358,6 +105016,64 @@ static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx)
     }
     return res;
 }
+
+#if QJS_AOT
+/* `str.replace(re, rep).length` of a compiled body, without making the result string: `this_val` and `rep` are flat strings, `rx` a pristine
+   RegExp (its replace method, its exec and its flags are the original ones), `rep` has no `$`. The length is the one the replacement
+   would have; a global RegExp's lastIndex is left at 0 as replace leaves it. Returns 0 with nothing observable done when any of that does
+   not hold (or the match failed in a way that throws: the exception is cleared and the caller's ordinary call throws it), so the
+   caller repeats the call. */
+QJS_AOT_STUB int qjs_aot_replace_len(JSContext *ctx, JSValue this_val, JSValue rx, JSValue rep, int32_t *out)
+{
+    JSRegExp *re;
+    const uint8_t *bc;
+    JSString *sp, *rp;
+    JSReMatches m;
+    int flags, ncap, next = 0;
+    bool global;
+    int64_t total = 0;
+    size_t mi;
+
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_STRING || JS_VALUE_GET_TAG(rep) != JS_TAG_STRING)
+        return 0;
+    re = js_regexp_fast(ctx, rx);
+    if (!re)
+        return 0;
+    sp = JS_VALUE_GET_STRING(this_val);
+    rp = JS_VALUE_GET_STRING(rep);
+    if (string_indexof_char(rp, '$', 0) >= 0)
+        return 0;
+    bc = str8(re->bytecode);
+    flags = lre_get_flags(bc);
+    ncap = lre_get_capture_count(bc);
+    global = (flags & LRE_FLAG_GLOBAL) != 0;
+    if ((flags & LRE_FLAG_NAMED_GROUPS) || ((flags & LRE_FLAG_STICKY) && !global))
+        return 0;
+    js_re_matches_init(&m, ctx, ncap);
+    if (global)
+        JS_VALUE_GET_OBJ(rx)->prop[0].u.value = js_int32(0);
+    if (js_regexp_match_loop(ctx, re, sp, global,
+                             (flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0,
+                             &m)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        js_re_matches_free(&m);
+        return 0;
+    }
+    for (mi = 0; mi < m.n; mi++) {
+        const int32_t *e = m.v + mi * m.stride;
+        if (e[0] >= next) {
+            total += (int64_t)(e[0] - next) + rp->len;
+            next = e[1];
+        }
+    }
+    total += (int64_t)sp->len - next;
+    js_re_matches_free(&m);
+    if (total > JS_STRING_LEN_MAX)
+        return 0;
+    *out = (int32_t)total;
+    return 1;
+}
+#endif
 
 static JSValue js_regexp_Symbol_replace_body(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv);
@@ -105314,6 +106030,14 @@ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
 
 static void json_shape_cache_free(JSContext *ctx, JSParseState *s)
 {
+    if (s->json_kcache) {
+        int q;
+        for (q = 0; q < JSON_KCACHE_N; q++)
+            if (s->json_kcache[q] != JS_ATOM_NULL)
+                JS_FreeAtom(ctx, s->json_kcache[q]);
+        js_free(ctx, s->json_kcache);
+        s->json_kcache = NULL;
+    }
     int i, k;
     if (!s->json_shapes)
         return;
@@ -105325,6 +106049,8 @@ static void json_shape_cache_free(JSContext *ctx, JSParseState *s)
             js_free(ctx, c->shapes);
         }
         js_free(ctx, c->atoms);
+        js_free(ctx, c->plain);
+        js_free(ctx, c->k16);
     }
     js_free(ctx, s->json_shapes);
     s->json_shapes = NULL;
@@ -105371,6 +106097,18 @@ static int json_shape_cache_reserve(JSContext *ctx, JSONShapeCache *c, int n)
     if (!na)
         return -1;
     c->atoms = na;
+    {
+        uint8_t *np = js_realloc(ctx, c->plain, newcap);
+        if (!np)
+            return -1;
+        c->plain = np;
+    }
+    {
+        uint8_t (*nk)[16] = js_realloc(ctx, c->k16, sizeof(*nk) * newcap);
+        if (!nk)
+            return -1;
+        c->k16 = nk;
+    }
     ns = js_realloc(ctx, c->shapes, sizeof(JSShape *) * (newcap + 1));
     if (!ns)
         return -1;
@@ -105400,6 +106138,114 @@ static int json_obj_adopt_shape(JSContext *ctx, JSObject *p, JSShape *new_sh,
     return 0;
 }
 
+/* Whether the atom is an 8-bit string whose every byte a JSON key holds unescaped (printable ASCII, no quote, no backslash). */
+static bool json_atom_plain(JSContext *ctx, JSAtom a)
+{
+    JSString *ap;
+    const uint8_t *q;
+    uint32_t i;
+
+    if (__JS_AtomIsTaggedInt(a))
+        return false;
+    ap = ctx->rt->atom_array[a];
+    if (ap->is_wide_char)
+        return false;
+    q = str8(ap);
+    for (i = 0; i < ap->len; i++)
+        if (q[i] < 0x20 || q[i] >= 0x80 || q[i] == '"' || q[i] == '\\')
+            return false;
+    return true;
+}
+
+/* A new object for JSON.parse at `depth`, with inline room for as many properties as the last object built there had (the cached
+   chain's length), so filling it in the expected shape never grows its property array */
+static JSValue json_new_object(JSContext *ctx, JSParseState *s, int depth)
+{
+    uint32_t cap = depth < s->json_shapes_len && s->json_shapes ? s->json_shapes[depth].n : 0;
+    return JS_NewObjectProtoClassCap(ctx, ctx->class_proto[JS_CLASS_OBJECT], JS_CLASS_OBJECT, cap);
+}
+
+/* The shape cache of `depth` for a new object being built (see JSONShapeCache): *matched when the cached chain starts at its shape. */
+static JSONShapeCache *json_obj_begin(JSContext *ctx, JSParseState *s, int depth, JSObject *jsobj, int *matched)
+{
+    JSONShapeCache *jsc = json_shape_cache_at(ctx, s, depth);
+
+    *matched = 0;
+    if (jsc) {
+        if (!jsc->shapes) {
+            /* first object at this depth: remember its base shape */
+            if (json_shape_cache_reserve(ctx, jsc, 1) == 0)
+                jsc->shapes[0] = js_dup_shape(jsobj->shape);
+            else
+                jsc = NULL;
+        }
+        if (jsc && jsc->n > 0 && jsc->shapes[0] == jsobj->shape)
+            *matched = 1;
+    }
+    return jsc;
+}
+
+/* Add the k-th property (prop_name and prop_val, both owned and consumed) to the object being built at `depth`: the cached shape when
+   the transition is the expected one, else a define that rebuilds the cache from k. Returns < 0 on an exception. */
+static int json_obj_add(JSContext *ctx, JSParseState *s, int depth, JSValue val, JSObject *jsobj, int k, int *matched,
+                        JSAtom prop_name, JSValue prop_val)
+{
+    /* fetched here: a nested object may have grown the cache array */
+    JSONShapeCache *jsc = json_shape_cache_at(ctx, s, depth);
+    int ret;
+
+    if (jsc && *matched && k < jsc->n &&
+        jsc->atoms[k] == prop_name &&
+        jsc->shapes[k] == jsobj->shape &&
+        jsc->shapes[k + 1] != jsc->shapes[k]) {
+        /* expected transition: adopt the cached shape */
+        JSShape *nsh = jsc->shapes[k + 1];
+        if (json_obj_adopt_shape(ctx, jsobj, nsh, prop_val)) {
+            JS_FreeValue(ctx, prop_val);
+            JS_FreeAtom(ctx, prop_name);
+            return -1;
+        }
+        ret = 0;
+    } else {
+        if (jsc && *matched) {
+            /* diverged: drop the stale tail and rebuild */
+            int j;
+            if (k < jsc->n) {
+                for (j = k + 1; j <= jsc->n; j++)
+                    js_free_shape(ctx->rt, jsc->shapes[j]);
+                for (j = k; j < jsc->n; j++)
+                    JS_FreeAtom(ctx, jsc->atoms[j]);
+                jsc->n = k;
+                jsc->gen++;
+            }
+            *matched = 0;
+        }
+        ret = JS_DefinePropertyValue(ctx, val, prop_name,
+                                     prop_val, JS_PROP_C_W_E);
+        /* the chain is extended only where it ends (an earlier reservation failure, or an object that did not start on it, leaves it as it is) */
+        if (ret >= 0 && jsc && jsc->n == k) {
+            if (json_shape_cache_reserve(ctx, jsc, k + 1) == 0) {
+                jsc->atoms[k] = JS_DupAtom(ctx, prop_name);
+                jsc->plain[k] = json_atom_plain(ctx, prop_name);
+                if (jsc->plain[k]) {
+                    JSString *ap = ctx->rt->atom_array[prop_name];
+                    if (ap->len <= 14) {
+                        memset(jsc->k16[k], 0, 16);
+                        memcpy(jsc->k16[k], json_str8(ap), ap->len);
+                        jsc->k16[k][ap->len] = '"';
+                        jsc->k16[k][15] = (uint8_t)ap->len;
+                        jsc->plain[k] = 2;
+                    }
+                }
+                jsc->shapes[k + 1] = js_dup_shape(jsobj->shape);
+                jsc->n = k + 1;
+            }
+        }
+    }
+    JS_FreeAtom(ctx, prop_name);
+    return ret;
+}
+
 /* 'pr' can be NULL */
 static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
 {
@@ -105425,9 +106271,9 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
             JSObject *jsobj;
             int pr_size, k, matched;
 
-            if (json_next_key_token(s))
+            if (json_next_key_token_hint(s, depth < s->json_shapes_len ? &s->json_shapes[depth] : NULL, 0))
                 goto fail;
-            val = JS_NewObject(ctx);
+            val = json_new_object(ctx, s, depth);
             if (JS_IsException(val))
                 goto fail;
             if (pr) {
@@ -105436,19 +106282,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
             }
             jsobj = JS_VALUE_GET_OBJ(val);
             k = 0;
-            matched = 0;
-            jsc = json_shape_cache_at(ctx, s, depth);
-            if (jsc) {
-                if (!jsc->shapes) {
-                    /* first object at this depth: remember its base shape */
-                    if (json_shape_cache_reserve(ctx, jsc, 1) == 0)
-                        jsc->shapes[0] = js_dup_shape(jsobj->shape);
-                    else
-                        jsc = NULL;
-                }
-                if (jsc && jsc->n > 0 && jsc->shapes[0] == jsobj->shape)
-                    matched = 1;
-            }
+            jsc = json_obj_begin(ctx, s, depth, jsobj, &matched);
             if (s->token.val != '}') {
                 for(;;) {
                     if (s->token.val == TOK_STRING || s->token.val == TOK_IDENT) {
@@ -105484,46 +106318,9 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
                         JS_FreeAtom(ctx, prop_name);
                         goto fail;
                     }
+                    ret = json_obj_add(ctx, s, depth, val, jsobj, k, &matched, prop_name, prop_val);
                     /* re-fetch: a nested object may have grown the cache array */
                     jsc = json_shape_cache_at(ctx, s, depth);
-                    if (jsc && matched && k < jsc->n &&
-                        jsc->atoms[k] == prop_name &&
-                        jsc->shapes[k] == jsobj->shape &&
-                        jsc->shapes[k + 1] != jsc->shapes[k]) {
-                        /* expected transition: adopt the cached shape */
-                        JSShape *nsh = jsc->shapes[k + 1];
-                        if (json_obj_adopt_shape(ctx, jsobj, nsh, prop_val)) {
-                            JS_FreeValue(ctx, prop_val);
-                            JS_FreeAtom(ctx, prop_name);
-                            goto fail;
-                        }
-                        ret = 0;
-                    } else {
-                        if (jsc && matched) {
-                            /* diverged: drop the stale tail and rebuild */
-                            int j;
-                            if (k < jsc->n) {
-                                for (j = k + 1; j <= jsc->n; j++)
-                                    js_free_shape(ctx->rt, jsc->shapes[j]);
-                                for (j = k; j < jsc->n; j++)
-                                    JS_FreeAtom(ctx, jsc->atoms[j]);
-                                jsc->n = k;
-                            }
-                            matched = 0;
-                        }
-                        ret = JS_DefinePropertyValue(ctx, val, prop_name,
-                                                     prop_val, JS_PROP_C_W_E);
-                        if (ret >= 0 && jsc) {
-                            if (json_shape_cache_reserve(ctx, jsc, k + 1) == 0) {
-                                jsc->atoms[k] = JS_DupAtom(ctx, prop_name);
-                                jsc->shapes[k + 1] = js_dup_shape(jsobj->shape);
-                                jsc->n = k + 1;
-                            } else {
-                                jsc = NULL;
-                            }
-                        }
-                    }
-                    JS_FreeAtom(ctx, prop_name);
                     if (ret < 0)
                         goto fail;
                     k++;
@@ -105534,7 +106331,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
                         json_parse_error(s, s->token.ptr, "Expected ',' or '}' after property value");
                         goto fail;
                     }
-                    if (json_next_key_token(s))
+                    if (json_next_key_token_hint(s, jsc && matched ? jsc : NULL, k))
                         goto fail;
                 }
             }
@@ -105696,13 +106493,325 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
     return JS_EXCEPTION;
 }
 
-static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf_len,
-                                     const char *filename, JSONParseRecord *pr)
+/* The direct parser of JSON.parse without a reviver: bytes to values with no token stream (no position bookkeeping, no token to free
+   per punctuation mark). It uses the general parser's own string, key and number readers and its object building (the shape cache,
+   the expected keys), and gives up on anything it does not expect -- any syntax error included -- by returning -1; the caller then
+   parses the whole input again with the general parser, which gives every error and its message. */
+static inline const uint8_t *json_fast_ws(const uint8_t *p)
+{
+    while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')
+        p++;
+    return p;
+}
+
+/* json_fast_value's shape-cache slot for a value under the one at `slot`: the member named `key`, or (JS_ATOM_NULL) an array element.
+   Objects reached by the same path share a slot, so siblings at one depth with different keys (an "address" and a "manager") keep
+   their own chains; a collision only costs a rebuild, since every use of a chain checks its shapes and keys. Slot 0 is the root. */
+#define JSON_SLOTS 32
+static inline int json_child_slot(int slot, JSAtom key)
+{
+    uint32_t h = ((uint32_t)slot + 1) * 0x9E3779B1u ^ (uint32_t)key * 0x85EBCA77u;
+    return 1 + (int)((h >> 27) % (JSON_SLOTS - 1));
+}
+
+/* `depth` is the shape-cache slot (json_child_slot), not the nesting depth */
+static int json_fast_value(JSParseState *s, const uint8_t **pp, int depth, JSValue *out)
+{
+    JSContext *ctx = s->ctx;
+    const uint8_t *p = *pp;
+    JSValue val;
+
+    if (js_check_stack_overflow(ctx->rt, 0))
+        return -1;
+    switch (*p) {
+    case '"':
+        p++;
+        if (json_parse_string(s, &p))
+            return -1;
+        /* the string moves out of the token */
+        *out = s->token.u.str.str;
+        s->token.val = ' ';
+        *pp = p;
+        return 0;
+    case '-': case '0': case '1': case '2': case '3': case '4':
+    case '5': case '6': case '7': case '8': case '9':
+        {
+            const uint8_t *q = p + (*p == '-');
+            if (!is_digit(*q) || (q[0] == '0' && is_digit(q[1])))
+                return -1;
+            if (json_parse_number(s, &p))
+                return -1;
+            *out = s->token.u.num.val;
+            s->token.val = ' ';
+            *pp = p;
+            return 0;
+        }
+    case 't':
+        if (p[1] == 'r' && p[2] == 'u' && p[3] == 'e') { *out = JS_TRUE; p += 4; break; }
+        return -1;
+    case 'f':
+        if (p[1] == 'a' && p[2] == 'l' && p[3] == 's' && p[4] == 'e') { *out = JS_FALSE; p += 5; break; }
+        return -1;
+    case 'n':
+        if (p[1] == 'u' && p[2] == 'l' && p[3] == 'l') { *out = JS_NULL; p += 4; break; }
+        return -1;
+    case '[':
+        {
+            JSValue *elems = NULL, el;
+            int elems_size = 0, n = 0;
+            p = json_fast_ws(p + 1);
+            if (*p != ']') {
+                for (;;) {
+                    if (n >= elems_size) {
+                        int ns2 = elems_size ? elems_size * 2 : 8;
+                        JSValue *ne = js_realloc(ctx, elems, sizeof(JSValue) * ns2);
+                        if (!ne)
+                            goto arr_fail;
+                        elems = ne;
+                        elems_size = ns2;
+                    }
+                    if (json_fast_value(s, &p, json_child_slot(depth, JS_ATOM_NULL), &el))
+                        goto arr_fail;
+                    elems[n++] = el;
+                    p = json_fast_ws(p);
+                    if (*p == ']')
+                        break;
+                    if (*p != ',')
+                        goto arr_fail;
+                    p = json_fast_ws(p + 1);
+                }
+            }
+            val = js_new_array_from_owned(ctx, n, elems);
+            if (JS_IsException(val))
+                return -1;
+            *out = val;
+            p++;
+            break;
+        arr_fail:
+            while (n > 0)
+                JS_FreeValue(ctx, elems[--n]);
+            js_free(ctx, elems);
+            return -1;
+        }
+    case '{':
+        {
+            JSObject *jsobj;
+            JSONShapeCache *jsc;
+            JSAtom prop_name;
+            JSValue prop_val;
+            int k = 0, matched;
+
+            val = json_new_object(ctx, s, depth);
+            if (JS_IsException(val))
+                return -1;
+            jsobj = JS_VALUE_GET_OBJ(val);
+            jsc = json_obj_begin(ctx, s, depth, jsobj, &matched);
+            p = json_fast_ws(p + 1);
+            if (*p != '}') {
+                for (;;) {
+                    if (*p != '"')
+                        goto obj_fail;
+                    p++;
+                    /* the expected next key, plain: its bytes compared in place, the value read here and stored with the cached
+                       shape; the key atom is only borrowed from the chain (a string, number or literal reader touches no shape
+                       cache; after a nested value the chain's generation says whether entry k still holds) */
+                    if (jsc && matched && k < jsc->n && jsc->plain[k] && jsc->shapes[k] == jsobj->shape &&
+                        jsc->shapes[k + 1] != jsc->shapes[k]) {
+                        uint32_t n;
+                        const uint8_t *q;
+                        bool kmatch;
+#if defined(__SSE2__)
+                        if (jsc->plain[k] == 2 && s->buf_end - p >= 16) {
+                            /* the key and its closing quote against the stored 16 bytes, one compare */
+                            unsigned mask;
+                            n = jsc->k16[k][15];
+                            mask = (2u << n) - 1;
+                            kmatch = (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)p),
+                                                                       _mm_loadu_si128((const __m128i *)jsc->k16[k]))) & mask) == mask;
+                        } else
+#endif
+                        {
+                            JSString *ap = ctx->rt->atom_array[jsc->atoms[k]];
+                            n = ap->len;
+                            kmatch = (size_t)(s->buf_end - p) > n + 1 && p[n] == '"' && memcmp(json_str8(ap), p, n) == 0;
+                        }
+                        if (kmatch) {
+                            q = json_fast_ws(p + n + 1);
+                            if (*q == ':') {
+                                const uint8_t *kp = p;
+                                q = json_fast_ws(q + 1);
+                                switch (*q) {
+                                case '"':
+                                    q++;
+                                    if (json_parse_string(s, &q))
+                                        goto obj_fail;
+                                    prop_val = s->token.u.str.str;
+                                    s->token.val = ' ';
+                                    break;
+                                case '-': case '0': case '1': case '2': case '3': case '4':
+                                case '5': case '6': case '7': case '8': case '9':
+                                    {
+                                        const uint8_t *d = q + (*q == '-');
+                                        if (!is_digit(*d) || (d[0] == '0' && is_digit(d[1])))
+                                            goto obj_fail;
+                                        if (json_parse_number(s, &q))
+                                            goto obj_fail;
+                                        prop_val = s->token.u.num.val;
+                                        s->token.val = ' ';
+                                    }
+                                    break;
+                                case 't':
+                                    if (q[1] != 'r' || q[2] != 'u' || q[3] != 'e')
+                                        goto obj_fail;
+                                    prop_val = JS_TRUE;
+                                    q += 4;
+                                    break;
+                                case 'f':
+                                    if (q[1] != 'a' || q[2] != 'l' || q[3] != 's' || q[4] != 'e')
+                                        goto obj_fail;
+                                    prop_val = JS_FALSE;
+                                    q += 5;
+                                    break;
+                                case 'n':
+                                    if (q[1] != 'u' || q[2] != 'l' || q[3] != 'l')
+                                        goto obj_fail;
+                                    prop_val = JS_NULL;
+                                    q += 4;
+                                    break;
+                                default:
+                                    {
+                                        /* a nested value may rebuild this chain (a slot collision): its entry k is used only
+                                           if no entry below n was dropped meanwhile, else the key is read again from the input
+                                           and added the general way */
+                                        uint32_t gen = jsc->gen;
+                                        if (json_fast_value(s, &q, json_child_slot(depth, jsc->atoms[k]), &prop_val))
+                                            goto obj_fail;
+                                        jsc = json_shape_cache_at(ctx, s, depth);
+                                        if (!(jsc && jsc->gen == gen && k < jsc->n && jsc->shapes[k] == jsobj->shape &&
+                                              jsc->shapes[k + 1] != jsc->shapes[k])) {
+                                            JSAtom a2 = JS_NewAtomLen(ctx, (const char *)kp, n);
+                                            if (a2 == JS_ATOM_NULL) {
+                                                JS_FreeValue(ctx, prop_val);
+                                                goto obj_fail;
+                                            }
+                                            if (json_obj_add(ctx, s, depth, val, jsobj, k, &matched, a2, prop_val) < 0)
+                                                goto obj_fail;
+                                            jsc = json_shape_cache_at(ctx, s, depth);
+                                            goto fast_next;
+                                        }
+                                    }
+                                    break;
+                                }
+                                if (json_obj_adopt_shape(ctx, jsobj, jsc->shapes[k + 1], prop_val)) {
+                                    JS_FreeValue(ctx, prop_val);
+                                    goto obj_fail;
+                                }
+                            fast_next:
+                                k++;
+                                p = json_fast_ws(q);
+                                if (*p == '}')
+                                    break;
+                                if (*p != ',')
+                                    goto obj_fail;
+                                p = json_fast_ws(p + 1);
+                                continue;
+                            }
+                        }
+                    }
+                    if (jsc && matched && jsc->atoms && k < jsc->n && jsc->plain[k])
+                        s->json_key_hint = jsc->atoms[k];
+                    if (json_parse_key_string(s, &p)) {
+                        s->json_key_hint = JS_ATOM_NULL;
+                        goto obj_fail;
+                    }
+                    s->json_key_hint = JS_ATOM_NULL;
+                    if (s->token.val == TOK_IDENT) {
+                        prop_name = s->token.u.ident.atom;
+                    } else {
+                        prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
+                        JS_FreeValue(ctx, s->token.u.str.str);
+                        if (prop_name == JS_ATOM_NULL) {
+                            s->token.val = ' ';
+                            goto obj_fail;
+                        }
+                    }
+                    s->token.val = ' ';
+                    p = json_fast_ws(p);
+                    if (*p != ':') {
+                        JS_FreeAtom(ctx, prop_name);
+                        goto obj_fail;
+                    }
+                    p = json_fast_ws(p + 1);
+                    if (json_fast_value(s, &p, json_child_slot(depth, prop_name), &prop_val)) {
+                        JS_FreeAtom(ctx, prop_name);
+                        goto obj_fail;
+                    }
+                    if (json_obj_add(ctx, s, depth, val, jsobj, k, &matched, prop_name, prop_val) < 0)
+                        goto obj_fail;
+                    jsc = json_shape_cache_at(ctx, s, depth);
+                    k++;
+                    p = json_fast_ws(p);
+                    if (*p == '}')
+                        break;
+                    if (*p != ',')
+                        goto obj_fail;
+                    p = json_fast_ws(p + 1);
+                }
+            }
+            *out = val;
+            p++;
+            break;
+        obj_fail:
+            JS_FreeValue(ctx, val);
+            return -1;
+        }
+    default:
+        return -1;
+    }
+    *pp = p;
+    return 0;
+}
+
+/* The whole input by json_fast_value; JS_UNINITIALIZED when it gave up (nothing pending: an exception one of its readers threw is
+   cleared, except an uncatchable one, which is returned as JS_EXCEPTION). */
+static JSValue json_fast_parse(JSContext *ctx, const char *buf, size_t buf_len, bool latin1)
+{
+    JSParseState s1, *s = &s1;
+    const uint8_t *p;
+    JSValue val = JS_UNDEFINED;
+    int ok;
+
+    js_parse_init(ctx, s, buf, buf_len, "<input>", 1);
+    s->json_latin1 = latin1;
+    p = json_fast_ws((const uint8_t *)buf);
+    ok = json_fast_value(s, &p, 0, &val) == 0;
+    if (ok) {
+        p = json_fast_ws(p);
+        if (p != s->buf_end) {
+            JS_FreeValue(ctx, val);
+            ok = 0;
+        }
+    }
+    json_shape_cache_free(ctx, s);
+    if (ok)
+        return val;
+    if (JS_HasException(ctx)) {
+        JSValue exc = JS_GetException(ctx);
+        if (JS_IsUncatchableError(exc))
+            return JS_Throw(ctx, exc);
+        JS_FreeValue(ctx, exc);
+    }
+    return JS_UNINITIALIZED;
+}
+
+static JSValue JS_ParseJSON_internal2(JSContext *ctx, const char *buf, size_t buf_len,
+                                      const char *filename, JSONParseRecord *pr, bool latin1)
 {
     JSParseState s1, *s = &s1;
     JSValue val = JS_UNDEFINED;
 
     js_parse_init(ctx, s, buf, buf_len, filename, 1);
+    s->json_latin1 = latin1;
     if (json_next_token(s))
         goto fail;
     val = json_parse_value(s, pr, 0);
@@ -105721,6 +106830,12 @@ static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf
     JS_FreeValue(ctx, val);
     free_token(s, &s->token);
     return JS_EXCEPTION;
+}
+
+static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf_len,
+                                     const char *filename, JSONParseRecord *pr)
+{
+    return JS_ParseJSON_internal2(ctx, buf, buf_len, filename, pr, false);
 }
 
 /* 'buf' must be zero terminated i.e. buf[buf_len] = '\0'. */
@@ -105836,1102 +106951,6 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
 }
 
 
-/* ---- Lazy JSON.parse ----
-   Large documents use a shared validated source and tape for direct materialization.
-   QJS_JSON_LAZY=0/1 overrides the per-runtime default for testing. */
-
-#define QJS_JSON_LAZY_DOC_MIN_LEN 4096U
-
-typedef enum JSONLazyType {
-    JSON_LAZY_STRING,
-    JSON_LAZY_NUMBER,
-    JSON_LAZY_TRUE,
-    JSON_LAZY_FALSE,
-    JSON_LAZY_NULL,
-    JSON_LAZY_OBJECT,
-    JSON_LAZY_ARRAY,
-} JSONLazyType;
-
-typedef struct JSONLazyTapeNode {
-    uint32_t start;
-    uint32_t end;
-    uint32_t first_child;
-    uint32_t next_sibling;
-    uint32_t child_count;
-    uint32_t key_start;
-    uint32_t key_length;
-    uint8_t type;
-    uint8_t feedback_slot;
-} JSONLazyTapeNode;
-
-typedef struct JSONLazyLayoutEntry {
-    JSAtom atom;
-    uint32_t slot;
-} JSONLazyLayoutEntry;
-
-typedef struct JSONLazyLayout {
-    JSValue template;
-    JSONLazyLayoutEntry *entries;
-    uint32_t document_slot;
-    uint32_t count;
-    uint32_t instance_count;
-    uint32_t slot_access_count[8];
-    uint8_t hot_slot_mask;
-    int valid;
-} JSONLazyLayout;
-
-typedef struct JSONLazyDocument {
-    uint32_t source_len;
-    JSONLazyTapeNode *nodes;
-    uint32_t node_count;
-    uint32_t node_capacity;
-    JSONLazyLayout layout;
-    char source[];
-} JSONLazyDocument;
-
-static JSClassID js_lazy_document_class_id;
-static void json_lazy_layout_release(JSRuntime *rt, JSONLazyLayout *layout);
-
-static int js_lazy_marker_is(JSValueConst v)
-{
-    return JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON;
-}
-
-static JSValue js_lazy_marker_new(uint32_t idx)
-{
-    return JS_MKVAL(JS_TAG_LAZY_JSON, idx);
-}
-
-static uint32_t js_lazy_marker_index(JSValueConst v)
-{
-    return (uint32_t)JS_VALUE_GET_INT(v);
-}
-
-static void json_lazy_layout_feedback(JSONLazyLayout *layout, uint32_t slot)
-{
-    uint32_t i;
-    if (!layout || !layout->valid || slot >= layout->count || slot >= 8)
-        return;
-    layout->slot_access_count[slot]++;
-    if (layout->instance_count < 32 || (layout->instance_count & 7) != 0)
-        return;
-    layout->hot_slot_mask = 0;
-    for (i = 0; i < layout->count && i < 8; i++) {
-        if (layout->slot_access_count[i] * 4 >=
-            layout->instance_count * 3)
-            layout->hot_slot_mask |= (uint8_t)(1U << i);
-    }
-}
-
-static const JSAtom js_lazy_document_atom = JS_ATOM_Private_brand;
-
-static JSValue js_lazy_get_document(JSContext *ctx, JSObject *holder)
-{
-    JSProperty *pr;
-    JSShapeProperty *prs;
-    prs = find_own_property(&pr, holder, js_lazy_document_atom);
-    if (!prs || !pr || JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
-        return JS_ThrowInternalError(ctx, "lazy JSON document missing");
-    return js_dup(pr->u.value);
-}
-
-static int js_lazy_set_document(JSContext *ctx, JSValueConst holder,
-                               JSValueConst backing)
-{
-    return JS_DefinePropertyValue(ctx, holder, js_lazy_document_atom,
-                                  js_dup(backing), JS_PROP_C_W_E);
-}
-
-static int js_lazy_container_has_markers(JSObject *holder)
-{
-    uint32_t i;
-    if (holder->class_id == JS_CLASS_ARRAY && holder->fast_array) {
-        if (!JS_ARR_GENERIC(holder))
-            return 0;
-        for (i = 0; i < holder->u.array.count; i++) {
-            if (js_lazy_marker_is(JS_ARR_VALS(holder)[i]))
-                return 1;
-        }
-        return 0;
-    }
-    {
-        JSShapeProperty *prs = get_shape_prop(holder->shape);
-        for (i = 0; i < (uint32_t)holder->shape->prop_size; i++, prs++) {
-            if (prs->atom == JS_ATOM_NULL ||
-                prs->atom == js_lazy_document_atom ||
-                (prs->flags & JS_PROP_TMASK))
-                continue;
-            if (js_lazy_marker_is(holder->prop[i].u.value))
-                return 1;
-        }
-    }
-    return 0;
-}
-
-/* Keep the private slot in the shape, but release its document once this
-   container no longer has any deferred values of its own. */
-static void js_lazy_release_document_if_complete(JSContext *ctx,
-                                                 JSObject *holder)
-{
-    JSProperty *pr;
-    JSShapeProperty *prs;
-    if (js_lazy_container_has_markers(holder))
-        return;
-    prs = find_own_property(&pr, holder, js_lazy_document_atom);
-    if (prs && pr && !(prs->flags & JS_PROP_TMASK) &&
-        JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_OBJECT) {
-        JSValue document = pr->u.value;
-        pr->u.value = JS_UNDEFINED;
-        JS_FreeValue(ctx, document);
-    }
-}
-
-static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
-                                                JSONLazyDocument *doc,
-                                                uint32_t node_index,
-                                                JSValueConst document,
-                                                JSONLazyLayout *layout_hint);
-static JSValue js_lazy_eager_parse_range(JSContext *ctx, const char *base,
-                                        uint32_t start, uint32_t len);
-
-static JSValue js_lazy_materialize_slot(JSContext *ctx, JSValue *slot, JSObject *holder)
-{
-    JSONLazyDocument *b;
-    JSValue backing;
-    JSValue val;
-    uint32_t child_node;
-    uint8_t feedback_slot;
-    if (!js_lazy_marker_is(*slot))
-        return js_dup(*slot);
-    backing = js_lazy_get_document(ctx, holder);
-    if (JS_IsException(backing))
-        return JS_EXCEPTION;
-    b = JS_GetOpaque2(ctx, backing, js_lazy_document_class_id);
-    if (!b || !b->nodes) {
-        JS_FreeValue(ctx, backing);
-        return JS_ThrowInternalError(ctx, "lazy JSON document is not a tape document");
-    }
-    child_node = js_lazy_marker_index(*slot);
-    if (child_node >= b->node_count) {
-        JS_FreeValue(ctx, backing);
-        return JS_ThrowInternalError(ctx, "lazy JSON marker is invalid");
-    }
-    feedback_slot = b->nodes[child_node].feedback_slot;
-    if (holder->class_id == JS_CLASS_OBJECT && b->layout.valid &&
-        feedback_slot != UINT8_MAX && feedback_slot < b->layout.count &&
-        JS_VALUE_GET_TAG(b->layout.template) == JS_TAG_OBJECT &&
-        holder->shape == JS_VALUE_GET_OBJ(b->layout.template)->shape) {
-        json_lazy_layout_feedback(&b->layout, feedback_slot);
-    }
-    val = json_lazy_materialize_tape_value(
-        ctx, b, child_node, backing,
-        holder->class_id == JS_CLASS_ARRAY &&
-                b->nodes[child_node].type == JSON_LAZY_OBJECT
-            ? &b->layout : NULL);
-    if (JS_IsException(val))
-        goto fail;
-    JS_FreeValue(ctx, *slot);
-    *slot = val;
-    js_lazy_release_document_if_complete(ctx, holder);
-    JS_FreeValue(ctx, backing);
-    return js_dup(val);
-fail:
-    JS_FreeValue(ctx, backing);
-    return JS_EXCEPTION;
-}
-
-static void js_lazy_document_finalizer(JSRuntime *rt, JSValueConst val)
-{
-    JSONLazyDocument *b = JS_GetOpaque(val, js_lazy_document_class_id);
-    if (!b)
-        return;
-    js_free_rt(rt, b->nodes);
-    json_lazy_layout_release(rt, &b->layout);
-    js_free_rt(rt, b);
-}
-
-static void js_lazy_document_mark(JSRuntime *rt, JSValueConst val,
-                                 JS_MarkFunc *mark_func)
-{
-    JSONLazyDocument *b = JS_GetOpaque(val, js_lazy_document_class_id);
-    if (b && b->layout.valid)
-        JS_MarkValue(rt, b->layout.template, mark_func);
-}
-
-static int js_lazy_json_should_enable(JSContext *ctx, size_t len)
-{
-    const char *e = getenv("QJS_JSON_LAZY");
-    int enabled = ctx->rt->json_lazy_enabled;
-    if (e && (*e == '0' || *e == '1'))
-        enabled = *e == '1';
-    if (!enabled)
-        return 0;
-    if (len < QJS_JSON_LAZY_DOC_MIN_LEN)
-        return 0;
-    if (!js_lazy_document_class_id) {
-        JSClassID cid = 0;
-        JS_NewClassID(ctx->rt, &cid);
-        if (cid == 0)
-            return 0;
-        js_lazy_document_class_id = cid;
-    }
-    if (!JS_IsRegisteredClass(ctx->rt, js_lazy_document_class_id)) {
-        JSClassDef cd;
-        memset(&cd, 0, sizeof(cd));
-        cd.class_name = "JSONLazyDocument";
-        cd.finalizer = js_lazy_document_finalizer;
-        cd.gc_mark = js_lazy_document_mark;
-        if (JS_NewClass(ctx->rt, js_lazy_document_class_id, &cd) < 0)
-            return 0;
-    }
-    return 1;
-}
-
-static void json_lazy_skip_ws(const uint8_t **pp, const uint8_t *end)
-{
-    const uint8_t *p = *pp;
-    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-        p++;
-    *pp = p;
-}
-
-static int json_lazy_skip_string(const uint8_t **pp, const uint8_t *end)
-{
-    const uint8_t *p = *pp;
-    int c, i;
-    const uint64_t ones = UINT64_C(0x0101010101010101);
-    const uint64_t highs = UINT64_C(0x8080808080808080);
-    if (p >= end || *p != '"')
-        return -1;
-    p++;
-    for (;;) {
-        if (p >= end)
-            return -1;
-        if ((size_t)(end - p) >= sizeof(uint64_t)) {
-            uint64_t word, quote, slash, low;
-            memcpy(&word, p, sizeof(word));
-            quote = word ^ UINT64_C(0x2222222222222222);
-            slash = word ^ UINT64_C(0x5c5c5c5c5c5c5c5c);
-            low = word & highs;
-            if ((((quote - ones) & ~quote & highs) == 0) &&
-                (((slash - ones) & ~slash & highs) == 0) &&
-                low == 0 &&
-                (((word - UINT64_C(0x2020202020202020)) &
-                  ~word & highs) == 0)) {
-                p += sizeof(uint64_t);
-                continue;
-            }
-        }
-        c = *p++;
-        if (c == '"') {
-            *pp = p;
-            return 0;
-        }
-        if (c == '\\') {
-            if (p >= end)
-                return -1;
-            c = *p++;
-            switch (c) {
-            case '"': case '\\': case '/': case 'b': case 'f':
-            case 'n': case 'r': case 't':
-                break;
-            case 'u':
-                for (i = 0; i < 4; i++) {
-                    int h;
-                    if (p >= end)
-                        return -1;
-                    h = from_hex(*p++);
-                    if (h < 0)
-                        return -1;
-                }
-                break;
-            default:
-                return -1;
-            }
-        } else if (c < 0x20) {
-            return -1;
-        }
-    }
-}
-
-static int json_lazy_is_digit(int c) { return c >= '0' && c <= '9'; }
-static int json_lazy_skip_number(const uint8_t **pp, const uint8_t *end)
-{
-    const uint8_t *p = *pp;
-    if (p >= end)
-        return -1;
-    if (*p == '-') {
-        p++;
-        if (p >= end || !json_lazy_is_digit(*p))
-            return -1;
-    }
-    if (*p == '0') {
-        p++;
-        if (p < end && json_lazy_is_digit(*p))
-            return -1;
-    } else if (*p >= '1' && *p <= '9') {
-        while (p < end && json_lazy_is_digit(*p))
-            p++;
-    } else {
-        return -1;
-    }
-    if (p < end && *p == '.') {
-        p++;
-        if (p >= end || !json_lazy_is_digit(*p))
-            return -1;
-        while (p < end && json_lazy_is_digit(*p))
-            p++;
-    }
-    if (p < end && (*p == 'e' || *p == 'E')) {
-        p++;
-        if (p < end && (*p == '+' || *p == '-'))
-            p++;
-        if (p >= end || !json_lazy_is_digit(*p))
-            return -1;
-        while (p < end && json_lazy_is_digit(*p))
-            p++;
-    }
-    *pp = p;
-    return 0;
-}
-
-static int json_lazy_skip_literal(const uint8_t **pp, const uint8_t *end,
-                                  const char *lit)
-{
-    const uint8_t *p = *pp;
-    const char *q;
-    for (q = lit; *q; q++) {
-        if (p >= end || *p != (uint8_t)*q)
-            return -1;
-        p++;
-    }
-    *pp = p;
-    return 0;
-}
-
-static int json_lazy_skip_scalar(const uint8_t **pp, const uint8_t *end,
-                                 uint8_t *type)
-{
-    const uint8_t *p;
-    json_lazy_skip_ws(pp, end);
-    p = *pp;
-    if (p >= end)
-        return -1;
-    switch (*p) {
-    case '"':
-        if (json_lazy_skip_string(&p, end) < 0)
-            return -1;
-        *type = JSON_LAZY_STRING;
-        break;
-    case '-': case '0': case '1': case '2': case '3': case '4':
-    case '5': case '6': case '7': case '8': case '9':
-        if (json_lazy_skip_number(&p, end) < 0)
-            return -1;
-        *type = JSON_LAZY_NUMBER;
-        break;
-    case 't':
-        if (json_lazy_skip_literal(&p, end, "true") < 0)
-            return -1;
-        *type = JSON_LAZY_TRUE;
-        break;
-    case 'f':
-        if (json_lazy_skip_literal(&p, end, "false") < 0)
-            return -1;
-        *type = JSON_LAZY_FALSE;
-        break;
-    case 'n':
-        if (json_lazy_skip_literal(&p, end, "null") < 0)
-            return -1;
-        *type = JSON_LAZY_NULL;
-        break;
-    default:
-        return -1;
-    }
-    *pp = p;
-    return 0;
-}
-
-
-static int json_lazy_tape_reserve_nodes(JSContext *ctx, JSONLazyDocument *doc)
-{
-    uint32_t cap;
-    JSONLazyTapeNode *nodes;
-    if (doc->node_count < doc->node_capacity)
-        return 0;
-    if (doc->node_capacity > UINT32_MAX / 2) {
-        JS_ThrowInternalError(ctx, "lazy JSON tape is too large");
-        return -1;
-    }
-    cap = doc->node_capacity ? doc->node_capacity * 2 : 64;
-    if ((size_t)cap > SIZE_MAX / sizeof(*nodes)) {
-        JS_ThrowInternalError(ctx, "lazy JSON tape is too large");
-        return -1;
-    }
-    nodes = js_realloc(ctx, doc->nodes, sizeof(*nodes) * cap);
-    if (!nodes)
-        return -1;
-    doc->nodes = nodes;
-    doc->node_capacity = cap;
-    return 0;
-}
-
-static int json_lazy_tape_value(JSContext *ctx, JSONLazyDocument *doc,
-                                const uint8_t *base, const uint8_t **pp,
-                                const uint8_t *end, uint32_t key_start,
-                                uint32_t key_length, uint32_t *node_out)
-{
-    const uint8_t *p = *pp, *q, *kstart, *kend;
-    JSONLazyTapeNode *node;
-    uint32_t node_index, previous_child = UINT32_MAX;
-    uint8_t type;
-
-    if (js_check_stack_overflow(ctx->rt, 0)) {
-        JS_ThrowStackOverflow(ctx);
-        return -1;
-    }
-    json_lazy_skip_ws(&p, end);
-    q = p;
-    if (p < end && *p == '{')
-        type = JSON_LAZY_OBJECT;
-    else if (p < end && *p == '[')
-        type = JSON_LAZY_ARRAY;
-    else if (json_lazy_skip_scalar(&q, end, &type) < 0)
-        return -1;
-    if (json_lazy_tape_reserve_nodes(ctx, doc) < 0)
-        return -1;
-    node_index = doc->node_count++;
-    node = &doc->nodes[node_index];
-    memset(node, 0, sizeof(*node));
-    node->start = (uint32_t)(p - base);
-    node->key_start = key_start;
-    node->key_length = key_length;
-    node->type = (uint8_t)type;
-    node->first_child = UINT32_MAX;
-    node->next_sibling = UINT32_MAX;
-    node->feedback_slot = UINT8_MAX;
-    if (type == JSON_LAZY_OBJECT || type == JSON_LAZY_ARRAY) {
-        int is_object = type == JSON_LAZY_OBJECT;
-        q++;
-        json_lazy_skip_ws(&q, end);
-        if ((is_object && q < end && *q == '}') ||
-            (!is_object && q < end && *q == ']')) {
-            q++;
-        } else {
-            for (;;) {
-                uint32_t child_node;
-                uint32_t child_key_start = 0, child_key_length = 0;
-                json_lazy_skip_ws(&q, end);
-                if (is_object) {
-                    kstart = q;
-                    if (json_lazy_skip_string(&q, end) < 0)
-                        return -1;
-                    kend = q;
-                    child_key_start = (uint32_t)(kstart - base);
-                    child_key_length = (uint32_t)(kend - kstart);
-                    json_lazy_skip_ws(&q, end);
-                    if (q >= end || *q++ != ':')
-                        return -1;
-                }
-                if (json_lazy_tape_value(ctx, doc, base, &q, end,
-                                         child_key_start, child_key_length,
-                                         &child_node) < 0)
-                    return -1;
-                if (doc->nodes[node_index].first_child == UINT32_MAX)
-                    doc->nodes[node_index].first_child = child_node;
-                else
-                    doc->nodes[previous_child].next_sibling = child_node;
-                doc->nodes[child_node].feedback_slot =
-                    doc->nodes[node_index].child_count < 8
-                        ? (uint8_t)doc->nodes[node_index].child_count
-                        : UINT8_MAX;
-                previous_child = child_node;
-                doc->nodes[node_index].child_count++;
-                json_lazy_skip_ws(&q, end);
-                if (q < end && ((is_object && *q == '}') ||
-                                (!is_object && *q == ']'))) {
-                    q++;
-                    break;
-                }
-                if (q >= end || *q++ != ',')
-                    return -1;
-            }
-        }
-    }
-    doc->nodes[node_index].end = (uint32_t)(q - base);
-    *pp = q;
-    *node_out = node_index;
-    return 0;
-}
-
-static int json_lazy_build_tape(JSContext *ctx, JSONLazyDocument *doc)
-{
-    const uint8_t *base = (const uint8_t *)doc->source;
-    const uint8_t *p = base, *end = base + doc->source_len;
-    uint32_t root;
-    uint32_t estimate = doc->source_len / 16;
-    if (estimate < 64)
-        estimate = 64;
-    if (estimate > 1024)
-        estimate = 1024;
-    doc->nodes = js_malloc(ctx, sizeof(*doc->nodes) * estimate);
-    if (!doc->nodes)
-        return -1;
-    doc->node_capacity = estimate;
-    if (json_lazy_tape_value(ctx, doc, base, &p, end, 0, 0, &root) < 0)
-        return -1;
-    json_lazy_skip_ws(&p, end);
-    if (p != end || root != 0)
-        return -1;
-    if (doc->node_count < doc->node_capacity) {
-        JSONLazyTapeNode *nodes = js_realloc(ctx, doc->nodes,
-                                             sizeof(*nodes) * doc->node_count);
-        if (nodes) {
-            doc->nodes = nodes;
-            doc->node_capacity = doc->node_count;
-        }
-    }
-    return 0;
-}
-
-/* Atomize an unescaped ASCII JSON key. Returns JS_ATOM_NULL on unsupported. */
-static JSAtom js_lazy_key_atom(JSContext *ctx, const uint8_t *p, const uint8_t *q)
-{
-    const uint8_t *k = p + 1;
-    size_t len = (size_t)(q - k);
-    size_t i;
-    if (len == 0)
-        return JS_NewAtomLen(ctx, "", 0);
-    for (i = 0; i < len; i++) {
-        uint8_t c = k[i];
-        if (c == '\\' || c < 0x20 || c >= 0x80)
-            return JS_ATOM_NULL;
-        if (c == '"')
-            return JS_ATOM_NULL;
-    }
-    return JS_NewAtomLen(ctx, (const char *)k, len);
-}
-
-static JSValue js_lazy_eager_parse_range(JSContext *ctx, const char *base,
-                                        uint32_t start, uint32_t len)
-{
-    char *tmp = js_malloc(ctx, (size_t)len + 1);
-    JSValue v;
-    if (!tmp)
-        return JS_EXCEPTION;
-    memcpy(tmp, base + start, len);
-    tmp[len] = '\0';
-    v = JS_ParseJSON(ctx, tmp, len, "<lazy>");
-    js_free(ctx, tmp);
-    return v;
-}
-
-static JSValue json_lazy_materialize_number(JSContext *ctx,
-                                            JSONLazyDocument *doc,
-                                            uint32_t start, uint32_t end)
-{
-    const uint8_t *p = (const uint8_t *)doc->source + start;
-    const uint8_t *q = (const uint8_t *)doc->source + end;
-    bool neg = false;
-    uint64_t ival = 0;
-    int ndigits = 0;
-    const uint8_t *p0 = p;
-    if (p >= q)
-        return JS_EXCEPTION;
-    if (*p == '-') { neg = true; p++; }
-    if (p >= q || !json_lazy_is_digit(*p))
-        return JS_EXCEPTION;
-    if (*p == '0') {
-        p++;
-        if (p < q && json_lazy_is_digit(*p))
-            return JS_EXCEPTION;
-    } else {
-        while (p < q && json_lazy_is_digit(*p)) {
-            if (ndigits <= 15)
-                ival = ival * 10 + (*p - '0');
-            ndigits++;
-            p++;
-        }
-    }
-    if (p == q) {
-        /* integer fast path */
-        if (ival == 0)
-            return neg ? js_float64(-0.0) : js_int32(0);
-        if (!neg && ival <= INT32_MAX)
-            return js_int32((int32_t)ival);
-        if (neg && ival <= (uint64_t)INT32_MAX + 1)
-            return js_int32((int32_t)(0 - (int64_t)ival));
-        if (ndigits <= 15)
-            return js_float64(neg ? -(double)ival : (double)ival);
-    }
-    /* The tape has already validated the complete range. Use the exact
-       converter for long integers as well as fractions and exponents. */
-    {
-        JSATODTempMem tmp_mem;
-        double d = js_atod((const char *)p0, NULL, 10, 0, &tmp_mem);
-        return js_float64(d);
-    }
-}
-
-static JSValue json_lazy_materialize_string(JSContext *ctx,
-                                            JSONLazyDocument *doc,
-                                            uint32_t start, uint32_t end)
-{
-    const uint8_t *p = (const uint8_t *)doc->source + start;
-    const uint8_t *q = (const uint8_t *)doc->source + end;
-    /* p points at opening quote, q points right after closing quote */
-    if (p >= q || *p != '"')
-        return JS_EXCEPTION;
-    {
-        const uint8_t *k = p + 1;
-        const uint8_t *e = q - 1;
-        const uint8_t *tmp;
-        int has_escape = 0;
-        for (tmp = k; tmp < e; tmp++) {
-            if (*tmp == '\\' || *tmp < 0x20 || *tmp >= 0x80) {
-                has_escape = 1;
-                break;
-            }
-        }
-        if (!has_escape)
-            return js_new_string8_len(ctx, (const char *)k, (size_t)(e - k));
-    }
-    {
-        JSValue v = js_lazy_eager_parse_range(ctx, doc->source, start,
-                                              end - start);
-        return v;
-    }
-}
-
-/* Return 1 for an exact supported key match, 0 for a different key and -1
-   for a key encoding this experiment deliberately does not fast-path. */
-static int json_lazy_layout_key_match(JSContext *ctx,
-                                      JSONLazyLayout *layout, uint32_t index,
-                                      const uint8_t *kstart,
-                                      const uint8_t *kend)
-{
-    JSAtom atom;
-    JSAtomStruct *str;
-    size_t len, i;
-    const uint8_t *key = kstart + 1;
-    if (index >= layout->count)
-        return 0;
-    len = (size_t)(kend - kstart - 2);
-    for (i = 0; i < len; i++) {
-        if (key[i] == '\\' || key[i] < 0x20 || key[i] >= 0x80)
-            return -1;
-    }
-    atom = layout->entries[index].atom;
-    if (__JS_AtomIsTaggedInt(atom))
-        return -1;
-    str = ctx->rt->atom_array[atom];
-    if (str->is_wide_char || str->len != len)
-        return 0;
-    return memcmp(str8(str), key, len) == 0;
-}
-
-static void json_lazy_layout_release(JSRuntime *rt, JSONLazyLayout *layout)
-{
-    uint32_t i;
-    if (!layout->valid)
-        return;
-    for (i = 0; i < layout->count; i++)
-        JS_FreeAtomRT(rt, layout->entries[i].atom);
-    js_free_rt(rt, layout->entries);
-    JS_FreeValueRT(rt, layout->template);
-    memset(layout, 0, sizeof(*layout));
-}
-
-static JSShape *json_lazy_layout_shape(const JSONLazyLayout *layout)
-{
-    if (!layout || !layout->valid ||
-        JS_VALUE_GET_TAG(layout->template) != JS_TAG_OBJECT)
-        return NULL;
-    return JS_VALUE_GET_OBJ(layout->template)->shape;
-}
-
-static JSValue json_lazy_make_shape_template(JSContext *ctx, JSObject *obj)
-{
-    JSProperty *props;
-    JSShape *shape;
-    JSValue value;
-    uint32_t i;
-
-    shape = js_dup_shape(obj->shape);
-    if ((size_t)shape->prop_size > SIZE_MAX / sizeof(*props)) {
-        js_free_shape(ctx->rt, shape);
-        return JS_ThrowInternalError(ctx, "lazy JSON shape is too large");
-    }
-    props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
-    if (!props) {
-        js_free_shape(ctx->rt, shape);
-        return JS_EXCEPTION;
-    }
-    for (i = 0; i < shape->prop_size; i++)
-        props[i].u.value = JS_UNDEFINED;
-    value = JS_NewObjectFromShape(ctx, shape, JS_CLASS_OBJECT, props);
-    js_free(ctx, props);
-    return value;
-}
-
-static int json_lazy_layout_capture(JSContext *ctx, JSONLazyLayout *layout,
-                                     JSObject *obj,
-                                     JSONLazyLayoutEntry *entries, int count)
-{
-    JSShapeProperty *prs;
-    JSProperty *pr;
-    uint32_t i, j;
-    JSValue template = JS_UNDEFINED;
-
-    if (layout->valid || !obj->shape->is_hashed || count <= 0)
-        return 0;
-    for (i = 0; i < (uint32_t)count; i++) {
-        if (__JS_AtomIsTaggedInt(entries[i].atom)) {
-            return 0;
-        }
-        for (j = 0; j < i; j++) {
-            if (entries[i].atom == entries[j].atom) {
-                return 0;
-            }
-        }
-        prs = find_own_property(&pr, obj, entries[i].atom);
-        if (!prs || !pr)
-            return -1;
-        entries[i].slot = (uint32_t)(pr - obj->prop);
-    }
-    prs = find_own_property(&pr, obj, js_lazy_document_atom);
-    if (!prs || !pr)
-        return -1;
-    layout->document_slot = (uint32_t)(pr - obj->prop);
-    template = json_lazy_make_shape_template(ctx, obj);
-    if (JS_IsException(template))
-        return -1;
-    layout->template = template;
-    layout->entries = entries;
-    layout->count = count;
-    layout->valid = 1;
-    return 0;
-}
-
-static JSValue js_lazy_new_document(JSContext *ctx, const char *buf, size_t len)
-{
-    JSValue value;
-    JSONLazyDocument *doc;
-    if (len > UINT32_MAX || len > SIZE_MAX - sizeof(*doc) - 1)
-        return JS_EXCEPTION;
-    value = JS_NewObjectClass(ctx, js_lazy_document_class_id);
-    if (JS_IsException(value))
-        return JS_EXCEPTION;
-    doc = js_mallocz(ctx, sizeof(*doc) + len + 1);
-    if (!doc) {
-        JS_FreeValue(ctx, value);
-        return JS_EXCEPTION;
-    }
-    doc->source_len = (uint32_t)len;
-    memcpy(doc->source, buf, len);
-    doc->source[len] = '\0';
-    JS_SetOpaque(value, doc);
-    return value;
-}
-
-static JSValue js_lazy_build_tape_layout_object(JSContext *ctx,
-                                                JSValueConst document,
-                                                uint32_t node_index,
-                                                JSONLazyLayout *layout)
-{
-    JSProperty *props;
-    JSValue obj;
-    JSShape *shape = json_lazy_layout_shape(layout);
-    uint32_t i;
-    JSONLazyDocument *doc = JS_GetOpaque(document, js_lazy_document_class_id);
-    JSONLazyTapeNode *node;
-    uint8_t hot_mask;
-    uint32_t instance_number;
-    if (!doc || !shape || node_index >= doc->node_count)
-        return JS_EXCEPTION;
-    node = &doc->nodes[node_index];
-    instance_number = layout->instance_count + 1;
-    hot_mask = instance_number >= 32 ? layout->hot_slot_mask : 0;
-    if ((size_t)shape->prop_size > SIZE_MAX / sizeof(*props))
-        return JS_ThrowInternalError(ctx, "lazy JSON shape is too large");
-    props = js_malloc(ctx, sizeof(*props) * shape->prop_size);
-    if (!props)
-        return JS_EXCEPTION;
-    for (i = 0; i < shape->prop_size; i++)
-        props[i].u.value = JS_UNDEFINED;
-    i = 0;
-    {
-        uint32_t child_index = node->first_child;
-        for (i = 0; i < layout->count; i++) {
-            JSONLazyTapeNode *child;
-            if (child_index == UINT32_MAX || child_index >= doc->node_count ||
-                child_index > INT32_MAX)
-                goto fail;
-            child = &doc->nodes[child_index];
-            if (hot_mask & (uint8_t)(1U << i)) {
-                props[layout->entries[i].slot].u.value =
-                    json_lazy_materialize_tape_value(ctx, doc, child_index,
-                                                     document, NULL);
-                if (JS_IsException(props[layout->entries[i].slot].u.value)) {
-                    uint32_t j;
-                    for (j = 0; j < shape->prop_size; j++)
-                        JS_FreeValue(ctx, props[j].u.value);
-                    js_free(ctx, props);
-                    return JS_EXCEPTION;
-                }
-            } else {
-                props[layout->entries[i].slot].u.value =
-                    js_lazy_marker_new(child_index);
-            }
-            child_index = child->next_sibling;
-        }
-        if (child_index != UINT32_MAX)
-            goto fail;
-    }
-    props[layout->document_slot].u.value = js_dup(document);
-    obj = JS_NewObjectFromShape(ctx, js_dup_shape(shape),
-                                JS_CLASS_OBJECT, props);
-    if (JS_IsException(obj)) {
-        js_free(ctx, props);
-        return JS_EXCEPTION;
-    }
-    layout->instance_count = instance_number;
-    js_free(ctx, props);
-    return obj;
-
-fail:
-    for (i = 0; i < shape->prop_size; i++)
-        JS_FreeValue(ctx, props[i].u.value);
-    js_free(ctx, props);
-    return JS_EXCEPTION;
-}
-
-static JSValue js_lazy_parse_tape_node(JSContext *ctx, JSONLazyDocument *doc,
-                                       JSValueConst document,
-                                       uint32_t node_index,
-                                       JSONLazyLayout *layout_hint)
-{
-    JSONLazyTapeNode *node;
-    JSValue obj = JS_UNDEFINED;
-    const uint8_t *base;
-    uint32_t i, initialized_atoms = 0;
-    JSONLazyLayoutEntry *entries = NULL;
-
-    if (!doc || node_index >= doc->node_count)
-        return JS_ThrowInternalError(ctx, "lazy JSON tape node is invalid");
-    node = &doc->nodes[node_index];
-    base = (const uint8_t *)doc->source;
-    if (node->type == JSON_LAZY_ARRAY) {
-        JSValue *values = NULL;
-        if (node->child_count) {
-            if ((size_t)node->child_count > SIZE_MAX / sizeof(*values))
-                return JS_ThrowInternalError(ctx, "lazy JSON array is too large");
-            values = js_malloc(ctx, sizeof(*values) * node->child_count);
-            if (!values)
-                return JS_EXCEPTION;
-            {
-                uint32_t child_index = node->first_child;
-                for (i = 0; i < node->child_count; i++) {
-                    JSONLazyTapeNode *child;
-                    if (child_index == UINT32_MAX ||
-                        child_index >= doc->node_count ||
-                        child_index > INT32_MAX) {
-                        while (i > 0)
-                            JS_FreeValue(ctx, values[--i]);
-                        js_free(ctx, values);
-                        return JS_EXCEPTION;
-                    }
-                    child = &doc->nodes[child_index];
-                    values[i] = js_lazy_marker_new(child_index);
-                    child_index = child->next_sibling;
-                }
-                if (child_index != UINT32_MAX) {
-                    while (i > 0)
-                        JS_FreeValue(ctx, values[--i]);
-                    js_free(ctx, values);
-                    return JS_EXCEPTION;
-                }
-            }
-        }
-        obj = js_new_array_from_owned(ctx, node->child_count, values);
-        values = NULL;
-        if (JS_IsException(obj))
-            return JS_EXCEPTION;
-    } else if (node->type == JSON_LAZY_OBJECT) {
-        if (layout_hint && layout_hint->valid) {
-            int match = node->child_count == layout_hint->count;
-            uint32_t child_index = node->first_child;
-            for (i = 0; i < node->child_count; i++) {
-                JSONLazyTapeNode *child;
-                if (child_index == UINT32_MAX ||
-                    child_index >= doc->node_count)
-                    return JS_EXCEPTION;
-                child = &doc->nodes[child_index];
-                if (match) {
-                    int key_match = json_lazy_layout_key_match(
-                        ctx, layout_hint, i, base + child->key_start,
-                        base + child->key_start + child->key_length);
-                    if (key_match != 1) {
-                        match = 0;
-                    }
-                }
-                child_index = child->next_sibling;
-            }
-            if (child_index != UINT32_MAX)
-                return JS_EXCEPTION;
-            if (json_lazy_layout_shape(layout_hint) && match) {
-                return js_lazy_build_tape_layout_object(
-                    ctx, document, node_index, layout_hint);
-            }
-        }
-        if (node->child_count && layout_hint && !layout_hint->valid) {
-            if ((size_t)node->child_count > SIZE_MAX / sizeof(*entries))
-                return JS_ThrowInternalError(ctx, "lazy JSON object is too large");
-            entries = js_mallocz(ctx, sizeof(*entries) * node->child_count);
-            if (!entries)
-                return JS_EXCEPTION;
-            for (i = 0; i < node->child_count; i++)
-                entries[i].slot = UINT32_MAX;
-        }
-        obj = JS_NewObject(ctx);
-        if (JS_IsException(obj))
-            goto fail;
-        {
-            uint32_t child_index = node->first_child;
-            for (i = 0; i < node->child_count; i++) {
-                JSONLazyTapeNode *child;
-                const uint8_t *kstart;
-                const uint8_t *kend;
-                JSAtom key;
-                JSValue marker;
-                if (child_index == UINT32_MAX ||
-                    child_index >= doc->node_count)
-                    goto fail;
-                child = &doc->nodes[child_index];
-                kstart = base + child->key_start;
-                kend = kstart + child->key_length;
-                key = js_lazy_key_atom(ctx, kstart, kend - 1);
-                if (key == JS_ATOM_NULL)
-                    goto fail;
-                if (entries) {
-                    entries[i].atom = JS_DupAtom(ctx, key);
-                    initialized_atoms++;
-                }
-                if (child_index > INT32_MAX)
-                    goto fail;
-                marker = js_lazy_marker_new(child_index);
-                if (JS_DefinePropertyValue(ctx, obj, key, marker,
-                                           JS_PROP_C_W_E) < 0) {
-                    JS_FreeAtom(ctx, key);
-                    goto fail;
-                }
-                JS_FreeAtom(ctx, key);
-                child_index = child->next_sibling;
-            }
-            if (child_index != UINT32_MAX)
-                goto fail;
-        }
-    } else {
-        return JS_UNDEFINED;
-    }
-    if (js_lazy_set_document(ctx, obj, document) < 0)
-        goto fail;
-    if (layout_hint && !layout_hint->valid && entries) {
-        if (json_lazy_layout_capture(ctx, layout_hint,
-                                     JS_VALUE_GET_OBJ(obj), entries,
-                                     node->child_count) < 0)
-            goto fail;
-        if (layout_hint->valid) {
-            entries = NULL;
-            initialized_atoms = 0;
-        }
-    }
-    if (entries) {
-        while (initialized_atoms > 0)
-            JS_FreeAtom(ctx, entries[--initialized_atoms].atom);
-        js_free(ctx, entries);
-    }
-    return obj;
-fail:
-    if (entries) {
-        while (initialized_atoms > 0)
-            JS_FreeAtom(ctx, entries[--initialized_atoms].atom);
-        js_free(ctx, entries);
-    }
-    JS_FreeValue(ctx, obj);
-    return JS_HasException(ctx) ? JS_EXCEPTION : JS_UNDEFINED;
-}
-
-static JSValue json_lazy_materialize_tape_value(JSContext *ctx,
-                                                JSONLazyDocument *doc,
-                                                uint32_t node_index,
-                                                JSValueConst document,
-                                                JSONLazyLayout *layout_hint)
-{
-    JSONLazyTapeNode *node;
-    JSValue value;
-    if (!doc || node_index >= doc->node_count)
-        return JS_EXCEPTION;
-    node = &doc->nodes[node_index];
-    switch (node->type) {
-    case JSON_LAZY_TRUE: value = JS_TRUE; break;
-    case JSON_LAZY_FALSE: value = JS_FALSE; break;
-    case JSON_LAZY_NULL: value = JS_NULL; break;
-    case JSON_LAZY_NUMBER:
-        value = json_lazy_materialize_number(ctx, doc, node->start, node->end);
-        break;
-    case JSON_LAZY_STRING:
-        value = json_lazy_materialize_string(ctx, doc, node->start, node->end);
-        break;
-    case JSON_LAZY_OBJECT:
-    case JSON_LAZY_ARRAY: {
-        value = js_lazy_parse_tape_node(ctx, doc, document, node_index,
-                                        layout_hint);
-        if (JS_IsUndefined(value)) {
-            if (JS_HasException(ctx))
-                return JS_EXCEPTION;
-            value = js_lazy_eager_parse_range(ctx, doc->source, node->start,
-                                              node->end - node->start);
-        }
-        if (JS_IsException(value))
-            return JS_EXCEPTION;
-        break;
-    }
-    default:
-        value = JS_EXCEPTION;
-        break;
-    }
-    return value;
-}
-
-/* Root entry point for a large document. */
-static JSValue json_lazy_parse(JSContext *ctx, const char *buf, size_t buf_len)
-{
-    JSValue document, v;
-    JSONLazyDocument *doc;
-    document = js_lazy_new_document(ctx, buf, buf_len);
-    if (JS_IsException(document))
-        return JS_EXCEPTION;
-    doc = JS_GetOpaque(document, js_lazy_document_class_id);
-    if (!doc || json_lazy_build_tape(ctx, doc) < 0) {
-        int is_exception = JS_HasException(ctx);
-        JS_FreeValue(ctx, document);
-        return is_exception ? JS_EXCEPTION : JS_UNDEFINED;
-    }
-    ctx->rt->lazy_json_seen = 1;
-    v = js_lazy_parse_tape_node(ctx, doc, document, 0, NULL);
-    if (JS_IsUndefined(v)) {
-        JS_FreeValue(ctx, document);
-        return JS_UNDEFINED;
-    }
-    if (JS_IsException(v)) {
-        JS_FreeValue(ctx, document);
-        return JS_EXCEPTION;
-    }
-    /* The document is retained by the root's private property. */
-    JS_FreeValue(ctx, document);
-    return v;
-}
-
 static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -106939,22 +106958,29 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
     const char *str;
     size_t len;
 
+    /* An 8-bit string without a reviver is parsed from its own bytes (Latin-1: JSON outside string literals is ASCII, and inside one
+       a byte is its code point), with no UTF-8 copy of the input. Any failure is redone below from the UTF-8 copy, so every error,
+       its message and its position are the ones the general path gives. */
+    if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING && !(argc > 1 && JS_IsFunction(ctx, argv[1]))) {
+        JSString *jp = JS_VALUE_GET_STRING(argv[0]);
+        /* the tokenizer reads the byte after the end (a number's last digit test): it must be the terminator */
+        if (!jp->is_wide_char && str8(jp)[jp->len] == 0) {
+            JSValue exc;
+            obj = json_fast_parse(ctx, (const char *)str8(jp), jp->len, true);
+            if (!JS_IsUninitialized(obj))
+                return obj;
+            obj = JS_ParseJSON_internal2(ctx, (const char *)str8(jp), jp->len, "<input>", NULL, true);
+            if (!JS_IsException(obj))
+                return obj;
+            exc = JS_GetException(ctx);
+            if (JS_IsUncatchableError(exc))
+                return JS_Throw(ctx, exc);
+            JS_FreeValue(ctx, exc);
+        }
+    }
     str = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!str)
         return JS_EXCEPTION;
-    if (!(argc > 1 && JS_IsFunction(ctx, argv[1]))) {
-        JSValue laz = JS_UNDEFINED;
-        if (js_lazy_json_should_enable(ctx, len) &&
-            !json_is_integer_array(str, len)) {
-            laz = json_lazy_parse(ctx, str, len);
-            if (JS_IsException(laz))
-                goto fail;
-            if (!JS_IsUndefined(laz)) {
-                JS_FreeCString(ctx, str);
-                return laz;
-            }
-        }
-    }
     if (argc > 1 && JS_IsFunction(ctx, argv[1])) {
         JSONParseRecord pr_s, *pr = &pr_s, *pr1;
         JSValue root;
@@ -106988,7 +107014,9 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
         json_free_parse_record(ctx, pr);
         JS_FreeValue(ctx, root);
     } else {
-        obj = JS_ParseJSON_internal(ctx, str, len, "<input>", NULL);
+        obj = json_fast_parse(ctx, str, len, false);
+        if (JS_IsUninitialized(obj))
+            obj = JS_ParseJSON_internal(ctx, str, len, "<input>", NULL);
     }
     JS_FreeCString(ctx, str);
     return obj;
@@ -107064,7 +107092,60 @@ typedef struct JSONStringifyContext {
     JSValue gap;
     JSValue empty;
     StringBuffer *b;
+    /* shapes already found to hold only string, non-index, non-varref keys (the shape walk of js_json_to_str), each held with a count */
+    JSShape *walk_ok[8];
+    /* for each walk_ok shape, bit i: property i's key is an 8-bit string with nothing to escape (only i < 64) */
+    uint64_t walk_plain[8];
+    /* for each walk_ok shape with plain keys, their `"key":` fragments side by side (see JSONKeyFrags) */
+    struct JSONKeyFrags *walk_frag[8];
 } JSONStringifyContext;
+
+/* The `"key":` bytes of a shape's plain keys (bit i of walk_plain), property i at bytes[off[i]] to bytes[off[i + 1]], followed by 16
+   spare bytes so a fragment of up to 16 bytes is copied as one fixed-size block */
+typedef struct JSONKeyFrags {
+    int ref;            /* the walk_frag slot, and each walk using it (a nested object can replace the slot meanwhile) */
+    uint16_t off[65];
+    uint8_t bytes[];
+} JSONKeyFrags;
+
+/* The fragments for the plain keys in `bits` of a shape with properties prs[0..nsp-1]; NULL when they cannot be allocated */
+static JSONKeyFrags *json_key_frags(JSContext *ctx, JSShapeProperty *prs, int nsp, uint64_t bits)
+{
+    JSONKeyFrags *kf;
+    size_t total = 0;
+    int i, n = nsp < 64 ? nsp : 64;
+
+    for (i = 0; i < n; i++)
+        if ((bits >> i) & 1)
+            total += ctx->rt->atom_array[prs[i].atom]->len + 3;
+    if (total > 60000)
+        return NULL;
+    kf = js_malloc(ctx, sizeof(*kf) + total + 16);
+    if (!kf)
+        return NULL;
+    kf->ref = 1;
+    total = 0;
+    for (i = 0; i < n; i++) {
+        kf->off[i] = (uint16_t)total;
+        if ((bits >> i) & 1) {
+            JSString *ks = ctx->rt->atom_array[prs[i].atom];
+            kf->bytes[total++] = '"';
+            memcpy(kf->bytes + total, json_str8(ks), ks->len);
+            total += ks->len;
+            kf->bytes[total++] = '"';
+            kf->bytes[total++] = ':';
+        }
+    }
+    kf->off[n] = (uint16_t)total;
+    memset(kf->bytes + total, 0, 16);
+    return kf;
+}
+
+static void json_key_frags_free(JSContext *ctx, JSONKeyFrags *kf)
+{
+    if (kf && --kf->ref == 0)
+        js_free(ctx, kf);
+}
 
 static bool json_stack_contains(JSONStringifyContext *jsc, JSObject *p)
 {
@@ -107152,6 +107233,79 @@ exception:
     return JS_EXCEPTION;
 }
 
+static int json_put_float64(StringBuffer *b, double d)
+{
+    char numbuf[JS_DTOA_MAX_DIGITS + 32];
+    JSDTOATempMem dtoa_mem;
+    int64_t i64;
+    size_t n;
+    if (!isfinite(d))
+        return string_buffer_write8(b, (const uint8_t *)"null", 4);
+    /* Integral doubles -- timestamps, ids, counts, prices in minor
+       units -- are most of the numbers in a real payload, and their
+       shortest round-trip representation is simply their digits.
+       js_dtoa reaches for multi-precision arithmetic to work that out;
+       profiling a number-heavy payload puts ~60% of the time inside
+       mpb_shr_round / mul_pow / mp_div1norm.
+
+       Exact within +/-2^53, where every integer is representable, so
+       the round trip is exact by construction. -0 takes this path and
+       prints "0", which is what Number(-0).toString() gives. */
+    if (d >= -9007199254740992.0 && d <= 9007199254740992.0 &&
+        (double)(i64 = (int64_t)d) == d) {
+        n = i64toa(numbuf, i64);
+        return string_buffer_write8(b, (const uint8_t *)numbuf, n);
+    }
+    n = js_dtoa_short(numbuf, d);
+    if (n == 0)
+        n = js_dtoa(numbuf, d, 10, 0, JS_DTOA_FORMAT_FREE, &dtoa_mem);
+    return string_buffer_write8(b, (const uint8_t *)numbuf, n);
+}
+
+/* A value js_json_check passes through unchanged when there is no replacer, and that js_json_to_str writes without recursing */
+static inline bool json_is_prim(JSValueConst v)
+{
+    switch (JS_VALUE_GET_NORM_TAG(v)) {
+    case JS_TAG_INT:
+    case JS_TAG_FLOAT64:
+    case JS_TAG_BOOL:
+    case JS_TAG_NULL:
+    case JS_TAG_STRING:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Write a value json_is_prim accepts, as js_json_to_str does; the value is only borrowed */
+static inline int json_put_prim_borrowed(StringBuffer *b, JSValueConst v)
+{
+    char numbuf[16];
+    int n;
+    switch (JS_VALUE_GET_NORM_TAG(v)) {
+    case JS_TAG_INT:
+        n = i32toa(numbuf, JS_VALUE_GET_INT(v));
+        return string_buffer_write8(b, (const uint8_t *)numbuf, n);
+    case JS_TAG_FLOAT64:
+        return json_put_float64(b, JS_VALUE_GET_FLOAT64(v));
+    case JS_TAG_BOOL:
+        return JS_VALUE_GET_BOOL(v) ? string_buffer_write8(b, (const uint8_t *)"true", 4)
+                                    : string_buffer_write8(b, (const uint8_t *)"false", 5);
+    case JS_TAG_NULL:
+        return string_buffer_write8(b, (const uint8_t *)"null", 4);
+    default: /* JS_TAG_STRING */
+        return json_quote_str(b, JS_VALUE_GET_STRING(v));
+    }
+}
+
+/* json_put_prim_borrowed, then free the value */
+static int json_put_prim(JSContext *ctx, StringBuffer *b, JSValue v)
+{
+    int ret = json_put_prim_borrowed(b, v);
+    JS_FreeValue(ctx, v);
+    return ret;
+}
+
 static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                           JSValueConst holder, JSValue val,
                           JSValueConst indent)
@@ -107160,7 +107314,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
     JSObject *p;
     int64_t i, len;
     int cl, ret;
-    bool has_content;
+    bool has_content, has_gap = false;
 
     indent1 = JS_UNDEFINED;
     sep = JS_UNDEFINED;
@@ -107202,10 +107356,12 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             JS_ThrowTypeError(ctx, "circular reference");
             goto exception;
         }
-        indent1 = JS_ConcatString(ctx, js_dup(indent), js_dup(jsc->gap));
+        has_gap = !JS_IsEmptyString(jsc->gap);
+        /* no gap: the indent stays the empty string, and no separator is written */
+        indent1 = has_gap ? JS_ConcatString(ctx, js_dup(indent), js_dup(jsc->gap)) : js_dup(indent);
         if (JS_IsException(indent1))
             goto exception;
-        if (!JS_IsEmptyString(jsc->gap)) {
+        if (has_gap) {
             sep = JS_ConcatString3(ctx, "\n", js_dup(indent1), "");
             if (JS_IsException(sep))
                 goto exception;
@@ -107224,14 +107380,19 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
         if (ret) {
             if (js_get_length64(ctx, &len, val))
                 goto exception;
-            string_buffer_putc8(jsc->b, '[');
+            json_putc8(jsc->b, '[');
             for(i = 0; i < len; i++) {
                 if (i > 0)
-                    string_buffer_putc8(jsc->b, ',');
-                string_buffer_concat_value(jsc->b, sep);
+                    json_putc8(jsc->b, ',');
+                if (has_gap) string_buffer_concat_value(jsc->b, sep);
                 v = JS_GetPropertyInt64(ctx, val, i);
                 if (JS_IsException(v))
                     goto exception;
+                if (JS_IsUndefined(jsc->replacer_func) && json_is_prim(v)) {
+                    if (json_put_prim(ctx, jsc->b, v))
+                        goto exception;
+                    continue;
+                }
 
                 if (!JS_IsUndefined(jsc->replacer_func) ||
                     (JS_IsObject(v) || JS_IsBigInt(v))) {
@@ -107252,22 +107413,169 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                     goto exception;
             }
             if (len > 0 && !JS_IsEmptyString(jsc->gap)) {
-                string_buffer_putc8(jsc->b, '\n');
+                json_putc8(jsc->b, '\n');
                 string_buffer_concat_value(jsc->b, indent);
             }
-            string_buffer_putc8(jsc->b, ']');
+            json_putc8(jsc->b, ']');
         } else if (JS_IsUndefined(jsc->property_list) &&
                    !JS_VALUE_GET_OBJ(val)->is_exotic) {
 
             JSPropertyEnum *ptab;
             uint32_t plen, pi;
 
+            if (JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_OBJECT) {
+                /* A plain object whose keys are all strings that are not array indices: its enumerable keys in shape order are the
+                   list JS_GetOwnPropertyNames gives. Walk the shape held at the start (the key list is fixed then, as the general
+                   path's is) and read each value from its slot while the object keeps that shape and the property is a plain data
+                   one, else with JS_GetProperty, as the general path does. */
+                JSObject *op = JS_VALUE_GET_OBJ(val);
+                JSShape *sh = op->shape;
+                JSShapeProperty *prs = get_shape_prop(sh);
+                int si, nsp = sh->prop_count, wslot = (int)(((uintptr_t)sh >> 6) & (countof(jsc->walk_ok) - 1));
+                uint32_t idx_;
+                if (jsc->walk_ok[wslot] == sh) {
+                    si = nsp;
+                } else if (!sh->is_hashed) {
+                    /* an unhashed shape belongs to this object alone and is edited in place when a getter adds to it
+                       (add_property needs it unshared), so it is not held across the walk: the general path takes it */
+                    si = -1;
+                } else {
+                    for (si = 0; si < nsp; si++)
+                        if (prs[si].atom != JS_ATOM_NULL &&
+                            (JS_AtomGetKind(ctx, prs[si].atom) != JS_ATOM_KIND_STRING || JS_AtomIsArrayIndex(ctx, &idx_, prs[si].atom) ||
+                             (prs[si].flags & JS_PROP_TMASK) == JS_PROP_VARREF))
+                            break;
+                    /* a hashed shape is shared and never changed in place (a change makes another shape), so the answer holds while it
+                       is held; an unhashed one can be edited in place by its owner and is checked every time */
+                    if (si == nsp && sh->is_hashed) {
+                        uint64_t bits = 0;
+                        int bi;
+                        for (bi = 0; bi < nsp && bi < 64; bi++) {
+                            JSString *ks;
+                            if (prs[bi].atom == JS_ATOM_NULL)
+                                continue;
+                            ks = ctx->rt->atom_array[prs[bi].atom];
+                            if (!ks->is_wide_char && json_scan_plain(json_str8(ks), json_str8(ks) + ks->len, true) == json_str8(ks) + ks->len)
+                                bits |= (uint64_t)1 << bi;
+                        }
+                        if (jsc->walk_ok[wslot])
+                            js_free_shape(ctx->rt, jsc->walk_ok[wslot]);
+                        json_key_frags_free(ctx, jsc->walk_frag[wslot]);
+                        jsc->walk_frag[wslot] = bits ? json_key_frags(ctx, prs, nsp, bits) : NULL;
+                        if (!jsc->walk_frag[wslot])
+                            bits = 0;
+                        jsc->walk_ok[wslot] = js_dup_shape(sh);
+                        jsc->walk_plain[wslot] = bits;
+                    }
+                }
+                if (si == nsp) {
+                    /* the cached answer for this shape (walk_ok holds it, so its key atoms stay alive) */
+                    uint64_t plain = jsc->walk_ok[wslot] == sh ? jsc->walk_plain[wslot] : 0;
+                    JSONKeyFrags *kf = plain ? jsc->walk_frag[wslot] : NULL;
+                    if (kf)
+                        kf->ref++;
+                    js_dup_shape(sh);
+                    json_putc8(jsc->b, '{');
+                    has_content = false;
+                    for (si = 0; si < nsp; si++) {
+                        JSAtom atom = prs[si].atom;
+                        if (atom == JS_ATOM_NULL || !(prs[si].flags & JS_PROP_ENUMERABLE))
+                            continue;
+                        JS_FreeValue(ctx, prop);
+                        prop = JS_UNDEFINED;
+                        if (op->shape == sh && (prs[si].flags & JS_PROP_TMASK) == JS_PROP_NORMAL) {
+                            JSValueConst bv = op->prop[si].u.value;
+                            /* a primitive with no replacer, written at once from the slot (no JS runs before it is written) */
+                            if (JS_IsUndefined(jsc->replacer_func) && json_is_prim(bv) && !has_gap && si < 64 && ((plain >> si) & 1)) {
+                                StringBuffer *b = jsc->b;
+                                uint32_t fo = kf->off[si], fl = kf->off[si + 1] - fo;
+                                if (likely(!b->is_wide_char && b->size - b->len >= (int)fl + 17)) {
+                                    uint8_t *d = json_str8(b->str) + b->len;
+                                    d[0] = ',';
+                                    d += has_content;
+                                    if (fl <= 16)
+                                        memcpy(d, kf->bytes + fo, 16);
+                                    else
+                                        memcpy(d, kf->bytes + fo, fl);
+                                    b->len += has_content + fl;
+                                } else {
+                                    JSString *ks = ctx->rt->atom_array[atom];
+                                    if (has_content && json_putc8(b, ','))
+                                        goto exception_sh;
+                                    if (json_quote_str(b, ks) || json_putc8(b, ':'))
+                                        goto exception_sh;
+                                }
+                                if (json_put_prim_borrowed(b, bv))
+                                    goto exception_sh;
+                                has_content = true;
+                                continue;
+                            }
+                            v = js_dup(bv);
+                        } else {
+                            v = JS_GetProperty(ctx, val, atom);
+                        }
+                        if (JS_IsException(v))
+                            goto exception_sh;
+                        if (JS_IsUndefined(jsc->replacer_func) && json_is_prim(v)) {
+                            if (has_content)
+                                json_putc8(jsc->b, ',');
+                            if (has_gap) string_buffer_concat_value(jsc->b, sep);
+                            if (json_quote_str(jsc->b, ctx->rt->atom_array[atom])) {
+                                JS_FreeValue(ctx, v);
+                                goto exception_sh;
+                            }
+                            json_putc8(jsc->b, ':');
+                            if (has_gap) string_buffer_concat_value(jsc->b, sep1);
+                            if (json_put_prim(ctx, jsc->b, v))
+                                goto exception_sh;
+                            has_content = true;
+                            continue;
+                        }
+                        if (!JS_IsUndefined(jsc->replacer_func) || (JS_IsObject(v) || JS_IsBigInt(v))) {
+                            prop = JS_AtomToString(ctx, atom);
+                            if (JS_IsException(prop)) {
+                                JS_FreeValue(ctx, v);
+                                goto exception_sh;
+                            }
+                        }
+                        v = js_json_check(ctx, jsc, val, v, prop);
+                        if (JS_IsException(v))
+                            goto exception_sh;
+                        if (!JS_IsUndefined(v)) {
+                            if (has_content)
+                                json_putc8(jsc->b, ',');
+                            if (has_gap) string_buffer_concat_value(jsc->b, sep);
+                            if (json_quote_str(jsc->b, ctx->rt->atom_array[atom])) {
+                                JS_FreeValue(ctx, v);
+                                goto exception_sh;
+                            }
+                            json_putc8(jsc->b, ':');
+                            if (has_gap) string_buffer_concat_value(jsc->b, sep1);
+                            if (js_json_to_str(ctx, jsc, val, v, indent1))
+                                goto exception_sh;
+                            has_content = true;
+                        }
+                    }
+                    js_free_shape(ctx->rt, sh);
+                    json_key_frags_free(ctx, kf);
+                    if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
+                        json_putc8(jsc->b, '\n');
+                        string_buffer_concat_value(jsc->b, indent);
+                    }
+                    json_putc8(jsc->b, '}');
+                    goto done_object;
+                exception_sh:
+                    js_free_shape(ctx->rt, sh);
+                    json_key_frags_free(ctx, kf);
+                    goto exception;
+                }
+            }
             if (JS_GetOwnPropertyNamesInternal(ctx, &ptab, &plen,
                                                JS_VALUE_GET_OBJ(val),
                                                JS_GPN_STRING_MASK |
                                                JS_GPN_ENUM_ONLY))
                 goto exception;
-            string_buffer_putc8(jsc->b, '{');
+            json_putc8(jsc->b, '{');
             has_content = false;
             for (pi = 0; pi < plen; pi++) {
                 JSAtom atom = ptab[pi].atom;
@@ -107290,8 +107598,8 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                     goto exception_ptab;
                 if (!JS_IsUndefined(v)) {
                     if (has_content)
-                        string_buffer_putc8(jsc->b, ',');
-                    string_buffer_concat_value(jsc->b, sep);
+                        json_putc8(jsc->b, ',');
+                    if (has_gap) string_buffer_concat_value(jsc->b, sep);
 
                     if (!__JS_AtomIsTaggedInt(atom)) {
                         if (json_quote_str(jsc->b, ctx->rt->atom_array[atom])) {
@@ -107311,8 +107619,8 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                             goto exception_ptab;
                         }
                     }
-                    string_buffer_putc8(jsc->b, ':');
-                    string_buffer_concat_value(jsc->b, sep1);
+                    json_putc8(jsc->b, ':');
+                    if (has_gap) string_buffer_concat_value(jsc->b, sep1);
                     if (js_json_to_str(ctx, jsc, val, v, indent1))
                         goto exception_ptab;
                     has_content = true;
@@ -107320,10 +107628,10 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             }
             js_free_prop_enum(ctx, ptab, plen);
             if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
-                string_buffer_putc8(jsc->b, '\n');
+                json_putc8(jsc->b, '\n');
                 string_buffer_concat_value(jsc->b, indent);
             }
-            string_buffer_putc8(jsc->b, '}');
+            json_putc8(jsc->b, '}');
             goto done_object;
         exception_ptab:
             js_free_prop_enum(ctx, ptab, plen);
@@ -107338,7 +107646,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                 goto exception;
             if (js_get_length64(ctx, &len, tab))
                 goto exception;
-            string_buffer_putc8(jsc->b, '{');
+            json_putc8(jsc->b, '{');
             has_content = false;
             for(i = 0; i < len; i++) {
                 JS_FreeValue(ctx, prop);
@@ -107353,26 +107661,26 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                     goto exception;
                 if (!JS_IsUndefined(v)) {
                     if (has_content)
-                        string_buffer_putc8(jsc->b, ',');
+                        json_putc8(jsc->b, ',');
                     prop = JS_ToQuotedStringFree(ctx, prop);
                     if (JS_IsException(prop)) {
                         JS_FreeValue(ctx, v);
                         goto exception;
                     }
-                    string_buffer_concat_value(jsc->b, sep);
+                    if (has_gap) string_buffer_concat_value(jsc->b, sep);
                     string_buffer_concat_value(jsc->b, prop);
-                    string_buffer_putc8(jsc->b, ':');
-                    string_buffer_concat_value(jsc->b, sep1);
+                    json_putc8(jsc->b, ':');
+                    if (has_gap) string_buffer_concat_value(jsc->b, sep1);
                     if (js_json_to_str(ctx, jsc, val, v, indent1))
                         goto exception;
                     has_content = true;
                 }
             }
             if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
-                string_buffer_putc8(jsc->b, '\n');
+                json_putc8(jsc->b, '\n');
                 string_buffer_concat_value(jsc->b, indent);
             }
-            string_buffer_putc8(jsc->b, '}');
+            json_putc8(jsc->b, '}');
         }
     done_object:
         jsc->stack_len--; /* pop (borrowed pointer, nothing to free) */
@@ -107399,33 +107707,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             goto exception;
         goto concat_value;
     case JS_TAG_FLOAT64:
-        {
-
-            double d = JS_VALUE_GET_FLOAT64(val);
-            char numbuf[JS_DTOA_MAX_DIGITS + 32];
-            JSDTOATempMem dtoa_mem;
-            int64_t i64;
-            size_t n;
-            if (!isfinite(d))
-                return string_buffer_write8(jsc->b, (const uint8_t *)"null", 4);
-            /* Integral doubles -- timestamps, ids, counts, prices in minor
-               units -- are most of the numbers in a real payload, and their
-               shortest round-trip representation is simply their digits.
-               js_dtoa reaches for multi-precision arithmetic to work that out;
-               profiling a number-heavy payload puts ~60% of the time inside
-               mpb_shr_round / mul_pow / mp_div1norm.
-
-               Exact within +/-2^53, where every integer is representable, so
-               the round trip is exact by construction. -0 takes this path and
-               prints "0", which is what Number(-0).toString() gives. */
-            if (d >= -9007199254740992.0 && d <= 9007199254740992.0 &&
-                (double)(i64 = (int64_t)d) == d) {
-                n = i64toa(numbuf, i64);
-                return string_buffer_write8(jsc->b, (const uint8_t *)numbuf, n);
-            }
-            n = js_dtoa(numbuf, d, 10, 0, JS_DTOA_FORMAT_FREE, &dtoa_mem);
-            return string_buffer_write8(jsc->b, (const uint8_t *)numbuf, n);
-        }
+        return json_put_float64(jsc->b, JS_VALUE_GET_FLOAT64(val));
     case JS_TAG_INT:
         {
             /* format integers straight into the buffer (no JSString alloc) */
@@ -107471,6 +107753,9 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
 
     jsc->replacer_func = JS_UNDEFINED;
     jsc->stack = NULL;
+    memset(jsc->walk_ok, 0, sizeof(jsc->walk_ok));
+    memset(jsc->walk_plain, 0, sizeof(jsc->walk_plain));
+    memset(jsc->walk_frag, 0, sizeof(jsc->walk_frag));
     jsc->stack_len = 0;
     jsc->stack_size = 0;
     jsc->property_list = JS_UNDEFINED;
@@ -107594,6 +107879,14 @@ done:
     JS_FreeValue(ctx, jsc->gap);
     JS_FreeValue(ctx, jsc->property_list);
     js_free(ctx, jsc->stack);
+    {
+        int wi;
+        for (wi = 0; wi < (int)countof(jsc->walk_ok); wi++) {
+            if (jsc->walk_ok[wi])
+                js_free_shape(ctx->rt, jsc->walk_ok[wi]);
+            json_key_frags_free(ctx, jsc->walk_frag[wi]);
+        }
+    }
     return ret;
 }
 
@@ -120853,3 +121146,35 @@ uintptr_t js_std_cmd(int cmd, ...) {
 #undef malloc
 #undef free
 #undef realloc
+
+#if QJS_AOT
+/* An own data property read by position: the receiver's shape names `atom` at index `slot` as a plain data property, so the value is
+   at the same index of the property array, whichever shape the receiver has. A site whose receivers have many shapes that all keep
+   the field at one index (the objects of one hierarchy build their common fields first) is served without a lookup. The value is
+   borrowed, as at a register read hit. Anything else (an exotic object, an accessor, a variable reference, an array length, a lazy
+   value, another atom at that index) is a miss for the caller to take its own way. */
+int qjs_aot_slot_atom_hit(JSValue recv, uint32_t slot, JSAtom atom, JSValue *out)
+{
+    JSObject *p;
+    JSShape *sh;
+    JSShapeProperty *prs;
+    JSValue v;
+
+    if (unlikely(JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT))
+        return 0;
+    p = JS_VALUE_GET_OBJ(recv);
+    sh = p->shape;
+    if (unlikely(p->is_exotic || slot >= (uint32_t)sh->prop_count))
+        return 0;
+    prs = &get_shape_prop(sh)[slot];
+    if (unlikely(prs->atom != atom || (prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH))))
+        return 0;
+    v = p->prop[slot].u.value;
+#if !QJS_DRC
+    if (JS_VALUE_GET_TAG(v) < 0)
+        return 0;
+#endif
+    *out = v;
+    return 1;
+}
+#endif

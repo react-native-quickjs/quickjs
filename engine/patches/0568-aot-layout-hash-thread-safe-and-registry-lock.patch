@@ -1,0 +1,187 @@
+Subject: Layout hash derived without shared scratch state; the unit registry is locked and owner-only
+
+What this does
+  - js_aot_gen_layout probed the context and runtime layouts in two static all-zero structs (c0, r0), setting a bit and scanning for it. Two runtimes on two threads did this at once, so one could scan a struct the other had just cleared and derive a different hash. The probes now use per-call heap structs.
+  - aot_unit_present derives the engine hash once and prints every compared field (abi and layout, unit and engine) on refusal; refusals are counted and reported at teardown with QJS_AOT_STATS.
+  - The process-wide bytecode registry (rbc_tab) is guarded by a lock (add, delete and the backtrace lookup rbc_find), and only a runtime that owns the unit (or while it is unowned) registers in it.
+
+Why we need it
+  The AOT-harness test262 gate (-t 2) printed "AOT unit refused: engine layout mismatch (unit N, engine N)" with equal numbers: the compare and the print ran the racy derivation twice. With the hash stable, both threads bind, and js_aot_bind then grew and freed rbc_tab from two threads at once (ASan: heap-use-after-free in rbc_add, "corrupted size vs. prev_size"); that was hidden while a thread was refused.
+
+Soundness
+  The hash value is unchanged for a single thread. A non-owner runtime already interprets; it now also stays out of the registry its frames must not resolve into.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -31294,7 +31294,12 @@
+ static uint32_t rbc_cap, rbc_n, rbc_used;
+ #define RBC_TOMB ((JSFunctionBytecode *)1)
+ static uint32_t rbc_hash(const uint8_t *d) { uint64_t h; memcpy(&h, d, 8); return (uint32_t)((h * 0x9E3779B97F4A7C15ull) >> 40); }
+-static void rbc_add(const uint8_t *d, JSFunctionBytecode *b)
++/* The table is process-wide and only the runtime that owns the unit registers in it; the lock covers the moment before ownership is
++   settled, when runtimes on several threads bind their first bytecodes together. */
++static int rbc_lock_word;
++static void rbc_lock(void) { while (__atomic_exchange_n(&rbc_lock_word, 1, __ATOMIC_ACQUIRE)) ; }
++static void rbc_unlock(void) { __atomic_store_n(&rbc_lock_word, 0, __ATOMIC_RELEASE); }
++static void rbc_add_locked(const uint8_t *d, JSFunctionBytecode *b)
+ {
+     uint32_t i;
+     if ((rbc_used + 1) * 2 > rbc_cap) {
+@@ -31315,19 +31320,32 @@
+     if (!rbc_tab[i].b) rbc_used++;
+     memcpy(rbc_tab[i].d, d, 16); rbc_tab[i].b = b; rbc_n++;
+ }
++static void rbc_add(const uint8_t *d, JSFunctionBytecode *b)
++{
++    rbc_lock();
++    rbc_add_locked(d, b);
++    rbc_unlock();
++}
+ static void rbc_del(JSFunctionBytecode *b)
+ {
+     uint32_t k;
++    rbc_lock();
+     for (k = 0; k < rbc_cap; k++)
+         if (rbc_tab[k].b == b) { rbc_tab[k].b = RBC_TOMB; rbc_n--; }
++    rbc_unlock();
+ }
+ static JSFunctionBytecode *rbc_find(const uint8_t *d)
+ {
+     uint32_t i;
+-    if (!rbc_cap) return NULL;
+-    for (i = rbc_hash(d) & (rbc_cap - 1); rbc_tab[i].b; i = (i + 1) & (rbc_cap - 1))
+-        if (rbc_tab[i].b != RBC_TOMB && memcmp(rbc_tab[i].d, d, 16) == 0) return rbc_tab[i].b;
+-    return NULL;
++    JSFunctionBytecode *r = NULL;
++    /* Backtrace building only (never a signal handler), so the lock is uncontended and off every hot path. */
++    rbc_lock();
++    if (rbc_cap) {
++        for (i = rbc_hash(d) & (rbc_cap - 1); rbc_tab[i].b; i = (i + 1) & (rbc_cap - 1))
++            if (rbc_tab[i].b != RBC_TOMB && memcmp(rbc_tab[i].d, d, 16) == 0) { r = rbc_tab[i].b; break; }
++    }
++    rbc_unlock();
++    return r;
+ }
+ static JSFunctionBytecode *rat_bc(const uint8_t *d)
+ {
+@@ -67589,8 +67607,9 @@
+     {
+         /* `extensible` and `fast_array` likewise, and the context's `std_array_prototype`. */
+         JSObject o;
+-        static JSContext c0; /* all zero: only the bit under test is set while it is searched for */
+-        JSContext *c = &c0;
++        /* all zero: only the bit under test is set while it is searched for; per call, since
++           two runtimes on two threads derive the hash at the same time */
++        JSContext *c = calloc(1, sizeof(JSContext));
+         const uint8_t *q = (const uint8_t *)&o;
+         size_t i;
+ 
+@@ -67626,6 +67645,7 @@
+             }
+             c->std_array_prototype = 0;
+         }
++        (free)(c);
+     }
+     /* The light-frame header a generated native entry writes itself. It builds
+        the same frame `regvm_light_fill` builds, field for field, so the
+@@ -67647,19 +67667,20 @@
+     out->off_rt_drc_pend_i = (uint32_t)offsetof(JSRuntime, drc_pend_i);
+     out->off_rt_drc_in_reconcile = (uint32_t)offsetof(JSRuntime, drc_in_reconcile);
+     {
+-        static JSRuntime r0; /* all zero: only the phase under test is set while it is searched for */
+-        const uint8_t *q = (const uint8_t *)&r0;
++        /* all zero: only the phase under test is set while it is searched for (per call, see above) */
++        JSRuntime *r0p = calloc(1, sizeof(JSRuntime));
++        const uint8_t *q = (const uint8_t *)r0p;
+         size_t i;
+ 
+-        r0.gc_phase = (JSGCPhaseEnum)255;
++        r0p->gc_phase = (JSGCPhaseEnum)255;
+         out->off_rt_gc_phase = 0;
+-        for (i = 0; i < sizeof(r0); i++) {
++        for (i = 0; i < sizeof(JSRuntime); i++) {
+             if (q[i] != 0) {
+                 out->off_rt_gc_phase = (uint32_t)i;
+                 break;
+             }
+         }
+-        r0.gc_phase = JS_GC_PHASE_NONE;
++        (free)(r0p);
+     }
+     out->class_object = JS_CLASS_OBJECT;
+     out->off_rt_blkcache = (uint32_t)offsetof(JSRuntime, arena_state.cache);
+@@ -69699,28 +69720,29 @@
+    with no other sign; one line on stderr, once per process, names
+    the cause and both hashes. */
+ static int aot_unit_refused_reported;
++/* How many times the unit was refused (each runtime asks), reported at teardown under QJS_AOT_STATS. */
++static uint64_t aot_unit_refused_count;
+ 
+ static int aot_unit_present(void)
+ {
+ #if defined(__GNUC__)
+     int has_unit = (&qjs_aot_count != NULL) && (&qjs_aot_layout != NULL);
++    uint32_t eh;
+ 
+     if (!has_unit)
+         return 0;
+-    if (qjs_aot_abi == QJS_AOT_ABI && qjs_aot_layout == js_aot_unit_layout_hash())
++    /* Derived once, so the compare and the message see the same value. */
++    eh = js_aot_unit_layout_hash();
++    if (qjs_aot_abi == QJS_AOT_ABI && qjs_aot_layout == eh)
+         return 1;
+-    if (!aot_unit_refused_reported) {
+-        aot_unit_refused_reported = 1;
+-        if (qjs_aot_abi != QJS_AOT_ABI)
+-            fprintf(stderr,
+-                    "quickjs: AOT unit refused: ABI mismatch (unit %u, engine %u)\n",
+-                    (unsigned)qjs_aot_abi, (unsigned)QJS_AOT_ABI);
+-        else
+-            fprintf(stderr,
+-                    "quickjs: AOT unit refused: engine layout mismatch "
+-                    "(unit %u, engine %u)\n",
+-                    (unsigned)qjs_aot_layout,
+-                    (unsigned)js_aot_unit_layout_hash());
++    __atomic_add_fetch(&aot_unit_refused_count, 1, __ATOMIC_RELAXED);
++    if (!__atomic_exchange_n(&aot_unit_refused_reported, 1, __ATOMIC_RELAXED)) {
++        fprintf(stderr,
++                "quickjs: AOT unit refused: %s (compared: abi unit %u engine %u, "
++                "layout unit %u engine %u)\n",
++                qjs_aot_abi != QJS_AOT_ABI ? "ABI mismatch" : "engine layout mismatch",
++                (unsigned)qjs_aot_abi, (unsigned)QJS_AOT_ABI,
++                (unsigned)qjs_aot_layout, (unsigned)eh);
+     }
+     return 0;
+ #else
+@@ -69898,6 +69920,7 @@
+ 
+ void js_aot_stats_dump(JSRuntime *rt)
+ {
++    uint64_t refused = __atomic_load_n(&aot_unit_refused_count, __ATOMIC_RELAXED);
+     int present = aot_unit_present();
+     unsigned count = present ? (unsigned)qjs_aot_count : 0u;
+     JSAotRun *r = rt->aot_run;
+@@ -69906,6 +69929,9 @@
+     char swbuf[64];
+     uint64_t sw = 0;
+ 
++    if (refused)
++        fprintf(stderr, "aot refusals: unit refused at %llu bind checks\n", (unsigned long long)refused);
++    fprintf(stderr, "aot registry: rbc_cap=%u rbc_n=%u\n", (unsigned)rbc_cap, (unsigned)rbc_n);
+     if (r) {
+         for (i = 0; i < r->cell_count; i++)
+             if (r->cells[i])
+@@ -70207,7 +70233,12 @@
+     if (!b->regvm_compiled || b->regvm_len <= 0 || b->is_lazy)
+         return;
+     js_aot_digest(b, digest);
+-    rbc_add(digest, b);
++    {
++        /* A runtime that does not own the unit interprets and registers nothing: its bytecodes must not be found by the owner's frames. */
++        JSRuntime *own = __atomic_load_n(&js_aot_unit_owner, __ATOMIC_ACQUIRE);
++        if (own == NULL || own == b->realm->rt)
++            rbc_add(digest, b);
++    }
+     /* A constructor of a contracted layout is marked whether or not the unit
+        compiled it: its function object is what the layout's chain is built from. */
+     if (&qjs_aot_layout_ctor != NULL && qjs_aot_layout_ctor(digest))

@@ -43,8 +43,7 @@ typedef struct ProfPc {
 #define Q2_ELEM_TA     (1u << 5)
 #define Q2_ELEM_BOOL   (1u << 6)
   /* AOT_ELEM_*: what an element pc stored or loaded. INT or FLOAT alone means
-     every element there was a number, so a compiled read needs no hole or lazy
-     test. */
+     every element there was a number, so a compiled read needs no hole test. */
   uint8_t elem;
   /* bit k: a typed array of class JS_CLASS_UINT8C_ARRAY + k was accessed here (the profiler's `tacls=`) */
   uint16_t ta;

@@ -4,6 +4,9 @@
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 CK=${CK:-$ROOT/.local/scratch/ck}
 seed=$1; W=$2/s$seed; mkdir -p "$W"
+for v in stack-rel reg-rel; do  # the two reference interpreters: Release CMake builds (reg-rel with -DQJS_REGVM=ON), target qjs-run
+  [ -x "$CK/$v/tests/qjs-run" ] || { echo "diff.sh: no $CK/$v/tests/qjs-run; build it first" >&2; exit 8; }
+done
 export TMPDIR=$ROOT/.local/scratch/tmp; mkdir -p "$TMPDIR"
 node $ROOT/tools/fuzz/gen.mjs $seed "$W/g" || exit 9
 node $ROOT/tools/fuzz/gen.mjs $((seed + 1000003)) "$W/w" || exit 9

@@ -1,0 +1,291 @@
+Subject: A shared add-transition table replays property adds for receivers of many shapes
+
+What this does
+  - `rt->put_add_cache`, 1024 entries keyed by (receiver shape, atom): the shape after the add and the slot. `regvm_put_field_ic` probes it before the generic store; a hit replays the add (`regvm_put_add_apply`, the same body the site entry's replay uses). The entry is filled where the site entry is installed, and the pre-add shape is now snapshotted for every miss, not only at a site whose entry is empty or holds the same shape.
+  - Both shapes of an entry are held by a counted reference (like a site entry's shape); `js_putadd_release` drops them at the start of `JS_FreeRuntime`, before the objects and atoms are freed (a held shape holds its prototype).
+  - The site-entry replay (`regvm_put_field_add_hit`) keeps its inline body (`regvm_put_add_apply_i`, always inline); the table's replay is one out-of-line copy.
+
+Why we need it
+  A base constructor run for every subclass (typescript's `AST`, `_super.call(this)`) stores into receivers of about sixty shapes, one per subclass prototype. The site entry holds one transition, so every other receiver went through the generic add: find_own_property, the shape-hash lookup and the snapshot, 7.2% of typescript's cycles (qjs_aot_put_field_slow -> regvm_put_field_ic).
+
+Soundness
+  An entry is replayed only while `ic_watchpoint_epoch` is the value it was filled at (no prototype gained a setter or read-only property of that name), only for extensible, non-exotic, non-prototype receivers in the filled shape, and only for stores that `ic_store_is_plain_add` found plain at fill time: the conditions of the site entry's replay. A nursery cell is promoted first, as the site replay does for a caller that does not take the young path.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -405,6 +405,7 @@
+ typedef struct JSString JSAtomStruct;
+ typedef struct JSStringRope JSStringRope;
+ typedef struct JSMegaEntry JSMegaEntry;
++typedef struct JSPutAddEntry JSPutAddEntry;
+ /* QJS_DRC: the runtime's candidate list needs the name before the
+    struct definition below. */
+ typedef struct JSVarRef JSVarRef;
+@@ -909,6 +910,7 @@
+     size_t regvm_chunks_bytes;   /* data bytes of the chunks in the live chain */
+ #endif
+     JSMegaEntry *mega_cache;
++    JSPutAddEntry *put_add_cache;
+     void *user_opaque;
+     void *libc_opaque;
+     JSRuntimeFinalizerState *finalizers;
+@@ -1732,6 +1734,22 @@
+     uint32_t shape_epoch;
+ };
+ 
++/* The add-transition cache shared by every store site: receiver shape + atom -> the shape after the add and the slot. A site whose
++   receivers have many shapes (a base constructor run for every subclass) keeps one transition in its own entry and misses on the
++   rest; this table holds them all. Both shapes are held by a counted reference, like the site entries' shapes, so an entry never
++   names a freed shape; it is good while no prototype interceptor has appeared (ic_watchpoint_epoch), the condition the per-site
++   entry already depends on. */
++#ifndef JS_PUTADD_BITS
++#define JS_PUTADD_BITS 10
++#endif
++struct JSPutAddEntry {
++    JSShape *shape;
++    JSShape *to_shape;
++    JSAtom atom;
++    uint32_t off;
++    uint32_t wp_epoch;
++};
++
+ /* AOT ABI version, shared by the profiler digest and the AOT runtime. The
+    engine refuses a generated unit built against another version. The value
+    encoding is part of the ABI: a unit compiled against one encoding reads a
+@@ -3153,6 +3171,7 @@
+                             JS_MarkFunc *mark_func);
+ static int JS_AddIntrinsicBasicObjects(JSContext *ctx);
+ static void js_free_shape(JSRuntime *rt, JSShape *sh);
++static void js_putadd_release(JSRuntime *rt);
+ static void js_free_shape_null(JSRuntime *rt, JSShape *sh);
+ #if QJS_AOT_PROFILE
+ static void aot_note_shape_freed(JSShape *sh);
+@@ -5221,6 +5240,7 @@
+     bool leak = false;
+     int i;
+ 
++    js_putadd_release(rt);
+     if (rt->forin_shape) {
+         js_free_shape(rt, rt->forin_shape);
+         rt->forin_shape = NULL;
+@@ -5526,6 +5546,7 @@
+     js_free_rt(rt, rt->shape_hash);
+ #if !JS_MEGA_DISABLE
+     js_free_rt(rt, rt->mega_cache);
++    js_free_rt(rt, rt->put_add_cache);
+ #if QJS_REGVM_RECORD
+     regvm_arena_free(rt);
+     rt->regvm_frames = NULL;
+@@ -9842,6 +9863,68 @@
+ }
+ #endif
+ 
++static inline uint32_t js_putadd_slot(JSShape *shape, JSAtom atom)
++{
++    return (((uintptr_t)shape >> 5) ^ (uint32_t)atom * 2654435761u) & ((1u << JS_PUTADD_BITS) - 1);
++}
++
++static inline JSPutAddEntry *js_putadd_probe(JSRuntime *rt, JSShape *shape, JSAtom atom)
++{
++    JSPutAddEntry *e;
++    if (!rt->put_add_cache)
++        return NULL;
++    e = &rt->put_add_cache[js_putadd_slot(shape, atom)];
++    if (e->shape != shape || e->atom != atom || e->wp_epoch != rt->ic_watchpoint_epoch)
++        return NULL;
++    return e;
++}
++
++static void js_putadd_fill(JSRuntime *rt, JSShape *shape, JSAtom atom, JSShape *to_shape, uint32_t off)
++{
++    JSPutAddEntry *e;
++    if (rt->ic_watchpoint_epoch >= JS_IC_EPOCH_MAX)
++        return;
++    if (!rt->put_add_cache) {
++        rt->put_add_cache = js_calloc_rt(rt, 1u << JS_PUTADD_BITS, sizeof(*rt->put_add_cache));
++        if (!rt->put_add_cache)
++            return;
++    }
++    e = &rt->put_add_cache[js_putadd_slot(shape, atom)];
++    if (e->shape == shape && e->to_shape == to_shape && e->atom == atom) {
++        e->off = off;
++        e->wp_epoch = rt->ic_watchpoint_epoch;
++        return;
++    }
++    {
++        JSShape *old_a = e->shape, *old_b = e->to_shape;
++        e->shape = js_dup_shape(shape);
++        e->to_shape = js_dup_shape(to_shape);
++        e->atom = atom;
++        e->off = off;
++        e->wp_epoch = rt->ic_watchpoint_epoch;
++        if (old_a)
++            js_free_shape(rt, old_a);
++        if (old_b)
++            js_free_shape(rt, old_b);
++    }
++}
++
++static void js_putadd_release(JSRuntime *rt)
++{
++    uint32_t i;
++    if (!rt->put_add_cache)
++        return;
++    for (i = 0; i < (1u << JS_PUTADD_BITS); i++) {
++        JSPutAddEntry *e = &rt->put_add_cache[i];
++        JSShape *a = e->shape, *b = e->to_shape;
++        e->shape = e->to_shape = NULL;
++        if (a)
++            js_free_shape(rt, a);
++        if (b)
++            js_free_shape(rt, b);
++    }
++}
++
+ #ifdef QJS_ICSTAT
+ static void js_icstat_dump(void)
+ {
+@@ -29644,7 +29727,7 @@
+ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
+                                JSRegPIC **ppic, JSValue recv, JSAtom atom,
+                                int site, JSShape *pre_sh, uint32_t pre_count,
+-                               int prof_was_own)
++                               int prof_was_own, int site_ok)
+ {
+     JSRuntime *rt = ctx->rt;
+     JSObject *p;
+@@ -29694,7 +29777,7 @@
+         /* Saturated: the epoch can no longer say that a prototype changed. The store is replayed as "append this property"
+            only when it was a plain add (see ic_store_is_plain_add). */
+         int plain_add = rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX && ic_store_is_plain_add(pre_sh, atom);
+-        if (plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
++        if (site_ok && plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
+             int s2 = b->regvm_pic_count + site;
+             AOT_THRASH(b, site);
+ regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+@@ -29702,6 +29785,8 @@
+                               (uint32_t)(pr - p->prop));
+             pic[s2].misses = (uint16_t)rt->ic_watchpoint_epoch;
+         }
++        if (plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1)
++            js_putadd_fill(rt, pre_sh, atom, nsh, (uint32_t)(pr - p->prop));
+     }
+ }
+ 
+@@ -29710,32 +29795,11 @@
+    appeared. Grow the property array if needed, install the new shape, and
+    write the slot with a duplicated value. Returns 1 on a hit, 0 on a miss, -1
+    after an allocation threw. */
+-static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
+-                                   JSRegPIC *pic, JSObject *p, JSValue v,
+-                                   int site, int yok)
++static inline __attribute__((always_inline)) int regvm_put_add_apply_i(JSContext *ctx, JSFunctionBytecode *b, JSObject *p, JSValue v,
++                                                                       int site, int yok, JSShape *nsh, uint32_t off)
+ {
+-    JSRegPIC *e;
+-    JSShape *nsh, *osh;
+-    uint32_t off;
++    JSShape *osh = p->shape;
+ 
+-    if (b->regvm_pic == NULL || b->regvm_pic_count == 0)
+-        return 0;
+-    e = &pic[b->regvm_pic_count + site];
+-    if (e->shape != p->shape || e->kind != REG_PIC_ADD_W)
+-        return 0;
+-    if (!p->extensible || p->is_exotic)
+-        return 0;
+-    /* a property added to a prototype is the generic add's to make: it moves the watchpoint epoch */
+-    if (unlikely(p->is_prototype))
+-        return 0;
+-    if (e->misses != (uint16_t)ctx->rt->ic_watchpoint_epoch)
+-        return 0;                   /* a prototype interceptor appeared */
+-    /* a nursery cell owns no shape reference and counts none of its edges until
+-       it is promoted; the swap below moves counted references, so it is the
+-       ordinary object's to make */
+-    nsh = b->regvm_pic_holder[b->regvm_pic_count + site];
+-    off = e->slot_off / (uint32_t)sizeof(JSProperty);
+-    osh = p->shape;
+     if (yok && Y_YOUNG(p)) {
+         if ((uint32_t)nsh->prop_size <= p->prop_inline_cap && !p->gv_watched) {
+             /* The cell takes the new shape without a reference and the value without a count; the value's own count is the caller's,
+@@ -29775,6 +29839,38 @@
+     return 1;
+ }
+ 
++/* The shared table's replay is off the interpreter's hot path: one out-of-line copy. */
++static __attribute__((noinline)) int regvm_put_add_apply(JSContext *ctx, JSFunctionBytecode *b, JSObject *p, JSValue v,
++                                                         int site, int yok, JSShape *nsh, uint32_t off)
++{
++    return regvm_put_add_apply_i(ctx, b, p, v, site, yok, nsh, off);
++}
++
++static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
++                                   JSRegPIC *pic, JSObject *p, JSValue v,
++                                   int site, int yok)
++{
++    JSRegPIC *e;
++
++    if (b->regvm_pic == NULL || b->regvm_pic_count == 0)
++        return 0;
++    e = &pic[b->regvm_pic_count + site];
++    if (e->shape != p->shape || e->kind != REG_PIC_ADD_W)
++        return 0;
++    if (!p->extensible || p->is_exotic)
++        return 0;
++    /* a property added to a prototype is the generic add's to make: it moves the watchpoint epoch */
++    if (unlikely(p->is_prototype))
++        return 0;
++    if (e->misses != (uint16_t)ctx->rt->ic_watchpoint_epoch)
++        return 0;                   /* a prototype interceptor appeared */
++    /* a nursery cell owns no shape reference and counts none of its edges until
++       it is promoted; the swap below moves counted references, so it is the
++       ordinary object's to make */
++    return regvm_put_add_apply_i(ctx, b, p, v, site, yok, b->regvm_pic_holder[b->regvm_pic_count + site],
++                               e->slot_off / (uint32_t)sizeof(JSProperty));
++}
++
+ /* The register store for a site-bearing instruction. The pre-add shape is
+    snapshotted before the store so a fresh add can be cached as a
+    transition. */
+@@ -29789,6 +29885,7 @@
+     int ret;
+     JSShape *sprof_pre = NULL;      /* profile only: the receiver's shape before the store, referenced */
+     int sprof_cnt = 0, sprof_own = 0;
++    int site_ok = 1;
+ 
+     if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+         JSObject *po = JS_VALUE_GET_OBJ(recv);
+@@ -29810,10 +29907,20 @@
+ #endif
+         if (*ppic != NULL && b->regvm_pic_count != 0)
+             e2 = &(*ppic)[b->regvm_pic_count + site];
+-        /* Snapshot only when the site has no transition yet or holds this exact
+-           pre-add shape; a polymorphic site is left alone. */
+-        if ((e2 == NULL || e2->kind == REG_PIC_EMPTY || e2->shape == po->shape) &&
+-            po->extensible && !po->is_exotic && po->shape->is_hashed) {
++        /* A store whose receiver shape and atom the shared add-transition table knows is replayed from it: the site's own entry
++           holds one transition, and a base constructor run for many subclasses sees one receiver shape per subclass. */
++        if (po->extensible && !po->is_exotic && !po->is_prototype && po->shape->is_hashed) {
++            JSPutAddEntry *pe = js_putadd_probe(rt, po->shape, atom);
++            if (pe != NULL) {
++                int ah = regvm_put_add_apply(ctx, b, po, val, site, 0, pe->to_shape, pe->off);
++                if (ah != 0)
++                    return ah < 0 ? -1 : 0;
++            }
++        }
++        /* Snapshot for the shared table always, and for the site's own entry only when it has no transition yet or holds this
++           exact pre-add shape (a polymorphic site's entry is left alone). */
++        site_ok = e2 == NULL || e2->kind == REG_PIC_EMPTY || e2->shape == po->shape;
++        if (po->extensible && !po->is_exotic && po->shape->is_hashed) {
+             JSProperty *pr0;
+             if (!find_own_property(&pr0, po, atom)) {
+                 pre_sh = js_dup_shape(po->shape);
+@@ -29825,7 +29932,7 @@
+                                   JS_PROP_THROW_STRICT);
+     if (likely(ret >= 0))
+         regvm_put_pic_fill(ctx, b, ppic, recv, atom, site, pre_sh, pre_count,
+-                           prof_was_own);
++                           prof_was_own, site_ok);
+     if (pre_sh)
+         js_free_shape(rt, pre_sh);
+ #if QJS_AOT_PROFILE

@@ -1,0 +1,32 @@
+Subject: The shared add-transition table is probed and filled only by sites whose entry holds another shape
+
+What this does
+  - `regvm_put_field_ic` probes `rt->put_add_cache` only when the site's add entry is filled with a different receiver shape, and fills it only at such a site (`site_ok` false); a site whose entry is empty or holds the receiver's own shape neither probes nor fills.
+
+Why we need it
+  Patch 0572 probed on every store miss and filled on every add. A site with one receiver shape never needs the table, and the fill (two counted shape references, two releases on a slot conflict) was paid on every add through the slow path. splay: instructions +1.2% -> +0.6% against the tree without 0572; typescript is unchanged (-17.3% instructions, the polymorphic sites are the ones that use the table).
+
+Soundness
+  Nothing is replayed that was not before: the probe is skipped where the site entry's own replay holds, and the table's entries are filled by the same conditions.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -29785,7 +29785,7 @@
+                               (uint32_t)(pr - p->prop));
+             pic[s2].misses = (uint16_t)rt->ic_watchpoint_epoch;
+         }
+-        if (plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1)
++        if (!site_ok && plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1)
+             js_putadd_fill(rt, pre_sh, atom, nsh, (uint32_t)(pr - p->prop));
+     }
+ }
+@@ -29909,7 +29909,8 @@
+             e2 = &(*ppic)[b->regvm_pic_count + site];
+         /* A store whose receiver shape and atom the shared add-transition table knows is replayed from it: the site's own entry
+            holds one transition, and a base constructor run for many subclasses sees one receiver shape per subclass. */
+-        if (po->extensible && !po->is_exotic && !po->is_prototype && po->shape->is_hashed) {
++        if (po->extensible && !po->is_exotic && !po->is_prototype && po->shape->is_hashed &&
++            e2 != NULL && e2->kind != REG_PIC_EMPTY && e2->shape != po->shape) {
+             JSPutAddEntry *pe = js_putadd_probe(rt, po->shape, atom);
+             if (pe != NULL) {
+                 int ah = regvm_put_add_apply(ctx, b, po, val, site, 0, pe->to_shape, pe->off);

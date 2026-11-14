@@ -1,0 +1,121 @@
+Subject: `s.replace(re, K).length` in compiled code computes the length from the match vector and makes no result string
+
+What this does
+  - new `qjs_aot_replace_len` (quickjs-aot-rt.h): for a flat string subject, a pristine RegExp and a flat replacement string without `$` (no named groups, not sticky without global), runs the same match loop as the pristine replace, sets a global RegExp's lastIndex to 0 as replace does, and returns the length of the string replace would build; 0 with nothing observable done in any other case (a match that throws clears its exception and the caller's ordinary call throws it again)
+  - `qjs_aot_array_builtin_fn(2)` is String.prototype.replace, so a compiled site can identify the builtin callee by its function pointer
+  - RegExp.prototype[Symbol.replace] joins the pristine snapshot (`js_regexp_snapshot`): String.prototype.replace looks it up, so a fast path that skips the lookup needs it to be the original
+
+Why we need it
+  The regexp row runs 712 `s.replace(re, K).length` sites; each made a result string only to read its length and drop it. With the generator's site (a call whose only reader is the next `.length`, profiled callee String.prototype.replace) asking for the length first: regexp row at fixed work -9.8% cycles, -10.4% instructions, stripped binary +1.4%.
+
+Soundness
+  The length is computed from the same match vector `js_regexp_replace_fast` copies spans from (same span rule, same empty-match advance), so it equals the built string's length; any condition the fast replace does not cover declines before any effect except a global RegExp's lastIndex = 0, which the ordinary call then repeats. The snapshot entry only makes `js_regexp_fast` fail when Symbol.replace was changed, which sends those calls down the generic path. Differential, compiled unit vs interpreter: 234,000 cases (13 regexps incl. empty matches and captures, 6 replacements incl. `$`, 10 subjects incl. 16-bit) and 23 guard cases (Symbol.replace patched, replaced and restored, exec patched, String.prototype.replace replaced, named groups, sticky, lastIndex global and not, subclass, own exec, String object, string pattern, function replacement, `$&`, 16-bit replacement, flags getter) are identical; the 13 Octane rows compile and run.
+
+diff --git a/quickjs.c b/quickjs.c
+index f356342..8e7d437 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -70614,9 +70614,14 @@ QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void)
+     return (const void *)js_array_iterator_next;
+ }
+ 
++static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
++                                 int argc, JSValueConst *argv,
++                                 int is_replaceAll);
++
+ QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which)
+ {
+-    return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop : NULL;
++    return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop :
++           which == 2 ? (const void *)js_string_replace : NULL;
+ }
+ 
+ /* The push of a compiled body that does not fit the array's capacity (or its packed element kind): the builtin itself, on a receiver the
+@@ -103291,6 +103296,7 @@ static void js_regexp_snapshot(JSContext *ctx)
+         n++;
+     }
+     atoms[n++] = JS_ATOM_Symbol_match;
++    atoms[n++] = JS_ATOM_Symbol_replace;
+     for (i = 0; i < n; i++) {
+         idx[i] = js_regexp_snap_slot(ctx, proto, atoms[i], &getter[i]);
+         if (idx[i] < 0)
+@@ -104669,6 +104675,62 @@ static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx)
+     return res;
+ }
+ 
++/* `str.replace(re, rep).length` of a compiled body, without making the result string: `this_val` and `rep` are flat strings, `rx` a pristine
++   RegExp (its replace method, its exec and its flags are the original ones), `rep` has no `$`. The length is the one the replacement
++   would have; a global RegExp's lastIndex is left at 0 as replace leaves it. Returns 0 with nothing observable done when any of that does
++   not hold (or the match failed in a way that throws: the exception is cleared and the caller's ordinary call throws it), so the
++   caller repeats the call. */
++QJS_AOT_STUB int qjs_aot_replace_len(JSContext *ctx, JSValue this_val, JSValue rx, JSValue rep, int32_t *out)
++{
++    JSRegExp *re;
++    const uint8_t *bc;
++    JSString *sp, *rp;
++    JSReMatches m;
++    int flags, ncap, next = 0;
++    bool global;
++    int64_t total = 0;
++    size_t mi;
++
++    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_STRING || JS_VALUE_GET_TAG(rep) != JS_TAG_STRING)
++        return 0;
++    re = js_regexp_fast(ctx, rx);
++    if (!re)
++        return 0;
++    sp = JS_VALUE_GET_STRING(this_val);
++    rp = JS_VALUE_GET_STRING(rep);
++    if (string_indexof_char(rp, '$', 0) >= 0)
++        return 0;
++    bc = str8(re->bytecode);
++    flags = lre_get_flags(bc);
++    ncap = lre_get_capture_count(bc);
++    global = (flags & LRE_FLAG_GLOBAL) != 0;
++    if ((flags & LRE_FLAG_NAMED_GROUPS) || ((flags & LRE_FLAG_STICKY) && !global))
++        return 0;
++    js_re_matches_init(&m, ctx, ncap);
++    if (global)
++        JS_VALUE_GET_OBJ(rx)->prop[0].u.value = js_int32(0);
++    if (js_regexp_match_loop(ctx, re, sp, global,
++                             (flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0,
++                             &m)) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        js_re_matches_free(&m);
++        return 0;
++    }
++    for (mi = 0; mi < m.n; mi++) {
++        const int32_t *e = m.v + mi * m.stride;
++        if (e[0] >= next) {
++            total += (int64_t)(e[0] - next) + rp->len;
++            next = e[1];
++        }
++    }
++    total += (int64_t)sp->len - next;
++    js_re_matches_free(&m);
++    if (total > JS_STRING_LEN_MAX)
++        return 0;
++    *out = (int32_t)total;
++    return 1;
++}
++
+ static JSValue js_regexp_Symbol_replace_body(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv);
+ 
+diff --git a/quickjs-aot-rt.h b/quickjs-aot-rt.h
+index cfb6fb6..5a282a8 100644
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -241,9 +241,11 @@ typedef struct JSAotGenLayout {
+ /* The function pointer of Array Iterator's `next`, which a C function object holds when it is
+    that builtin. */
+ QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void);
+-/* The function pointer of Array.prototype.push (0) or pop (1), which a C function object holds,
++/* The function pointer of Array.prototype.push (0), pop (1) or String.prototype.replace (2), which a C function object holds,
+    with magic 0, when it is that builtin. */
+ QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which);
++/* `str.replace(re, rep).length` without the result string (see quickjs.c); 0 = not applicable, nothing done */
++QJS_AOT_STUB int qjs_aot_replace_len(JSContext *ctx, JSValue this_val, JSValue rx, JSValue rep, int32_t *out);
+ /* push of one value through the builtin on a plain array the body checked (the capacity miss of the inline push); 0 = it threw and nothing happened */
+ QJS_AOT_STUB int qjs_aot_array_push_slow(JSContext *ctx, JSValue arr, JSValue v, JSValue *out);
+ /* the byte offset of the own data property `atom` in objects of `shape`, or 0 when it is not one (a compiled copy resolves its receiver's slots from the shape) */

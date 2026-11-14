@@ -9,6 +9,7 @@
 #else
 #define FUZZ_EXECUTE 1
 #endif
+#define _GNU_SOURCE  // before any system header: the engine uses pthread_getattr_np
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,8 @@ static void fix_checksum(uint8_t *b, size_t len) {
   if (len < 6) return;
   put_u32(&b[1], bc_csum(&b[5], len - 5));
 }
+
+size_t LLVMFuzzerMutate(uint8_t *data, size_t size, size_t max_size);  // libFuzzer's default mutator
 
 size_t LLVMFuzzerCustomMutator(
     uint8_t *data, size_t size, size_t max_size, unsigned int seed) {

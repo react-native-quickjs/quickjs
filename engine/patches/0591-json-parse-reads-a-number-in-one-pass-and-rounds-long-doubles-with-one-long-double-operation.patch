@@ -1,0 +1,219 @@
+Subject: JSON.parse reads a number in one pass and rounds 17-19 digit doubles with one long-double operation
+
+What this does
+  - `json_parse_number` collects the significant digits (up to 19) and the decimal exponent while it validates, instead of a second scan by `json_fast_double` (removed)
+  - `json_wexp_to_double`: Clinger's fast path as before (w <= 2^53, |e| <= 22); then, on x86 with the 80-bit long double, w * 10^e or w / 10^-e for |e| <= 27 in long double and a rounding to double, unless the long-double result is exactly a midpoint between two doubles; everything else (more than 19 digits, larger exponents, midpoints) still goes to strtod
+  - `<float.h>` included for `LDBL_MANT_DIG`
+
+Why we need it
+  Doubles printed by JS carry up to 17 significant digits, so most non-integral values in a payload (balances, coordinates, ratios) were above 2^53 and went to strtod, ~5% of parse cycles on the app-traffic benchmark, plus the second scan. json_app parse only: -6.9% cycles, -5.6% instructions.
+
+Soundness
+  w < 10^19 < 2^64 and 10^k for k <= 27 (< 2^64 * 2^27, with 27 trailing zero bits) are exact long doubles, so one multiply or divide gives r = the true value rounded once to 64 bits, round-to-nearest. A double midpoint needs 54 significant bits, so it is a long double; if one lay strictly between the true value and r it would be nearer the true value than r, a contradiction. So rounding r to double equals rounding the true value unless r is a midpoint (low 11 bits of the 64-bit significand exactly 0x400), which goes to strtod. The range stays normal for both formats (1 <= w < 10^19, 10^-27..10^46). Differentials identical old vs new: new jld.js (3,052,514 numbers: 14-20 digit decimals with exponents -35..35, leading and trailing zeros, exact double midpoints (2^53+2k+1)*2^j and *2^-q written several ways and their neighbours), jnum (400,015), jdtoa (1.5M), and all earlier JSON differentials.
+
+diff --git a/quickjs.c b/quickjs.c
+index 2d66c5d..8771faa 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -31,6 +31,7 @@
+ #include <inttypes.h>
+ #include <string.h>
+ #include <assert.h>
++#include <float.h>
+ 
+ #if QJS_AOT_PROFILE && !defined(_WIN32)
+ #include <dlfcn.h> /* dladdr */
+@@ -50939,68 +50940,45 @@ static int json_parse_key_string(JSParseState *s, const uint8_t **pp)
+     return json_parse_string(s, pp);
+ }
+ 
+-/* A JSON number in [p, end) (already validated) as the correctly rounded double, when that takes one exact operation: at most 19
+-   significant digits making an integer w <= 2^53, and a decimal exponent e with |e| <= 22, so w and 10^|e| are exact doubles and
+-   w * 10^e or w / 10^-e is rounded once (Clinger's fast path). Returns false for anything else, which strtod handles. */
+-static bool json_fast_double(const uint8_t *p, const uint8_t *end, double *out)
++/* The correctly rounded double of (neg ? -1 : 1) * w * 10^e, w < 10^19 and nonzero, when it can be had without strtod; false
++   otherwise.
++   - w <= 2^53 and |e| <= 22: w and 10^|e| are exact doubles, and one multiply or divide rounds once (Clinger's fast path).
++   - x87 long double (64-bit significand), |e| <= 27: w and 10^|e| are exact there, so one operation gives r, the true value
++     rounded once to 64 bits; rounding r to a double is then the correct rounding of the true value unless r is itself a midpoint
++     between two doubles (a midpoint needs only 54 bits, so any midpoint strictly between the true value and r would be nearer
++     than r, which r excludes). That case, low 11 bits of r's significand exactly 0x400, is left to strtod. */
++static inline bool json_wexp_to_double(bool neg, uint64_t w, int e, double *out)
+ {
+     static const double pow10[23] = {
+         1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+         1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+     };
+-    bool neg = false, eneg = false;
+-    uint64_t w = 0;
+-    int nd = 0, e = 0, ex = 0;
+     double d;
+ 
+-    if (*p == '-') {
+-        neg = true;
+-        p++;
+-    }
+-    while (p < end && is_digit(*p)) {
+-        if (w != 0 || *p != '0') {
+-            if (++nd > 19)
+-                return false;
+-            w = w * 10 + (uint64_t)(*p - '0');
+-        }
+-        p++;
+-    }
+-    if (p < end && *p == '.') {
+-        p++;
+-        while (p < end && is_digit(*p)) {
+-            if (w != 0 || *p != '0') {
+-                if (++nd > 19)
+-                    return false;
+-                w = w * 10 + (uint64_t)(*p - '0');
+-            }
+-            e--;
+-            p++;
+-        }
+-    }
+-    if (p < end && (*p == 'e' || *p == 'E')) {
+-        p++;
+-        if (*p == '+' || *p == '-')
+-            eneg = *p++ == '-';
+-        while (p < end && is_digit(*p)) {
+-            if (ex > 1000)
+-                return false;
+-            ex = ex * 10 + (*p - '0');
+-            p++;
+-        }
+-        e += eneg ? -ex : ex;
++    if (w <= ((uint64_t)1 << 53) && e >= -22 && e <= 22) {
++        d = (double)w;
++        d = e < 0 ? d / pow10[-e] : d * pow10[e];
++        *out = neg ? -d : d;
++        return true;
+     }
+-    if (p != end || w > ((uint64_t)1 << 53))
+-        return false;
+-    if (w == 0) {
+-        *out = neg ? -0.0 : 0.0;
++#if (defined(__x86_64__) || defined(__i386__)) && LDBL_MANT_DIG == 64
++    if (e >= -27 && e <= 27) {
++        static const long double lpow10[28] = {
++            1e0L, 1e1L, 1e2L, 1e3L, 1e4L, 1e5L, 1e6L, 1e7L, 1e8L, 1e9L, 1e10L, 1e11L, 1e12L, 1e13L,
++            1e14L, 1e15L, 1e16L, 1e17L, 1e18L, 1e19L, 1e20L, 1e21L, 1e22L, 1e23L, 1e24L, 1e25L, 1e26L, 1e27L,
++        };
++        long double r = (long double)w;
++        uint64_t m;
++        r = e < 0 ? r / lpow10[-e] : r * lpow10[e];
++        memcpy(&m, &r, sizeof(m)); /* the explicit 64-bit significand */
++        if ((m & 0x7ff) == 0x400)
++            return false;
++        d = (double)r;
++        *out = neg ? -d : d;
+         return true;
+     }
+-    if (e < -22 || e > 22)
+-        return false;
+-    d = (double)w;
+-    d = e < 0 ? d / pow10[-e] : d * pow10[e];
+-    *out = neg ? -d : d;
+-    return true;
++#endif
++    return false;
+ }
+ 
+ static int json_parse_number(JSParseState *s, const uint8_t **pp)
+@@ -51009,8 +50987,10 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
+     const uint8_t *p_start = p;
+     bool neg = false;
+     bool is_float = false;
+-    uint64_t ival = 0;
+-    int ndigits = 0;
++    uint64_t w = 0;     /* the significant digits, while there are at most 19 */
++    int nd = 0;         /* significant digits seen (leading zeros excluded) */
++    int ndigits = 0;    /* integer-part digits */
++    int e = 0;          /* decimal exponent of w */
+ 
+     if (*p == '+' || *p == '-') {
+         neg = (*p == '-');
+@@ -51024,10 +51004,13 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
+         return json_parse_error(s, p, "Unexpected number");
+ 
+     while (is_digit(*p)) {
+-        /* accumulate the integer value while it stays exact in a double
+-           (<= 15 digits < 2^53); longer numbers fall back to strtod */
+-        if (ndigits <= 15)
+-            ival = ival * 10 + (*p - '0');
++        if (w != 0 || *p != '0') {
++            if (nd < 19)
++                w = w * 10 + (*p - '0');
++            else
++                e++;
++            nd++;
++        }
+         ndigits++;
+         p++;
+     }
+@@ -51037,36 +51020,54 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
+         p++;
+         if (!is_digit(*p))
+             return json_parse_error(s, p, "Unterminated fractional number");
+-        while (is_digit(*p))
++        while (is_digit(*p)) {
++            if (w != 0 || *p != '0') {
++                if (nd < 19) {
++                    w = w * 10 + (*p - '0');
++                    e--;
++                }
++                nd++;
++            } else {
++                e--;
++            }
+             p++;
++        }
+     }
+     if (*p == 'e' || *p == 'E') {
++        bool eneg = false;
++        int ex = 0;
+         is_float = true;
+         p++;
+         if (*p == '+' || *p == '-')
+-            p++;
++            eneg = *p++ == '-';
+         if (!is_digit(*p))
+             return json_parse_error(s, p, "Exponent part is missing a number");
+-        while (is_digit(*p))
++        while (is_digit(*p)) {
++            if (ex < 100000)
++                ex = ex * 10 + (*p - '0');
+             p++;
++        }
++        e += eneg ? -ex : ex;
+     }
+     s->token.val = TOK_NUMBER;
+     if (!is_float && ndigits <= 15) {
+         /* integer fast path: avoids a second (locale-aware) strtod scan */
+-        if (ival == 0) {
++        if (w == 0) {
+             /* preserve -0 as a float64 negative zero */
+             s->token.u.num.val = neg ? js_float64(-0.0) : js_int32(0);
+-        } else if (!neg && ival <= INT32_MAX) {
+-            s->token.u.num.val = js_int32((int32_t)ival);
+-        } else if (neg && ival <= (uint64_t)INT32_MAX + 1) {
+-            s->token.u.num.val = js_int32((int32_t)(0 - (int64_t)ival));
++        } else if (!neg && w <= INT32_MAX) {
++            s->token.u.num.val = js_int32((int32_t)w);
++        } else if (neg && w <= (uint64_t)INT32_MAX + 1) {
++            s->token.u.num.val = js_int32((int32_t)(0 - (int64_t)w));
+         } else {
+-            double d = (double)ival;
++            double d = (double)w;
+             s->token.u.num.val = js_float64(neg ? -d : d);
+         }
+     } else {
+         double d;
+-        if (!json_fast_double(p_start, p, &d))
++        if (w == 0)
++            d = neg ? -0.0 : 0.0;
++        else if (nd > 19 || !json_wexp_to_double(neg, w, e, &d))
+             d = strtod((const char *)p_start, NULL);
+         s->token.u.num.val = js_float64(d);
+     }

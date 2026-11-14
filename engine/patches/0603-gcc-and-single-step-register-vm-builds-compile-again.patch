@@ -1,0 +1,83 @@
+Subject: gcc and single-step register VM builds compile again
+
+What this does
+  <emmintrin.h> is included once, near the top of quickjs.c, before the malloc/free poison defines; the three later includes are gone. regvm_fill_unwritten moves out of the QJS_REGVM_RECORD block, next to the code that uses it in both paths. The single-step handler's light-frame branch of apply-with-arguments is compiled only with QJS_REGVM_THREAD, which defines regvm_light_apply_arguments. QJS_AOT without QJS_REGVM_THREAD is now an #error. The single-step handler's REGVM_CMP_BRANCH #undefs the threaded handlers' macro of the same name before defining its own.
+
+Why we need it
+  Every gcc build (the default stack build included) stopped at gcc's emmintrin.h, which defines _mm_malloc/_mm_free through malloc and free after the poison. The register VM with QJS_REGVM_THREAD=0 (a documented CMake option, and what gcc gets) failed on regvm_fill_unwritten and regvm_light_apply_arguments. QJS_AOT with QJS_REGVM_THREAD=0 failed with 20 undeclared functions instead of saying it is unsupported. Every register VM build warned -Wmacro-redefined on REGVM_CMP_BRANCH.
+
+Soundness
+  Light frames exist only with QJS_REGVM_RECORD, which needs QJS_REGVM_THREAD, so without it the removed branch was unreachable. The include and the moved function change nothing in builds that compiled before. Compiled code is entered against the threaded chain's activation record, so QJS_AOT always needed QJS_REGVM_THREAD.
+
+diff --git a/quickjs-regvm-step.inc b/quickjs-regvm-step.inc
+index 38a9342..bca3a0c 100644
+--- a/quickjs-regvm-step.inc
++++ b/quickjs-regvm-step.inc
+@@ -349,0 +350 @@ static uint8_t *REGVM_CC regvm_s_ROP_apply_arguments(uint8_t *ip, JSValue *fr, J
++#if QJS_REGVM_THREAD
+@@ -352 +353,3 @@ static uint8_t *REGVM_CC regvm_s_ROP_apply_arguments(uint8_t *ip, JSValue *fr, J
+-                } else if (likely(pa != NULL &&
++                } else
++#endif
++                if (likely(pa != NULL &&
+@@ -3803,0 +3807 @@ static uint8_t *REGVM_CC regvm_s_ROP_local_rmw_imm(uint8_t *ip, JSValue *fr, JSR
++#undef REGVM_CMP_BRANCH /* the threaded handlers' own form */
+diff --git a/quickjs.c b/quickjs.c
+index 6c6182c..f3af35d 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -34,0 +35,4 @@
++#if defined(__SSE2__)
++/* Before the malloc/free poison: gcc's copy includes mm_malloc.h. */
++#include <emmintrin.h>
++#endif
+@@ -37225,0 +37230,16 @@ static void js_regvm_thread_check_sizes(void);
++/* Fill the registers no analysis named. Such a register is only ever released,
++   never read as a value, so any valid uncounted word will do -- but it must be
++   one: all-bits-zero is the integer 0 only in the 16-byte encoding, and in the
++   8-byte one it is a double's bits pattern. */
++static inline void regvm_fill_unwritten(JSValue *regs, int n)
++{
++#if QJS_NAN_BOXING64
++    int k;
++
++    for (k = 0; k < n; k++)
++        regs[k] = JS_MKVAL(JS_TAG_INT, 0);
++#else
++    memset(regs, 0, (size_t)n * sizeof(JSValue));
++#endif
++}
++
+@@ -37744,16 +37763,0 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
+-/* Fill the registers no analysis named. Such a register is only ever released,
+-   never read as a value, so any valid uncounted word will do -- but it must be
+-   one: all-bits-zero is the integer 0 only in the 16-byte encoding, and in the
+-   8-byte one it is a double's bits pattern. */
+-static inline void regvm_fill_unwritten(JSValue *regs, int n)
+-{
+-#if QJS_NAN_BOXING64
+-    int k;
+-
+-    for (k = 0; k < n; k++)
+-        regs[k] = JS_MKVAL(JS_TAG_INT, 0);
+-#else
+-    memset(regs, 0, (size_t)n * sizeof(JSValue));
+-#endif
+-}
+-
+@@ -50801,4 +50804,0 @@ static int json_parse_error(JSParseState *s, const uint8_t *curp, const char *ms
+-#if defined(__SSE2__)
+-#include <emmintrin.h>
+-#endif
+-
+@@ -66513,0 +66514,4 @@ static int regvm_homes_mode(void)
++/* Compiled code is entered against the threaded chain's activation record. */
++#if QJS_AOT && !QJS_REGVM_THREAD
++#error "QJS_AOT needs QJS_REGVM_THREAD"
++#endif
+@@ -73633 +73636,0 @@ __attribute__((always_inline)) void qjs_aot_set_reg_b(JSContext *ctx, JSValue *f
+-#include <emmintrin.h>
+@@ -102885,3 +102887,0 @@ static inline bool js_regexp_atom_starts_at(JSString *str, int start,
+-#if defined(__SSE2__)
+-#include <emmintrin.h>
+-#endif

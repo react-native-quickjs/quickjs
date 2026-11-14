@@ -42,7 +42,7 @@ static int guard_kind_of(const char *c, size_t n) {
   if (n >= sizeof(t)) n = sizeof(t) - 1;
   memcpy(t, c, n);
   t[n] = 0;
-  if (strstr(t, "EPOCH") || strstr(t, "LAZY")) return GK_EPOCH;
+  if (strstr(t, "EPOCH")) return GK_EPOCH;
   /* the result of a call or runtime helper, not a speculation: exception and hand-off checks */
   if (strstr(t, "s_ !=") || strstr(t, "s_ ==") || strstr(t, "JS_IsException") || strstr(t, "qjs_aot_") || strstr(t, "rg_nof") || strstr(t, "HAS_REF_COUNT") || strstr(t, "load_const")) return GK_CALLRET;
   if (strstr(t, "q2_is_intr") || strstr(t, "q2_intr") || strstr(t, "q2_is_proto") || strstr(t, "is_fn_call") || strstr(t, "callee")) return GK_CALLEE;

@@ -1,0 +1,85 @@
+Subject: JSON.parse keeps a shape chain per path and creates each object with room for the chain's properties
+
+What this does
+  - `json_child_slot`: the direct parser (`json_fast_value`) picks a value's shape-cache entry from its parent's entry and its key (array elements share their parent's), in 32 slots, instead of from the nesting depth; the general parser keeps the depth
+  - `json_new_object`: a new object gets inline room for as many properties as its slot's cached chain holds (`JS_NewObjectProtoClassCap`, capped at the learned-inline maximum), so filling it never grows its property array
+
+Why we need it
+  Objects of different shapes at one depth (an API record's "address" and "manager") kept rebuilding one shared chain, taking the define path; every object also grew its property array (inline 2, then a separate block, then a realloc). json_app parse only: -4.5% cycles, -6.4% instructions; whole json_app -2.8% cycles.
+
+Soundness
+  The slot only selects which chain is tried. Every use of a chain still checks the object's current shape against the cached one and the parsed key against the cached atom (json_obj_begin, json_obj_add, the key hint's memcmp), so a collision or a stale chain costs a rebuild, never a wrong object. Slots stay below 32, so the cache array is bounded; nesting is still limited by the stack check. The inline capacity is only a reservation: the shape still says how many properties the object has. Differentials identical old vs new: new jslot.js (111,454 checks over 4,000 random documents with siblings of varying shape, duplicate keys, __proto__/constructor/index keys, nesting to 70 levels, truncated invalid inputs) and jdiff, jdiff2, jedge, jscan, jnum, jprim, jstr.
+
+diff --git a/quickjs.c b/quickjs.c
+index 6460596..2d66c5d 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -106078,6 +106078,14 @@ static bool json_atom_plain(JSContext *ctx, JSAtom a)
+     return true;
+ }
+ 
++/* A new object for JSON.parse at `depth`, with inline room for as many properties as the last object built there had (the cached
++   chain's length), so filling it in the expected shape never grows its property array */
++static JSValue json_new_object(JSContext *ctx, JSParseState *s, int depth)
++{
++    uint32_t cap = depth < s->json_shapes_len && s->json_shapes ? s->json_shapes[depth].n : 0;
++    return JS_NewObjectProtoClassCap(ctx, ctx->class_proto[JS_CLASS_OBJECT], JS_CLASS_OBJECT, cap);
++}
++
+ /* The shape cache of `depth` for a new object being built (see JSONShapeCache): *matched when the cached chain starts at its shape. */
+ static JSONShapeCache *json_obj_begin(JSContext *ctx, JSParseState *s, int depth, JSObject *jsobj, int *matched)
+ {
+@@ -106175,7 +106183,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
+ 
+             if (json_next_key_token_hint(s, depth < s->json_shapes_len ? &s->json_shapes[depth] : NULL, 0))
+                 goto fail;
+-            val = JS_NewObject(ctx);
++            val = json_new_object(ctx, s, depth);
+             if (JS_IsException(val))
+                 goto fail;
+             if (pr) {
+@@ -106406,6 +106414,17 @@ static inline const uint8_t *json_fast_ws(const uint8_t *p)
+     return p;
+ }
+ 
++/* json_fast_value's shape-cache slot for a value under the one at `slot`: the member named `key`, or (JS_ATOM_NULL) an array element.
++   Objects reached by the same path share a slot, so siblings at one depth with different keys (an "address" and a "manager") keep
++   their own chains; a collision only costs a rebuild, since every use of a chain checks its shapes and keys. Slot 0 is the root. */
++#define JSON_SLOTS 32
++static inline int json_child_slot(int slot, JSAtom key)
++{
++    uint32_t h = ((uint32_t)slot + 1) * 0x9E3779B1u ^ (uint32_t)key * 0x85EBCA77u;
++    return 1 + (int)((h >> 27) % (JSON_SLOTS - 1));
++}
++
++/* `depth` is the shape-cache slot (json_child_slot), not the nesting depth */
+ static int json_fast_value(JSParseState *s, const uint8_t **pp, int depth, JSValue *out)
+ {
+     JSContext *ctx = s->ctx;
+@@ -106461,7 +106480,7 @@ static int json_fast_value(JSParseState *s, const uint8_t **pp, int depth, JSVal
+                         elems = ne;
+                         elems_size = ns2;
+                     }
+-                    if (json_fast_value(s, &p, depth + 1, &el))
++                    if (json_fast_value(s, &p, json_child_slot(depth, JS_ATOM_NULL), &el))
+                         goto arr_fail;
+                     elems[n++] = el;
+                     p = json_fast_ws(p);
+@@ -106492,7 +106511,7 @@ static int json_fast_value(JSParseState *s, const uint8_t **pp, int depth, JSVal
+             JSValue prop_val;
+             int k = 0, matched;
+ 
+-            val = JS_NewObject(ctx);
++            val = json_new_object(ctx, s, depth);
+             if (JS_IsException(val))
+                 return -1;
+             jsobj = JS_VALUE_GET_OBJ(val);
+@@ -106527,7 +106546,7 @@ static int json_fast_value(JSParseState *s, const uint8_t **pp, int depth, JSVal
+                         goto obj_fail;
+                     }
+                     p = json_fast_ws(p + 1);
+-                    if (json_fast_value(s, &p, depth + 1, &prop_val)) {
++                    if (json_fast_value(s, &p, json_child_slot(depth, prop_name), &prop_val)) {
+                         JS_FreeAtom(ctx, prop_name);
+                         goto obj_fail;
+                     }

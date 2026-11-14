@@ -1,0 +1,480 @@
+Subject: JSON.stringify writes single bytes inline, skips empty separators and indents, and remembers the shapes its walk has checked
+
+What this does
+  - `json_putc8`: string_buffer_putc8 with the common case (room left in an 8-bit buffer) inline, used by `json_quote_str` and `js_json_to_str`
+  - with no gap, the indent of a nested level is the empty string itself (no concatenation per object or array) and the empty separators are not appended
+  - `JSONStringifyContext.walk_ok`: 8 hashed shapes (held with a count, freed at the end) already found to have only string, non-index, non-varref keys, so the shape walk of 0585 checks each shape once per call
+
+Why we need it
+  Byte output through a called function, an empty-string concatenation per object and two empty appends per property, and the key-kind check of every object's shape were most of what 0585 left in stringify. json_app stringify only: -9.7% cycles, -18.1% instructions (after 0585).
+
+Soundness
+  The output bytes are unchanged (json_putc8 does what string_buffer_putc8 does; appending an empty string writes nothing; the indent with an empty gap is the indent). A hashed shape is shared and never edited in place, so a property list found suitable stays suitable while the shape is held; unhashed shapes are checked every time. Differentials of 0584/0585 (60,000 values with and without indentation, 25 hard cases incl. toJSON mutating the object; 1.5M doubles) are identical.
+
+diff --git a/quickjs.c b/quickjs.c
+index 7b5fe7a..1fc4eb7 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -23869,13 +23869,23 @@ static const uint8_t json_quote_needs_escape[256] = {
+     [0x5c] = 1,
+ };
+ 
++/* string_buffer_putc8 with its common case inline: room left in an 8-bit buffer */
++static inline __attribute__((always_inline)) int json_putc8(StringBuffer *b, uint32_t c)
++{
++    if (likely(b->len < b->size && !b->is_wide_char)) {
++        str8(b->str)[b->len++] = c;
++        return 0;
++    }
++    return string_buffer_putc8(b, c);
++}
++
+ static int json_quote_str(StringBuffer *b, JSString *p)
+ {
+     char buf[16];
+     uint32_t c;
+     int i;
+ 
+-    if (string_buffer_putc8(b, '\"'))
++    if (json_putc8(b, '\"'))
+         return -1;
+ 
+     if (!p->is_wide_char) {
+@@ -23904,9 +23914,9 @@ static int json_quote_str(StringBuffer *b, JSString *p)
+             case '\"':
+             case '\\':
+             quote8:
+-                if (string_buffer_putc8(b, '\\'))
++                if (json_putc8(b, '\\'))
+                     return -1;
+-                if (string_buffer_putc8(b, c))
++                if (json_putc8(b, c))
+                     return -1;
+                 break;
+             default: /* remaining control chars < 0x20 */
+@@ -23916,7 +23926,7 @@ static int json_quote_str(StringBuffer *b, JSString *p)
+                 break;
+             }
+         }
+-        return string_buffer_putc8(b, '\"');
++        return json_putc8(b, '\"');
+     }
+ 
+ 
+@@ -23931,9 +23941,9 @@ static int json_quote_str(StringBuffer *b, JSString *p)
+         case '\"':
+         case '\\':
+         quote:
+-            if (string_buffer_putc8(b, '\\'))
++            if (json_putc8(b, '\\'))
+                 return -1;
+-            if (string_buffer_putc8(b, c))
++            if (json_putc8(b, c))
+                 return -1;
+             break;
+         default:
+@@ -23948,7 +23958,7 @@ static int json_quote_str(StringBuffer *b, JSString *p)
+             break;
+         }
+     }
+-    return string_buffer_putc8(b, '\"');
++    return json_putc8(b, '\"');
+ }
+ 
+ static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
+@@ -49787,7 +49797,7 @@ static __exception int js_parse_template_part(JSParseState *s,
+             break;
+         }
+         if (c == '\\') {
+-            if (string_buffer_putc8(b, c))
++            if (json_putc8(b, c))
+                 goto fail;
+             if (p >= s->buf_end)
+                 goto unexpected_eof;
+@@ -50009,7 +50019,7 @@ static __exception int js_parse_regexp(JSParseState *s)
+             /* XXX: incorrect as the first character in a class */
+             in_class = false;
+         } else if (c == '\\') {
+-            if (string_buffer_putc8(b, c))
++            if (json_putc8(b, c))
+                 goto fail;
+             c = *p++;
+             if (c == '\n' || c == '\r')
+@@ -94006,7 +94016,7 @@ static JSValue js_function_constructor(JSContext *ctx, JSValueConst new_target,
+     StringBuffer b_s, *b = &b_s;
+ 
+     string_buffer_init(ctx, b, 0);
+-    string_buffer_putc8(b, '(');
++    json_putc8(b, '(');
+ 
+     if (func_kind == JS_FUNC_ASYNC || func_kind == JS_FUNC_ASYNC_GENERATOR) {
+         string_buffer_puts8(b, "async ");
+@@ -94014,14 +94024,14 @@ static JSValue js_function_constructor(JSContext *ctx, JSValueConst new_target,
+     string_buffer_puts8(b, "function");
+ 
+     if (func_kind == JS_FUNC_GENERATOR || func_kind == JS_FUNC_ASYNC_GENERATOR) {
+-        string_buffer_putc8(b, '*');
++        json_putc8(b, '*');
+     }
+     string_buffer_puts8(b, " anonymous(");
+ 
+     n = argc - 1;
+     for(i = 0; i < n; i++) {
+         if (i != 0) {
+-            string_buffer_putc8(b, ',');
++            json_putc8(b, ',');
+         }
+         if (string_buffer_concat_value(b, argv[i]))
+             goto fail;
+@@ -96027,7 +96037,7 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
+             for (i = 0; i < n; i++) {
+                 if (i > 0) {
+                     if (c >= 0)
+-                        string_buffer_putc8(b, c);
++                        json_putc8(b, c);
+                     else
+                         string_buffer_concat(b, p, 0, p->len);
+                 }
+@@ -96045,7 +96055,7 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
+     for(i = 0; i < n; i++) {
+         if (i > 0) {
+             if (c >= 0) {
+-                string_buffer_putc8(b, c);
++                json_putc8(b, c);
+             } else {
+                 string_buffer_concat(b, p, 0, p->len);
+             }
+@@ -98273,7 +98283,7 @@ static JSValue js_iterator_proto_join(JSContext *ctx, JSValueConst this_val,
+             break;
+         if (!first) {
+             if (c >= 0)
+-                string_buffer_putc8(b, c);
++                json_putc8(b, c);
+             else
+                 string_buffer_concat(b, p, 0, p->len);
+         }
+@@ -100396,7 +100406,7 @@ static JSValue js_string___GetSubstitution(JSContext *ctx, JSValueConst this_val
+         j0 = j++;
+         c = string_get(rp, j++);
+         if (c == '$') {
+-            string_buffer_putc8(b, '$');
++            json_putc8(b, '$');
+         } else if (c == '&') {
+             if (string_buffer_concat_value(b, matched))
+                 goto exception;
+@@ -101310,14 +101320,14 @@ static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst this_val,
+     if (JS_IsException(str))
+         return JS_EXCEPTION;
+     string_buffer_init(ctx, b, 7);
+-    string_buffer_putc8(b, '<');
++    json_putc8(b, '<');
+     string_buffer_puts8(b, defs[magic].tag);
+     if (defs[magic].attr) {
+         // r += " " + attr + "=\"" + value + "\"";
+         JSValue value;
+         int i;
+ 
+-        string_buffer_putc8(b, ' ');
++        json_putc8(b, ' ');
+         string_buffer_puts8(b, defs[magic].attr);
+         string_buffer_puts8(b, "=\"");
+         value = JS_ToStringCheckObject(ctx, argv[0]);
+@@ -101336,14 +101346,14 @@ static JSValue js_string_CreateHTML(JSContext *ctx, JSValueConst this_val,
+             }
+         }
+         JS_FreeValue(ctx, value);
+-        string_buffer_putc8(b, '\"');
++        json_putc8(b, '\"');
+     }
+     // return r + ">" + str + "</" + tag + ">";
+-    string_buffer_putc8(b, '>');
++    json_putc8(b, '>');
+     string_buffer_concat_value_free(b, str);
+     string_buffer_puts8(b, "</");
+     string_buffer_puts8(b, defs[magic].tag);
+-    string_buffer_putc8(b, '>');
++    json_putc8(b, '>');
+     return string_buffer_end(b);
+ }
+ 
+@@ -102650,11 +102660,11 @@ static JSValue js_regexp_toString(JSContext *ctx, JSValueConst this_val,
+         return JS_ThrowTypeErrorNotAnObject(ctx);
+ 
+     string_buffer_init(ctx, b, 0);
+-    string_buffer_putc8(b, '/');
++    json_putc8(b, '/');
+     pattern = JS_GetProperty(ctx, this_val, JS_ATOM_source);
+     if (string_buffer_concat_value_free(b, pattern))
+         goto fail;
+-    string_buffer_putc8(b, '/');
++    json_putc8(b, '/');
+     flags = JS_GetProperty(ctx, this_val, JS_ATOM_flags);
+     if (string_buffer_concat_value_free(b, flags))
+         goto fail;
+@@ -102710,8 +102720,8 @@ static JSValue js_regexp_escape(JSContext *ctx, JSValueConst this_val,
+         c = p->is_wide_char ? (uint32_t)str16(p)[i] : (uint32_t)str8(p)[i];
+         if (c < 33) {
+             if (c >= 9 && c <= 13) {
+-                string_buffer_putc8(b, '\\');
+-                string_buffer_putc8(b, "tnvfr"[c - 9]);
++                json_putc8(b, '\\');
++                json_putc8(b, "tnvfr"[c - 9]);
+             } else {
+                 goto hex2;
+             }
+@@ -102724,9 +102734,9 @@ static JSValue js_regexp_escape(JSContext *ctx, JSValueConst this_val,
+             } else if (strchr(",-=<>#&!%:;@~'`\"", c)) {
+                 goto hex2;
+             } else if (c != '_') {
+-                string_buffer_putc8(b, '\\');
++                json_putc8(b, '\\');
+             }
+-            string_buffer_putc8(b, c);
++            json_putc8(b, c);
+         } else if (c < 256) {
+         hex2:
+             snprintf(s, sizeof(s), "\\x%02x", c);
+@@ -103844,7 +103854,7 @@ static void js_regexp_substitute(StringBuffer *b, JSString *rp, JSString *sp,
+         j0 = j++;
+         c = string_get(rp, j++);
+         if (c == '$') {
+-            string_buffer_putc8(b, '$');
++            json_putc8(b, '$');
+         } else if (c == '&') {
+             string_buffer_concat(b, sp, e[0], e[1]);
+         } else if (c == '`') {
+@@ -107691,6 +107701,8 @@ typedef struct JSONStringifyContext {
+     JSValue gap;
+     JSValue empty;
+     StringBuffer *b;
++    /* shapes already found to hold only string, non-index, non-varref keys (the shape walk of js_json_to_str), each held with a count */
++    JSShape *walk_ok[8];
+ } JSONStringifyContext;
+ 
+ static bool json_stack_contains(JSONStringifyContext *jsc, JSObject *p)
+@@ -107787,7 +107799,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+     JSObject *p;
+     int64_t i, len;
+     int cl, ret;
+-    bool has_content;
++    bool has_content, has_gap = false;
+ 
+     indent1 = JS_UNDEFINED;
+     sep = JS_UNDEFINED;
+@@ -107829,10 +107841,12 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+             JS_ThrowTypeError(ctx, "circular reference");
+             goto exception;
+         }
+-        indent1 = JS_ConcatString(ctx, js_dup(indent), js_dup(jsc->gap));
++        has_gap = !JS_IsEmptyString(jsc->gap);
++        /* no gap: the indent stays the empty string, and no separator is written */
++        indent1 = has_gap ? JS_ConcatString(ctx, js_dup(indent), js_dup(jsc->gap)) : js_dup(indent);
+         if (JS_IsException(indent1))
+             goto exception;
+-        if (!JS_IsEmptyString(jsc->gap)) {
++        if (has_gap) {
+             sep = JS_ConcatString3(ctx, "\n", js_dup(indent1), "");
+             if (JS_IsException(sep))
+                 goto exception;
+@@ -107851,11 +107865,11 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+         if (ret) {
+             if (js_get_length64(ctx, &len, val))
+                 goto exception;
+-            string_buffer_putc8(jsc->b, '[');
++            json_putc8(jsc->b, '[');
+             for(i = 0; i < len; i++) {
+                 if (i > 0)
+-                    string_buffer_putc8(jsc->b, ',');
+-                string_buffer_concat_value(jsc->b, sep);
++                    json_putc8(jsc->b, ',');
++                if (has_gap) string_buffer_concat_value(jsc->b, sep);
+                 v = JS_GetPropertyInt64(ctx, val, i);
+                 if (JS_IsException(v))
+                     goto exception;
+@@ -107879,10 +107893,10 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                     goto exception;
+             }
+             if (len > 0 && !JS_IsEmptyString(jsc->gap)) {
+-                string_buffer_putc8(jsc->b, '\n');
++                json_putc8(jsc->b, '\n');
+                 string_buffer_concat_value(jsc->b, indent);
+             }
+-            string_buffer_putc8(jsc->b, ']');
++            json_putc8(jsc->b, ']');
+         } else if (JS_IsUndefined(jsc->property_list) &&
+                    !JS_VALUE_GET_OBJ(val)->is_exotic) {
+ 
+@@ -107897,16 +107911,27 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                 JSObject *op = JS_VALUE_GET_OBJ(val);
+                 JSShape *sh = op->shape;
+                 JSShapeProperty *prs = get_shape_prop(sh);
+-                int si, nsp = sh->prop_count;
++                int si, nsp = sh->prop_count, wslot = (int)(((uintptr_t)sh >> 6) & (countof(jsc->walk_ok) - 1));
+                 uint32_t idx_;
+-                for (si = 0; si < nsp; si++)
+-                    if (prs[si].atom != JS_ATOM_NULL &&
+-                        (JS_AtomGetKind(ctx, prs[si].atom) != JS_ATOM_KIND_STRING || JS_AtomIsArrayIndex(ctx, &idx_, prs[si].atom) ||
+-                         (prs[si].flags & JS_PROP_TMASK) == JS_PROP_VARREF))
+-                        break;
++                if (jsc->walk_ok[wslot] == sh) {
++                    si = nsp;
++                } else {
++                    for (si = 0; si < nsp; si++)
++                        if (prs[si].atom != JS_ATOM_NULL &&
++                            (JS_AtomGetKind(ctx, prs[si].atom) != JS_ATOM_KIND_STRING || JS_AtomIsArrayIndex(ctx, &idx_, prs[si].atom) ||
++                             (prs[si].flags & JS_PROP_TMASK) == JS_PROP_VARREF))
++                            break;
++                    /* a hashed shape is shared and never changed in place (a change makes another shape), so the answer holds while it
++                       is held; an unhashed one can be edited in place by its owner and is checked every time */
++                    if (si == nsp && sh->is_hashed) {
++                        if (jsc->walk_ok[wslot])
++                            js_free_shape(ctx->rt, jsc->walk_ok[wslot]);
++                        jsc->walk_ok[wslot] = js_dup_shape(sh);
++                    }
++                }
+                 if (si == nsp) {
+                     js_dup_shape(sh);
+-                    string_buffer_putc8(jsc->b, '{');
++                    json_putc8(jsc->b, '{');
+                     has_content = false;
+                     for (si = 0; si < nsp; si++) {
+                         JSAtom atom = prs[si].atom;
+@@ -107932,14 +107957,14 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                             goto exception_sh;
+                         if (!JS_IsUndefined(v)) {
+                             if (has_content)
+-                                string_buffer_putc8(jsc->b, ',');
+-                            string_buffer_concat_value(jsc->b, sep);
++                                json_putc8(jsc->b, ',');
++                            if (has_gap) string_buffer_concat_value(jsc->b, sep);
+                             if (json_quote_str(jsc->b, ctx->rt->atom_array[atom])) {
+                                 JS_FreeValue(ctx, v);
+                                 goto exception_sh;
+                             }
+-                            string_buffer_putc8(jsc->b, ':');
+-                            string_buffer_concat_value(jsc->b, sep1);
++                            json_putc8(jsc->b, ':');
++                            if (has_gap) string_buffer_concat_value(jsc->b, sep1);
+                             if (js_json_to_str(ctx, jsc, val, v, indent1))
+                                 goto exception_sh;
+                             has_content = true;
+@@ -107947,10 +107972,10 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                     }
+                     js_free_shape(ctx->rt, sh);
+                     if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
+-                        string_buffer_putc8(jsc->b, '\n');
++                        json_putc8(jsc->b, '\n');
+                         string_buffer_concat_value(jsc->b, indent);
+                     }
+-                    string_buffer_putc8(jsc->b, '}');
++                    json_putc8(jsc->b, '}');
+                     goto done_object;
+                 exception_sh:
+                     js_free_shape(ctx->rt, sh);
+@@ -107962,7 +107987,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                                                JS_GPN_STRING_MASK |
+                                                JS_GPN_ENUM_ONLY))
+                 goto exception;
+-            string_buffer_putc8(jsc->b, '{');
++            json_putc8(jsc->b, '{');
+             has_content = false;
+             for (pi = 0; pi < plen; pi++) {
+                 JSAtom atom = ptab[pi].atom;
+@@ -107985,8 +108010,8 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                     goto exception_ptab;
+                 if (!JS_IsUndefined(v)) {
+                     if (has_content)
+-                        string_buffer_putc8(jsc->b, ',');
+-                    string_buffer_concat_value(jsc->b, sep);
++                        json_putc8(jsc->b, ',');
++                    if (has_gap) string_buffer_concat_value(jsc->b, sep);
+ 
+                     if (!__JS_AtomIsTaggedInt(atom)) {
+                         if (json_quote_str(jsc->b, ctx->rt->atom_array[atom])) {
+@@ -108006,8 +108031,8 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                             goto exception_ptab;
+                         }
+                     }
+-                    string_buffer_putc8(jsc->b, ':');
+-                    string_buffer_concat_value(jsc->b, sep1);
++                    json_putc8(jsc->b, ':');
++                    if (has_gap) string_buffer_concat_value(jsc->b, sep1);
+                     if (js_json_to_str(ctx, jsc, val, v, indent1))
+                         goto exception_ptab;
+                     has_content = true;
+@@ -108015,10 +108040,10 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+             }
+             js_free_prop_enum(ctx, ptab, plen);
+             if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
+-                string_buffer_putc8(jsc->b, '\n');
++                json_putc8(jsc->b, '\n');
+                 string_buffer_concat_value(jsc->b, indent);
+             }
+-            string_buffer_putc8(jsc->b, '}');
++            json_putc8(jsc->b, '}');
+             goto done_object;
+         exception_ptab:
+             js_free_prop_enum(ctx, ptab, plen);
+@@ -108033,7 +108058,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                 goto exception;
+             if (js_get_length64(ctx, &len, tab))
+                 goto exception;
+-            string_buffer_putc8(jsc->b, '{');
++            json_putc8(jsc->b, '{');
+             has_content = false;
+             for(i = 0; i < len; i++) {
+                 JS_FreeValue(ctx, prop);
+@@ -108048,26 +108073,26 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                     goto exception;
+                 if (!JS_IsUndefined(v)) {
+                     if (has_content)
+-                        string_buffer_putc8(jsc->b, ',');
++                        json_putc8(jsc->b, ',');
+                     prop = JS_ToQuotedStringFree(ctx, prop);
+                     if (JS_IsException(prop)) {
+                         JS_FreeValue(ctx, v);
+                         goto exception;
+                     }
+-                    string_buffer_concat_value(jsc->b, sep);
++                    if (has_gap) string_buffer_concat_value(jsc->b, sep);
+                     string_buffer_concat_value(jsc->b, prop);
+-                    string_buffer_putc8(jsc->b, ':');
+-                    string_buffer_concat_value(jsc->b, sep1);
++                    json_putc8(jsc->b, ':');
++                    if (has_gap) string_buffer_concat_value(jsc->b, sep1);
+                     if (js_json_to_str(ctx, jsc, val, v, indent1))
+                         goto exception;
+                     has_content = true;
+                 }
+             }
+             if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
+-                string_buffer_putc8(jsc->b, '\n');
++                json_putc8(jsc->b, '\n');
+                 string_buffer_concat_value(jsc->b, indent);
+             }
+-            string_buffer_putc8(jsc->b, '}');
++            json_putc8(jsc->b, '}');
+         }
+     done_object:
+         jsc->stack_len--; /* pop (borrowed pointer, nothing to free) */
+@@ -108168,6 +108193,7 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
+ 
+     jsc->replacer_func = JS_UNDEFINED;
+     jsc->stack = NULL;
++    memset(jsc->walk_ok, 0, sizeof(jsc->walk_ok));
+     jsc->stack_len = 0;
+     jsc->stack_size = 0;
+     jsc->property_list = JS_UNDEFINED;
+@@ -108291,6 +108317,12 @@ done:
+     JS_FreeValue(ctx, jsc->gap);
+     JS_FreeValue(ctx, jsc->property_list);
+     js_free(ctx, jsc->stack);
++    {
++        int wi;
++        for (wi = 0; wi < (int)countof(jsc->walk_ok); wi++)
++            if (jsc->walk_ok[wi])
++                js_free_shape(ctx->rt, jsc->walk_ok[wi]);
++    }
+     return ret;
+ }
+ 

@@ -1,0 +1,164 @@
+Subject: JSON.stringify keeps each cached shape's key fragments side by side
+
+What this does
+  - `JSONKeyFrags` / `json_key_frags`: when a shape enters walk_ok with plain keys, the `"key":` bytes of all of them are laid out in one block with offsets, plus 16 spare bytes
+  - the shape walk's fast write copies the fragment from that block (a fixed 16-byte copy when it fits) instead of reading each key's atom string
+  - the block is counted (`ref`): the walk_ok slot holds it and so does each walk using it, since a nested object can replace the slot during the walk
+
+Why we need it
+  After 0594 the key write read each key's atom string header and bytes, scattered across the heap. json_app stringify only: -7.1% cycles, -3.1% instructions.
+
+Soundness
+  The bytes are those 0594 wrote for the same plain keys of the same held, hashed shape. The fixed copy writes at most 16 bytes past the fragment into the buffer's spare room (checked: fragment length + 17 bytes free) and reads only within the block's 16 spare bytes; b->len advances by the fragment's length. A walk takes a count on the block before it starts and drops it on both exits, so a slot replacement by a nested object frees it only after the walk. Differentials identical old vs new: new jkey2.js (6,999 outputs, objects nested 3 deep from 60 key sets so walk_ok slots are replaced during walks), jkey, jstr, jprim, jedge, jdiff; jkey2 (600 iterations) under valgrind: no invalid reads or writes, nothing lost (only the conservative stack scan's known uninitialised reads).
+
+diff --git a/quickjs.c b/quickjs.c
+index d31a077..0d85765 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -108219,8 +108219,57 @@ typedef struct JSONStringifyContext {
+     JSShape *walk_ok[8];
+     /* for each walk_ok shape, bit i: property i's key is an 8-bit string with nothing to escape (only i < 64) */
+     uint64_t walk_plain[8];
++    /* for each walk_ok shape with plain keys, their `"key":` fragments side by side (see JSONKeyFrags) */
++    struct JSONKeyFrags *walk_frag[8];
+ } JSONStringifyContext;
+ 
++/* The `"key":` bytes of a shape's plain keys (bit i of walk_plain), property i at bytes[off[i]] to bytes[off[i + 1]], followed by 16
++   spare bytes so a fragment of up to 16 bytes is copied as one fixed-size block */
++typedef struct JSONKeyFrags {
++    int ref;            /* the walk_frag slot, and each walk using it (a nested object can replace the slot meanwhile) */
++    uint16_t off[65];
++    uint8_t bytes[];
++} JSONKeyFrags;
++
++/* The fragments for the plain keys in `bits` of a shape with properties prs[0..nsp-1]; NULL when they cannot be allocated */
++static JSONKeyFrags *json_key_frags(JSContext *ctx, JSShapeProperty *prs, int nsp, uint64_t bits)
++{
++    JSONKeyFrags *kf;
++    size_t total = 0;
++    int i, n = nsp < 64 ? nsp : 64;
++
++    for (i = 0; i < n; i++)
++        if ((bits >> i) & 1)
++            total += ctx->rt->atom_array[prs[i].atom]->len + 3;
++    if (total > 60000)
++        return NULL;
++    kf = js_malloc(ctx, sizeof(*kf) + total + 16);
++    if (!kf)
++        return NULL;
++    kf->ref = 1;
++    total = 0;
++    for (i = 0; i < n; i++) {
++        kf->off[i] = (uint16_t)total;
++        if ((bits >> i) & 1) {
++            JSString *ks = ctx->rt->atom_array[prs[i].atom];
++            kf->bytes[total++] = '"';
++            memcpy(kf->bytes + total, json_str8(ks), ks->len);
++            total += ks->len;
++            kf->bytes[total++] = '"';
++            kf->bytes[total++] = ':';
++        }
++    }
++    kf->off[n] = (uint16_t)total;
++    memset(kf->bytes + total, 0, 16);
++    return kf;
++}
++
++static void json_key_frags_free(JSContext *ctx, JSONKeyFrags *kf)
++{
++    if (kf && --kf->ref == 0)
++        js_free(ctx, kf);
++}
++
+ static bool json_stack_contains(JSONStringifyContext *jsc, JSObject *p)
+ {
+     int i;
+@@ -108534,6 +108583,10 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                         }
+                         if (jsc->walk_ok[wslot])
+                             js_free_shape(ctx->rt, jsc->walk_ok[wslot]);
++                        json_key_frags_free(ctx, jsc->walk_frag[wslot]);
++                        jsc->walk_frag[wslot] = bits ? json_key_frags(ctx, prs, nsp, bits) : NULL;
++                        if (!jsc->walk_frag[wslot])
++                            bits = 0;
+                         jsc->walk_ok[wslot] = js_dup_shape(sh);
+                         jsc->walk_plain[wslot] = bits;
+                     }
+@@ -108541,6 +108594,9 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                 if (si == nsp) {
+                     /* the cached answer for this shape (walk_ok holds it, so its key atoms stay alive) */
+                     uint64_t plain = jsc->walk_ok[wslot] == sh ? jsc->walk_plain[wslot] : 0;
++                    JSONKeyFrags *kf = plain ? jsc->walk_frag[wslot] : NULL;
++                    if (kf)
++                        kf->ref++;
+                     js_dup_shape(sh);
+                     json_putc8(jsc->b, '{');
+                     has_content = false;
+@@ -108555,20 +108611,18 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                             /* a primitive with no replacer, written at once from the slot (no JS runs before it is written) */
+                             if (JS_IsUndefined(jsc->replacer_func) && json_is_prim(bv) && !has_gap && si < 64 && ((plain >> si) & 1)) {
+                                 StringBuffer *b = jsc->b;
+-                                JSString *ks = ctx->rt->atom_array[atom];
+-                                uint32_t kl = ks->len;
+-                                if (likely(!b->is_wide_char && b->size - b->len >= (int)kl + 4)) {
++                                uint32_t fo = kf->off[si], fl = kf->off[si + 1] - fo;
++                                if (likely(!b->is_wide_char && b->size - b->len >= (int)fl + 17)) {
+                                     uint8_t *d = json_str8(b->str) + b->len;
+-                                    int o = 0;
+-                                    if (has_content)
+-                                        d[o++] = ',';
+-                                    d[o++] = '"';
+-                                    memcpy(d + o, json_str8(ks), kl);
+-                                    o += kl;
+-                                    d[o++] = '"';
+-                                    d[o++] = ':';
+-                                    b->len += o;
++                                    d[0] = ',';
++                                    d += has_content;
++                                    if (fl <= 16)
++                                        memcpy(d, kf->bytes + fo, 16);
++                                    else
++                                        memcpy(d, kf->bytes + fo, fl);
++                                    b->len += has_content + fl;
+                                 } else {
++                                    JSString *ks = ctx->rt->atom_array[atom];
+                                     if (has_content && json_putc8(b, ','))
+                                         goto exception_sh;
+                                     if (json_quote_str(b, ks) || json_putc8(b, ':'))
+@@ -108626,6 +108680,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                         }
+                     }
+                     js_free_shape(ctx->rt, sh);
++                    json_key_frags_free(ctx, kf);
+                     if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
+                         json_putc8(jsc->b, '\n');
+                         string_buffer_concat_value(jsc->b, indent);
+@@ -108634,6 +108689,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                     goto done_object;
+                 exception_sh:
+                     js_free_shape(ctx->rt, sh);
++                    json_key_frags_free(ctx, kf);
+                     goto exception;
+                 }
+             }
+@@ -108822,6 +108878,7 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
+     jsc->stack = NULL;
+     memset(jsc->walk_ok, 0, sizeof(jsc->walk_ok));
+     memset(jsc->walk_plain, 0, sizeof(jsc->walk_plain));
++    memset(jsc->walk_frag, 0, sizeof(jsc->walk_frag));
+     jsc->stack_len = 0;
+     jsc->stack_size = 0;
+     jsc->property_list = JS_UNDEFINED;
+@@ -108947,9 +109004,11 @@ done:
+     js_free(ctx, jsc->stack);
+     {
+         int wi;
+-        for (wi = 0; wi < (int)countof(jsc->walk_ok); wi++)
++        for (wi = 0; wi < (int)countof(jsc->walk_ok); wi++) {
+             if (jsc->walk_ok[wi])
+                 js_free_shape(ctx->rt, jsc->walk_ok[wi]);
++            json_key_frags_free(ctx, jsc->walk_frag[wi]);
++        }
+     }
+     return ret;
+ }

@@ -114,6 +114,31 @@ int lre_exec_at(uint8_t **capture,
                 const uint8_t *cbuf, int cindex, int clen,
                 int cbuf_type, void *opaque);
 
+/* A matcher generated ahead of time from one pattern's bytecode (see libregexp-exec.h). It runs the same machine as the
+   interpreter from the entry at byte offset 'off' of the code (0, or the anchored entry after the scan prologue) and returns what
+   the interpreter's backtracking function returns, or LRE_RET_AOT_NOENTRY when it has no code for that entry (the caller then
+   runs the interpreter). */
+struct REExecContext;
+typedef intptr_t (*LreAotFn)(struct REExecContext *s, uint8_t **capture, const uint8_t *cptr, uint32_t off);
+#define LRE_RET_AOT_NOENTRY (-100)
+typedef struct LreAotEntry {
+    const uint8_t *bc;  /* the exact bytecode the matcher was generated from */
+    uint32_t len;
+    LreAotFn fn8;       /* subject of 8-bit units, or NULL */
+    LreAotFn fn16;      /* subject of 16-bit units (not unicode mode), or NULL */
+} LreAotEntry;
+void lre_aot_register(const LreAotEntry *tab, int n);
+/* the entry whose bytecode equals bc[0..len), or NULL */
+const LreAotEntry *lre_aot_find(const uint8_t *bc, size_t len);
+extern int lre_aot_count;
+int lre_exec_ex(const LreAotEntry *aot, uint8_t **capture,
+                const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
+                int cbuf_type, void *opaque);
+int lre_exec_at_ex(const LreAotEntry *aot, uint8_t **capture,
+                   const uint8_t *bc_buf, uint32_t bytecode_offset,
+                   const uint8_t *cbuf, int cindex, int clen,
+                   int cbuf_type, void *opaque);
+
 #define LRE_REQ_MAX 32
 typedef struct LRERequired {
     uint16_t lit[LRE_REQ_MAX]; /* code units every match contains, in order */

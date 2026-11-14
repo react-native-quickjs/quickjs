@@ -946,9 +946,9 @@ static int rg_elem_cp(RCtx *c, RInst *I, int u0, int u1, int dv, const char *dst
     }
     fprintf(o, "if (__builtin_expect(%s >= %s, 0)) goto %s;\n          e_ = %s[%s];\n", ix_, cn_, xl, vl_, ix_);
   }
-  /* a hole or a lazy value is neither an int nor a double: the typed conversion that follows leaves on it, so the test is only for an untyped read */
+  /* a hole is neither an int nor a double: the typed conversion that follows leaves on it, so the test is only for an untyped read */
   if (rg_ty_num(I, dv)) fprintf(o, "          %s = e_; }\n", dst);
-  else fprintf(o, "          if (__builtin_expect(JS_VALUE_GET_TAG(e_) == JS_TAG_UNINITIALIZED || JS_VALUE_GET_TAG(e_) == QJS_AOT_TAG_LAZY_JSON, 0)) goto %s;\n          %s = e_; }\n", xl, dst);
+  else fprintf(o, "          if (__builtin_expect(JS_VALUE_GET_TAG(e_) == JS_TAG_UNINITIALIZED, 0)) goto %s;\n          %s = e_; }\n", xl, dst);
   return 1;
 }
 

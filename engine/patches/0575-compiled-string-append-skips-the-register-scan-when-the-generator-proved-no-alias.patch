@@ -1,0 +1,28 @@
+Subject: Compiled `s += x` skips the scan of the frame's registers when the generator has shown no other register holds the string
+
+What this does
+  - `qjs_aot_binary_rr` reads bit 0x200 of its `sub` argument and passes it as `unique` to `regvm_accum_append_u`, which then skips its loop over every register of the frame looking for another holder of the string being extended in place. The argument scan stays.
+
+Why we need it
+  The scan costs a load and compare per register on every append; in a function with a few hundred registers (pdfjs's Type1 font parser) it was 6-8% of the row's cycles.
+
+Soundness
+  The generator sets the bit only where the string reaches the register from constants and from appends to the same register, and no other read of it is used after the string can grow (see e_append_unique / e_append_noalias in ops.c); a register that holds a stale copy and is never read again is harmless. The runtime keeps its own tests (no counted owner, parked or the one local count).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -73467,12 +73467,13 @@
+                                    JSValue b, int d, int ra, JSValue *out)
+ {
+     int own1 = (sub & 0x100) != 0;
++    int unique = (sub & 0x200) != 0;   /* the generator has shown that no other register of the frame holds the string */
+ 
+     sub &= 0xff;
+     if (regvm_num_fast(sub, a, b, out))
+         return 1;
+     if (sub == REG_BIN_ADD) {
+-        int ar = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b, 0, own1);
++        int ar = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b, unique, own1);
+ 
+         ACC_NOTE();
+         if (ar > 0)

@@ -1,0 +1,62 @@
+Subject: Compiled field reads by position: qjs_aot_slot_atom_hit
+
+What this does
+  - `qjs_aot_slot_atom_hit(recv, slot, atom, &out)`: when the receiver's shape names `atom` at index `slot` as a plain data property (not an accessor, variable reference, auto-init or array length), the value is the same index of the property array, whichever shape the receiver has; the value is borrowed, as at a register read hit. An exotic object, another atom at that index and a lazy value are misses. It is declared in quickjs-aot-rt.h and defined at the end of the engine source.
+  - The generator (tools/aot/qjsaot, `qjs_aot_prof_site_atom_slot`) emits it after the site cache's own test for a get_field site whose profiled shapes all put the atom at one slot and whose fills installed own slots: `q2_own_read_hit(...) || qjs_aot_slot_atom_hit(v, slot, atom, &_f)`. QJS_AOT_NO_ATOMSLOT=1 turns it off.
+
+Why we need it
+  typescript's AST nodes are built by one constructor chain, so about sixty shapes keep nodeType/type/flags/... at the same index. 87% of the profile's property site executions are at sites that saw four or more shapes (96.6% of those at one slot), which the site cache (one or two shapes) misses and the interpreter served through a frame sync, an op dispatch, the megamorphic cache or a table lookup: 12.4% of cycles below qjs_aot_step.
+
+Soundness
+  Exact for any receiver: the shape is read, so a receiver whose shape does not hold the atom at that index misses, and the interpreter's step runs as before. The slot is a hint from the profile and only picks the index to test.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -121014,3 +121014,37 @@
+ #undef malloc
+ #undef free
+ #undef realloc
++
++#if QJS_AOT
++/* An own data property read by position: the receiver's shape names `atom` at index `slot` as a plain data property, so the value is
++   at the same index of the property array, whichever shape the receiver has. A site whose receivers have many shapes that all keep
++   the field at one index (the objects of one hierarchy build their common fields first) is served without a lookup. The value is
++   borrowed, as at a register read hit. Anything else (an exotic object, an accessor, a variable reference, an array length, a lazy
++   value, another atom at that index) is a miss for the caller to take its own way. */
++int qjs_aot_slot_atom_hit(JSValue recv, uint32_t slot, JSAtom atom, JSValue *out)
++{
++    JSObject *p;
++    JSShape *sh;
++    JSShapeProperty *prs;
++    JSValue v;
++
++    if (unlikely(JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT))
++        return 0;
++    p = JS_VALUE_GET_OBJ(recv);
++    sh = p->shape;
++    if (unlikely(p->is_exotic || slot >= (uint32_t)sh->prop_count))
++        return 0;
++    prs = &get_shape_prop(sh)[slot];
++    if (unlikely(prs->atom != atom || (prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH))))
++        return 0;
++    v = p->prop[slot].u.value;
++    if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON))
++        return 0;
++#if !QJS_DRC
++    if (JS_VALUE_GET_TAG(v) < 0)
++        return 0;
++#endif
++    *out = v;
++    return 1;
++}
++#endif
+--- a/quickjs-aot-rt.h
++++ b/quickjs-aot-rt.h
+@@ -821,6 +821,7 @@
+ /* A call to a bytecode function the unit cannot enter natively, made directly instead of through the step engine: JS_UNINITIALIZED
+    with nothing done when `callee` is not one; otherwise the owned result or an exception. `cap` is the call's byte offset. */
+ JSValue qjs_aot_call_generic(JSContext *ctx, JSRegRun *f, JSValue callee, JSValue this_obj, JSValue *argv, int na, uint32_t cap);
++int qjs_aot_slot_atom_hit(JSValue recv, uint32_t slot, JSAtom atom, JSValue *out);
+ 
+ JSValue qjs_aot_construct_learn(JSContext *ctx, JSObject *ctor, JSValue *argv, int na, const uint32_t *fm);
+ int qjs_aot_call_light(JSContext *ctx, JSRegRun *caller_f, int na,

@@ -55,7 +55,6 @@ android {
         arguments "-DANDROID_STL=c++_shared",
                   "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON",
                   "-DREACT_NATIVE_DIR=${reactNativeDir()}",
-                  "-DRNQJS_JSON_LAZY_DEFAULT=${jsonLazyEnabled() ? 'ON' : 'OFF'}",
                   "-DRNQJS_BYTECODE_LAZY=${quickjsLazyEnabled() ? 'ON' : 'OFF'}"
         if (quickjsModuleDirs().size() > 0) {
           arguments "-DRNQJS_QUICKJS_MODULES=${quickjsModuleDirs().join(';')}"
@@ -146,15 +145,8 @@ def reactNativeArchitectures() {
 // The app's existing package.json is the single cross-platform opt-in. A
 // Gradle property remains useful for CI and local experiments without adding
 // another project file.
-def jsonLazyEnabled() {
-  if (project.hasProperty('rnqjsJsonLazy')) {
-    return project.property('rnqjsJsonLazy').toString() != 'false'
-  }
-  def manifest = new File(rootProject.projectDir.parentFile, "package.json")
-  if (!manifest.exists()) return false
-  def json = new groovy.json.JsonSlurper().parse(manifest)
-  return json["react-native-quickjs"]?.lazyJson == true
-}
+// The package.json option react-native-quickjs.lazyJson is ignored: lazy JSON
+// parsing was removed (engine patch 0600).
 
 def quickjsLazyEnabled() {
   if (project.hasProperty('rnqjsLazy')) {

@@ -1,0 +1,24 @@
+Subject: Sites leave shapes with a deleted property unhashed
+
+What this does
+  regvm_shape_hashify, which hashes a site's receiver (and holder) shape in place so the per-function cache can hold it, leaves a shape with a deleted property as it is. Such a site takes the uncached path, as for any unhashed shape.
+
+Why we need it
+  Every `delete` makes the object its own shape copy. Hashing each copy linked one more equal shape into the same bucket per object, and every shape free walks its bucket: the AOT corpus program dispatch_delete_shape (`delete o.b` on every other of 400,000 fresh objects) took 4.86 s compiled and 0.14 s interpreted, 98% in js_shape_hash_unlink; on 2026-10-22 it took 0.10 s either way. Now 0.07 s compiled, 0.09 s interpreted.
+
+Soundness
+  js_shape_try_hash already refuses these shapes for the same reason. The cache callers check is_hashed after the call and go megamorphic when it is false, so nothing reads a cached entry for an unhashed shape. No transition ever leads to a deleted-property copy, so no lookup misses a shape it could have shared.
+
+diff --git a/quickjs.c b/quickjs.c
+index 353717d..348ba2b 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -29503 +29503,4 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
+- * only maintained while `is_hashed`.
++ * only maintained while `is_hashed`. A shape with a deleted property is left
++ * as it is: every delete makes its own copy, which no transition reaches, so
++ * hashing them puts one more equal shape in the same bucket per object and
++ * each free walks the chain. Its sites take the uncached path.
+@@ -29509 +29512 @@ static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh)
+-    if (sh->is_hashed)
++    if (sh->is_hashed || sh->deleted_prop_count != 0)

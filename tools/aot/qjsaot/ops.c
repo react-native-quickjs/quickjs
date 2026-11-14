@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "emit.h"
 #include "fast.h"
@@ -1150,7 +1151,7 @@ static int elem_run_len(const Q2Func *fn, int i, int block_last, int *arrp) {
 }
 
 /* An element read: `q2_elem_hit` inlines the array fast path (class, not
-   holey, index in bounds, element not a hole or lazy marker). A miss falls into
+   holey, index in bounds, element not a hole). A miss falls into
    the op call, which handles a getter, a string key, a proxy, everything. */
 static int emit_native_elem_read(
     FILE *f, const Q2Func *fn, const Q2Insn *in, int is_last, int run) {
@@ -2901,6 +2902,7 @@ static void e_fl_block(const char *what, const Q2Insn *in) {
 int qjs_aot_prof_site_own(const uint8_t dg[16], int site);
 int qjs_aot_prof_site_cold(const uint8_t dg[16], int site);
 int qjs_aot_prof_site_read_hits(const uint8_t dg[16], int site);
+int qjs_aot_prof_site_atom_slot(const uint8_t dg[16], int site, int *slot);
 /* A method read of the body's own code that the learned method table (Q2Lmt) can serve: a miss of the site's cache cells looks the receiver's shape up. */
 /* A read of a copy that no cache group serves (the site is polymorphic, or its cells are the callee's and unfilled): the unit learns shape ->
    slot (an own field) or shape -> method (get_field2) per site and leaves on a miss. */
@@ -3623,17 +3625,15 @@ static void e_pm_collect(const Q2Func *fn) {
   }
 }
 
-/* Set while a speculative body that assumes no lazy JSON value exists is emitted. */
+/* Set while a body is emitted in the form that uses the `_nl` reference helpers (every top-level body, and
+   the second form of an inline body); its calls name the `_n` forms of inline callees. */
 static int g_e_nolazy = 0;
-/* An inline body emitted for a caller that has tested for lazy documents (its own entry and each safepoint),
-   so its loads carry no lazy-marker test. */
+/* Set while the second form of an inline body is emitted. */
 static int g_e_inl_nl;
 
-/* After a safepoint (an op call, a call): code in this body skips the lazy-JSON marker
-   test on loaded values, which holds while no lazy JSON document has been created. A
-   safepoint may create one (JSON.parse of a large text), so the flag is read again and a
-   set flag exits at the next instruction, with the op's results already in the frame (the
-   dx_ stub). One helper for every safepoint emitter. */
+/* After a safepoint (an op call, a call): the cache epoch and the layout bits are tested again, and a
+   moved one exits at the next instruction, with the op's results already in the frame (the dx_ stub).
+   One helper for every safepoint emitter. */
 /* Set while a body is emitted whose entry validates the cache cells of its groups (and so defines
    `q2_ep`, the epoch it validated them at): an access to a hot site of such a group tests no cell, and
    every safepoint is followed by a comparison of the runtime's epoch with `q2_ep` that leaves the body
@@ -3691,11 +3691,8 @@ static void e_emit_group_recheck_at(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const Q2ValueId *cur, int exit_pc) {
   unsigned long long lm = g_e_facts != NULL ? (unsigned long long)g_e_facts->laymask[e_insn_idx(fn, in)] : 0;
   char lt[96] = "";
-  /* A body whose callees (transitively) are all inside the bundle and make no unknown call can not run JSON.parse: no lazy document appears
-     while it runs, and the entry tests the flag once. */
-  const int nolz = g_e_nolazy && !(g_e_fl && e_kon() && qjs_aot_bundle_fn_kok(fn->g));
   if (g_e_facts != NULL) lm |= (unsigned long long)g_e_facts->claimdeps;
-  if (!nolz && !g_e_epoch_skip && lm == 0) return;
+  if (!g_e_epoch_skip && lm == 0) return;
   /* An inline body's call whose result is the body's return value is followed by nothing that reads
      the facts; the caller tests them where the body returns. */
   if (g_e_inl && (in->rop == ROP_call || in->rop == ROP_call_method) && e_insn_idx(fn, in) + 1 < fn->ninsns) {
@@ -3719,11 +3716,10 @@ static void e_emit_group_recheck_at(
     const int ko = g_e_epoch_skip && getenv("QJS_AOT_KO_ENVRETEST") != NULL;
     const int ep = g_e_epoch_skip && !ko;
     if (ep) fprintf(f, "    E_PC_TICK();\n");
-    if (nolz || ep || lt[0])
+    if (ep || lt[0])
       fprintf(
-          f, "    if (__builtin_expect(%s%s%s%s%s, 0)) { %s E_GOTO(dx, %d); }\n", nolz ? "E_LAZY_SEEN(ctx)" : "",
-          nolz && (ep || lt[0]) ? " || " : "", ep ? "Q2_EPOCH_MOVED(ctx)" : "", ep && lt[0] ? " || " : "", lt,
-          g_e_dx_pre, exit_pc);
+          f, "    if (__builtin_expect(%s%s%s, 0)) { %s E_GOTO(dx, %d); }\n", ep ? "Q2_EPOCH_MOVED(ctx)" : "",
+          ep && lt[0] ? " || " : "", lt, g_e_dx_pre, exit_pc);
   }
   g_e_recheck_done = in->pc;
 }
@@ -6579,6 +6575,8 @@ static int emit_typed_propkey(
   return 1;
 }
 
+int e_rxlen_getlen(const Q2Func *fn, const Q2Insn *in);
+
 /* A speculative-body ARRAY LENGTH: `get_length` ("rr": dest, receiver). The hit
    helper is `q2_array_length`, which returns a double in an int range; the result is
    an i32 local (that is the only shape the analysis uses for it). A miss goes to the
@@ -6602,6 +6600,9 @@ static int emit_typed_length(
   rreg = fn->values[rv].reg;
   if (dreg < 0 || dreg >= fn->nregs || rreg < 0 || rreg >= fn->nregs) return 0;
 
+  /* the length of a replace result the call site measured without making it (e_rxlen_site): the value is the int itself */
+  if (e_rxlen_getlen(fn, in))
+    fprintf(f, "    if (JS_VALUE_GET_TAG(v%u) == JS_TAG_INT) { i%u = JS_VALUE_GET_INT(v%u); } else\n", (unsigned)rv, (unsigned)dv, (unsigned)rv);
   fprintf(f, "    { double _len;\n");
   fprintf(
       f,
@@ -6694,6 +6695,10 @@ static int emit_typed_elem_read(
     snprintf(kb, sizeof(kb), "JS_MKVAL(JS_TAG_INT, i%u)", (unsigned)kv);
   else if (t->lb[kv] == E_LB_TAG)
     snprintf(kb, sizeof(kb), "v%u", (unsigned)kv); /* an int is a hit; any other key is the wrapper's */
+  else if (t->lb[kv] == E_LB_F64)
+    /* A whole number in int32 range is the int the hit test takes (-0 is not: it stays a double, which the hit test declines, and the op call
+       reads it); any other double stays a double and is the wrapper's. */
+    snprintf(kb, sizeof(kb), "Q2_DKEY(d%u)", (unsigned)kv);
   else
     return 0;
   dreg = fn->values[dv].reg;
@@ -6897,6 +6902,64 @@ int e_arrayop_site(const Q2Func *fn, const Q2Insn *in) {
   if (strcmp(callee[0], "js_array_push:0") == 0 && in->win_n == 1) return 1;
   if (strcmp(callee[0], "js_array_pop:0") == 0 && in->win_n == 0) return 2;
   return 0;
+}
+
+/* How many places read the value `v`: instruction operands, argument windows, redefinitions and edge arguments. */
+static int e_value_uses(const Q2Func *fn, Q2ValueId v) {
+  int i, k, n = 0;
+  for (i = 0; i < fn->ninsns; i++) {
+    const Q2Insn *x = &fn->insns[i];
+    for (k = 0; k < x->nuse; k++) n += x->use[k] == v;
+    for (k = 0; k < x->win_n; k++) n += x->win_val != NULL && x->win_val[k] == v;
+    for (k = 0; k < x->nredef; k++) n += x->redef_val != NULL && x->redef_val[k] == v;
+  }
+  for (i = 0; i < fn->nblocks; i++) {
+    const Q2Block *b = &fn->blocks[i];
+    int s;
+    for (s = 0; s < b->nsucc; s++)
+      for (k = 0; k < b->nedge_args[s]; k++) n += b->edge_arg[s][k] == v;
+  }
+  return n;
+}
+
+/* `s.replace(re, K).length` where the result string is read by nothing else: the profile saw one callee, the engine's
+   String.prototype.replace, with two arguments, and the next instruction is the `.length` read of the result. The call
+   site first asks the engine for the length alone (q2_replace_len: a pristine RegExp, a replacement without `$`, the
+   builtin itself as callee), leaves that int where the string would be and the `.length` read takes it as it is; any
+   other case makes the call as before. Returns 1 for the call, and e_rxlen_getlen is true for its `.length`. */
+int e_rxlen_site(const Q2Func *fn, const Q2Insn *in) {
+  char callee[4][33];
+  unsigned long long hits[4];
+  int kind[4], n = 0, idx;
+  const Q2Insn *g;
+  if (in->op != Q2_OP_CALL || in->rop != ROP_call_method || in->own != 0 || in->win_n != 2 || in->ndef < 1) return 0;
+  if (getenv("QJS_AOT_NORXLEN") != NULL) return 0;
+  if (!call_site_shaped(fn, in) || call_callee_off(in) < 0 || call_this_off(in) < 0 || dest_off(fn, in) < 0) return 0;
+  idx = e_insn_idx(fn, in);
+  if (idx + 1 >= fn->ninsns) return 0;
+  g = &fn->insns[idx + 1];
+  if (g->rop != ROP_get_length || g->pc != in->next || g->nuse < 1 || g->ndef < 1 || g->use[0] != in->def[0]) return 0;
+  if (!qjs_aot_prof_callees(fn->g->digest, in->next, &n, callee, kind, hits) || n != 1 || kind[0] != 2) return 0;
+  if (strcmp(callee[0], "js_string_replace:0") != 0) return 0;
+  return e_value_uses(fn, in->def[0]) == 1;
+}
+
+/* The `.length` read after the site is lowered by emit_typed_length (a TAG receiver, an i32 result), the only form that takes the int. */
+static int e_rxlen_len_typed(const Q2Func *fn, const ETypes *t, const Q2Insn *in) {
+  const Q2Insn *g = &fn->insns[e_insn_idx(fn, in) + 1];
+  const ERole *role = e_roles[g->rop];
+  Q2ValueId rv = g->use[0], dv2 = g->def[0];
+  if (role == NULL || role->control != E_CF_NONE || g->ndef < 1 || g->nuse < 1) return 0;
+  if (dv2 >= (Q2ValueId)t->nvalues || rv >= (Q2ValueId)t->nvalues) return 0;
+  if (t->lb[rv] != E_LB_TAG || t->lb[dv2] != E_LB_I32) return 0;
+  return fn->values[dv2].reg >= 0 && fn->values[dv2].reg < fn->nregs && fn->values[rv].reg >= 0 && fn->values[rv].reg < fn->nregs;
+}
+
+int e_rxlen_getlen(const Q2Func *fn, const Q2Insn *in) {
+  int idx;
+  if (in->rop != ROP_get_length || in->nuse < 1) return 0;
+  idx = e_insn_idx(fn, in);
+  return idx > 0 && fn->insns[idx - 1].def[0] == in->use[0] && fn->insns[idx - 1].ndef >= 1 && e_rxlen_site(fn, &fn->insns[idx - 1]);
 }
 
 int e_intrinsic_lowerable(const Q2Func *fn, const Q2Insn *in) {
@@ -9245,6 +9308,106 @@ static int e_append_varslot(const Q2Func *fn, const Q2Insn *in) {
   return slot;
 }
 
+/* The block of the instruction at index `ix`, or -1. */
+static int e_block_of_insn(const Q2Func *fn, int ix) {
+  int b;
+  for (b = 0; b < fn->nblocks; b++)
+    if (ix >= fn->blocks[b].first_insn && ix < fn->blocks[b].first_insn + fn->blocks[b].ninsns) return b;
+  return -1;
+}
+
+/* Whether the string a local-slot append (see e_append_varslot) extends can be held by no OTHER register of this frame, so that the engine may skip its scan of
+   the registers. The string reaches the slot only from constants and from appends to the same slot (so no other value ever held it), and every other read
+   of the slot is used inside its own block before the append can run again (so no register copy is read after the string grew). An uncounted copy that is
+   never read again is harmless; the arguments are still scanned by the engine. */
+static int e_na_fail(int why, const Q2Insn *in) {
+  if (getenv("QJS_AOT_NA_WHY") != NULL) fprintf(stderr, "noalias: pc %d refused at check %d\n", in->pc, why);
+  return 0;
+}
+static int e_append_noalias(const Q2Func *fn, const Q2Insn *in) {
+  int slot = e_append_varslot(fn, in), ia = e_insn_idx(fn, in), ba, x, u, k, b, si;
+  if (slot < 0 || in->own != 0 || getenv("QJS_AOT_NOAPPALIAS") != NULL) return e_na_fail(1, in);
+  ba = e_block_of_insn(fn, ia);
+  if (ba < 0) return e_na_fail(2, in);
+  for (x = 0; x < fn->ninsns; x++) {
+    const Q2Insn *xi = &fn->insns[x];
+    if (xi->own != 0 && (e_local_slot_of_put(xi) == slot || e_local_slot_of_get(xi) == slot)) return e_na_fail(3, in);
+    if (e_local_slot_of_put(xi) == slot) {
+      const Q2Insn *d;
+      Q2ValueId v;
+      if (xi->nuse != 1) return e_na_fail(4, in);
+      v = xi->use[0];
+      if (v >= (Q2ValueId)fn->nvalues || fn->values[v].insn < 0) return e_na_fail(5, in);
+      d = &fn->insns[fn->values[v].insn];
+      if (d->op == Q2_OP_CONST || d->rop == ROP_load_const) continue;
+      if (d->rop == ROP_add && d->sub == REG_BIN_ADD && d->own == 0 && e_append_varslot(fn, d) == slot) continue;
+      return e_na_fail(6, in);
+    }
+    if (e_local_slot_of_get(xi) == slot && x != fn->values[in->use[0]].insn) {
+      Q2ValueId vq;
+      int bx = e_block_of_insn(fn, x);
+      if (xi->ndef < 1 || bx < 0) return e_na_fail(7, in);
+      vq = xi->def[0];
+      {
+        /* The read is dead once the instruction at `x` runs again, so a path counts only until it reaches `x`: the segments are the head of its block
+           (before `x`), its tail (after `x`), and the other blocks whole. The string can grow under the read when the append is on a path from `x` and a
+           use of the read is on a path from the append. */
+        int nb = fn->nblocks;
+        char *inA = calloc((size_t)nb + 1, 1), *r1 = calloc((size_t)nb + 1, 1);
+        int *stk = malloc(sizeof(int) * ((size_t)nb + 2) * 2), sp, sa, hazard = 0, pass;
+        if (inA == NULL || r1 == NULL || stk == NULL) { free(inA); free(r1); free(stk); return e_na_fail(11, in); }
+#define E_NA_SEG(i_) (e_block_of_insn(fn, (i_)) != bx ? e_block_of_insn(fn, (i_)) : ((i_) < x ? bx : nb))
+        sa = E_NA_SEG(ia);
+        for (pass = 0; pass < 2; pass++) {
+          char *vis = pass == 0 ? inA : r1;
+          sp = 0;
+          if (pass == 0) { vis[nb] = 1; stk[sp++] = nb; }
+          else {
+            int bb = sa == nb ? bx : sa, q;
+            if (sa != bx)
+              for (q = 0; q < fn->blocks[bb].nsucc && q < 2; q++) {
+                int t = fn->blocks[bb].succ_block[q];
+                if (t < 0) continue;
+                if (!vis[t]) { vis[t] = 1; stk[sp++] = t; }
+              }
+          }
+          while (sp > 0) {
+            int sg = stk[--sp], bb = sg == nb ? bx : sg, q;
+            if (sg == bx) continue;   /* the head of the read's block ends at the read */
+            for (q = 0; q < fn->blocks[bb].nsucc && q < 2; q++) {
+              int t = fn->blocks[bb].succ_block[q];
+              if (t < 0) continue;
+              if (!vis[t]) { vis[t] = 1; stk[sp++] = t; }
+            }
+          }
+        }
+        if (inA[sa]) {
+          for (u = 0; u < fn->ninsns && !hazard; u++) {
+            const Q2Insn *ui = &fn->insns[u];
+            int uses = 0, su;
+            for (k = 0; k < ui->nuse; k++)
+              if (ui->use[k] == vq) uses = 1;
+            for (k = 0; k < ui->win_n && ui->win_val != NULL; k++)
+              if (ui->win_val[k] == vq) uses = 1;
+            if (!uses) continue;
+            if (u == x) continue;
+            su = E_NA_SEG(u);
+            if ((su == sa && u > ia) || r1[su]) hazard = 1;
+          }
+        }
+#undef E_NA_SEG
+        free(inA); free(r1); free(stk);
+        if (hazard) return e_na_fail(8, in);
+      }
+      for (b = 0; b < fn->nblocks; b++)
+        for (si = 0; si < fn->blocks[b].nsucc && si < 2; si++)
+          for (k = 0; k < fn->blocks[b].nedge_args[si]; k++)
+            if (fn->blocks[b].edge_arg[si][k] == vq) return e_na_fail(10, in);
+    }
+  }
+  return 1;
+}
+
 /* Whether the string that `s += <constant>` extends can be held by no other register. Compiled
    code then tells the engine to skip its scan of the frame for another holder. The proof is
    about the data flow of the function:
@@ -9253,61 +9416,89 @@ static int e_append_varslot(const Q2Func *fn, const Q2Insn *in) {
    - where it goes: the append, a length read, a compare or a branch, and the loop-carried
      register itself. Any other use of the old or the new value (a move, a call argument or
      receiver, an edge into a different register) may leave a second register holding it. */
-static int e_append_unique(const Q2Func *fn, const Q2Insn *in) {
-  Q2ValueId vo, vn;
-  int b, k, si, x, u, reg;
+static int e_chain_has(const Q2ValueId *ch, int n, Q2ValueId v) {
+  int i;
+  for (i = 0; i < n; i++)
+    if (ch[i] == v) return 1;
+  return 0;
+}
 
-  if (in->nuse < 1 || in->ndef < 1) return 0;
-  vo = in->use[0];
-  vn = in->def[0];
-  if (vo >= (Q2ValueId)fn->nvalues || vn >= (Q2ValueId)fn->nvalues) return 0;
-  reg = fn->values[vo].reg;
-  if (reg < 0 || reg != fn->values[vn].reg) return 0;
-  /* the sources of the old value */
-  {
-    int is_param = 0;
-    for (b = 0; b < fn->nblocks && !is_param; b++)
-      for (k = 0; k < fn->blocks[b].nparams; k++)
-        if (fn->blocks[b].param_val[k] == vo) {
+static int e_append_unique(const Q2Func *fn, const Q2Insn *in) {
+  enum { CH_MAX = 12 };
+  Q2ValueId ch[CH_MAX];
+  int nch = 0, b, k, si, x, u, reg, changed;
+
+  if (in->nuse < 1 || in->ndef < 1) return e_na_fail(101, in);
+  if (in->use[0] >= (Q2ValueId)fn->nvalues || in->def[0] >= (Q2ValueId)fn->nvalues) return e_na_fail(102, in);
+  reg = fn->values[in->use[0]].reg;
+  if (reg < 0 || reg != fn->values[in->def[0]].reg) return e_na_fail(103, in);
+  ch[nch++] = in->use[0];
+  if (in->def[0] != in->use[0]) ch[nch++] = in->def[0];
+  /* The chain: every value of the accumulator's register that one append hands to the next (the appends in a row, and the loop-carried
+     parameter between them). It closes over the definitions of its values, the appends that read them and the edges that carry them; a
+     value that comes from anything else but a constant makes the proof fail. */
+#define E_CH_ADD(v_) do { Q2ValueId w_ = (v_); \
+      if (w_ == Q2_NO_VALUE || w_ >= (Q2ValueId)fn->nvalues || fn->values[w_].reg != reg) return e_na_fail(104, in); \
+      if (!e_chain_has(ch, nch, w_)) { if (nch >= CH_MAX) return e_na_fail(105, in); ch[nch++] = w_; changed = 1; } } while (0)
+  do {
+    changed = 0;
+    for (k = 0; k < nch; k++) {
+      Q2ValueId v = ch[k];
+      int is_param = 0;
+      for (b = 0; b < fn->nblocks; b++) {
+        int pk;
+        for (pk = 0; pk < fn->blocks[b].nparams; pk++) {
           int pb;
+          if (fn->blocks[b].param_val[pk] != v) continue;
           is_param = 1;
           for (pb = 0; pb < fn->nblocks; pb++) {
             const Q2Block *p = &fn->blocks[pb];
             for (si = 0; si < p->nsucc && si < 2; si++) {
               Q2ValueId av;
               const Q2Insn *ai;
-              if (p->succ_block[si] != b || k >= p->nedge_args[si]) continue;
-              av = p->edge_arg[si][k];
-              if (av == vn || av == vo) continue;
-              if (av == Q2_NO_VALUE || av >= (Q2ValueId)fn->nvalues ||
-                  fn->values[av].insn < 0)
-                return 0;
+              if (p->succ_block[si] != b || pk >= p->nedge_args[si]) continue;
+              av = p->edge_arg[si][pk];
+              if (e_chain_has(ch, nch, av)) continue;
+              if (av == Q2_NO_VALUE || av >= (Q2ValueId)fn->nvalues || fn->values[av].insn < 0) return e_na_fail(106, in);
               ai = &fn->insns[fn->values[av].insn];
-              if (ai->op != Q2_OP_CONST && ai->rop != ROP_load_const) return 0;
+              if (ai->op == Q2_OP_CONST || ai->rop == ROP_load_const) continue;
+              if (ai->rop == ROP_add && ai->sub == REG_BIN_ADD && ai->nuse >= 1 && ai->def[0] == av) { E_CH_ADD(av); continue; }
+              return e_na_fail(107, in);
             }
           }
-          break;
         }
-    if (!is_param) {
-      const Q2Insn *di;
-      if (fn->values[vo].insn < 0) return 0;
-      di = &fn->insns[fn->values[vo].insn];
-      if (di->op != Q2_OP_CONST && di->rop != ROP_load_const) return 0;
+      }
+      if (!is_param) {
+        const Q2Insn *di;
+        if (fn->values[v].insn < 0) return e_na_fail(108, in);
+        di = &fn->insns[fn->values[v].insn];
+        if (di->op == Q2_OP_CONST || di->rop == ROP_load_const) continue;
+        if (di->rop == ROP_add && di->sub == REG_BIN_ADD && di->nuse >= 1 && di->ndef >= 1 && di->def[0] == v) { E_CH_ADD(di->use[0]); continue; }
+        return e_na_fail(109, in);
+      }
     }
-  }
-  /* the uses of the old and the new value */
+    /* the appends that read a chain value as the string they extend */
+    for (x = 0; x < fn->ninsns; x++) {
+      const Q2Insn *xi = &fn->insns[x];
+      if (xi->rop == ROP_add && xi->sub == REG_BIN_ADD && xi->nuse >= 1 && xi->ndef >= 1 && e_chain_has(ch, nch, xi->use[0]))
+        E_CH_ADD(xi->def[0]);
+    }
+  } while (changed);
+#undef E_CH_ADD
+  /* the uses of every chain value */
   for (x = 0; x < fn->ninsns; x++) {
     const Q2Insn *xi = &fn->insns[x];
-    if (xi == in) continue;
+    int is_app = xi->rop == ROP_add && xi->sub == REG_BIN_ADD && xi->nuse >= 1 && e_chain_has(ch, nch, xi->use[0]);
     for (u = 0; u < xi->nuse; u++) {
-      if (xi->use[u] != vo && xi->use[u] != vn) continue;
-      if (xi->rop == ROP_get_length || xi->op == Q2_OP_BRANCH ||
-          xi->op == Q2_OP_BRANCH_CMP || xi->op == Q2_OP_COMPARE)
+      if (!e_chain_has(ch, nch, xi->use[u])) continue;
+      if (is_app && u == 0) continue;
+      if (xi->rop == ROP_get_length || xi->op == Q2_OP_BRANCH || xi->op == Q2_OP_BRANCH_CMP || xi->op == Q2_OP_COMPARE ||
+          (xi->op == Q2_OP_RETURN && getenv("QJS_AOT_NOAPPRET") == NULL))
         continue;
-      return 0;
+      return e_na_fail(110, in);
     }
     for (u = 0; u < xi->win_n && xi->win_val != NULL; u++)
-      if (xi->win_val[u] == vo || xi->win_val[u] == vn) return 0;
+      if (e_chain_has(ch, nch, xi->win_val[u])) return e_na_fail(111, in);
   }
   for (b = 0; b < fn->nblocks; b++) {
     const Q2Block *p = &fn->blocks[b];
@@ -9317,7 +9508,30 @@ static int e_append_unique(const Q2Func *fn, const Q2Insn *in) {
       sb = &fn->blocks[p->succ_block[si]];
       for (k = 0; k < p->nedge_args[si] && k < sb->nparams; k++) {
         Q2ValueId av = p->edge_arg[si][k];
-        if ((av == vo || av == vn) && sb->param_reg[k] != reg) return 0;
+        if (!e_chain_has(ch, nch, av) || sb->param_reg[k] == reg) continue;
+        /* a copy into another register is harmless once control can no longer reach any append of the chain */
+        {
+          int sp = 0, esc = 1, q, ap;
+          char *vis = calloc((size_t)fn->nblocks + 1, 1);
+          int *stk = malloc(sizeof(int) * ((size_t)fn->nblocks + 2));
+          if (vis == NULL || stk == NULL || getenv("QJS_AOT_NOAPPEXIT") != NULL) esc = 0;
+          else {
+            vis[p->succ_block[si]] = 1; stk[sp++] = p->succ_block[si];
+            while (sp > 0 && esc) {
+              int sg = stk[--sp];
+              for (ap = 0; ap < fn->ninsns && esc; ap++) {
+                const Q2Insn *ai = &fn->insns[ap];
+                if (ai->rop == ROP_add && ai->sub == REG_BIN_ADD && ai->nuse >= 1 && e_chain_has(ch, nch, ai->use[0]) && e_block_of_insn(fn, ap) == sg) esc = 0;
+              }
+              for (q = 0; q < fn->blocks[sg].nsucc && q < 2 && esc; q++) {
+                int w = fn->blocks[sg].succ_block[q];
+                if (w >= 0 && !vis[w]) { vis[w] = 1; stk[sp++] = w; }
+              }
+            }
+          }
+          free(vis); free(stk);
+          if (!esc) return e_na_fail(112, in);
+        }
       }
     }
   }
@@ -9511,7 +9725,8 @@ static int emit_alloc_op(
         snprintf(call, sizeof(call),
                  "qjs_aot_binary_rr(ctx, f, %d, AOT_REG(fr, %d), AOT_REG(fr, %d), %d, %d, &_o)",
                  (int)in->sub | ((in->rop == ROP_add && in->sub == REG_BIN_ADD && dreg == ao / 16 && getenv("QJS_AOT_NOVARAPP") == NULL &&
-                                  e_append_varslot(fn, in) >= 0) ? 0x100 : 0),
+                                  e_append_varslot(fn, in) >= 0) ? 0x100 : 0) |
+                     ((in->rop == ROP_add && in->sub == REG_BIN_ADD && dreg == ao / 16 && getenv("QJS_AOT_NOVARAPP") == NULL && (e_append_noalias(fn, in) || (getenv("QJS_AOT_NOAPPUNIQ") == NULL && e_append_unique(fn, in)))) ? 0x200 : 0),
                  ao, bo, dreg, ao / 16);
       break;
     }
@@ -10158,8 +10373,6 @@ static int emit_virt_proto(
       "q2_holder_bad_sh(vsh%d, holders, %d), 0)) E_GOTO(vx, %d);\n",
       in->vweb, g, e_cellidx(cib, sizeof(cib), site), g, in->vweb, site, in->pc);
   fprintf(f, "      _f = *q2_hslotp_sh(vsh%d, q2_cell_off(pic, %s));\n", in->vweb, cib);
-  if (!g_e_nolazy)
-    fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n", in->pc);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
     fprintf(stderr, "qjsaot: virtual prototype read at pc %d: no guard for its def\n", in->pc);
     e_fatal("internal inconsistency (see the message above)", NULL);
@@ -10699,6 +10912,17 @@ static int emit_typed_call(
         fprintf(f, "      }\n    }\n");
       }
     }
+  }
+
+  /* `s.replace(re, K).length`: the length alone, from the engine, when the site is the builtin on a pristine RegExp (e_rxlen_site) */
+  if (!g_e_inl && !g_e_fl && cur != NULL && th >= 0 && t->lb[dv] == E_LB_TAG && e_rxlen_site(fn, in) && e_rxlen_len_typed(fn, t, in)) {
+    char rxe[96], ke[96];
+    e_reg_box(rxe, sizeof(rxe), fn, t, cur, in->win_reg);
+    e_reg_box(ke, sizeof(ke), fn, t, cur, in->win_reg + 1);
+    fprintf(
+        f, "    { JSValue _o;\n      if (q2_replace_len(ctx, %s, %s, %s, %s, &_o)) {\n", cexp, recv, rxe, ke);
+    e_builtin_call_tail(f, fn, in, t, cur, dv, off);
+    fprintf(f, "      }\n    }\n");
   }
 
   /* ---- output starts here; it must not be abandoned ---- */
@@ -11498,8 +11722,6 @@ static int emit_group_this_read(
         okt ? "!this_ok_ && " : "", in->pc, okt ? "!this_ok_ && " : "", test, in->pc,
         e_slotfn(site), off);
   }
-  if (!g_e_nolazy)
-    fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n", in->pc);
   fprintf(f, "      v%u = _t;\n", (unsigned)rv);
   if (g_e_fl && e_group_layout(g) != 0 && fn->nrpo > 0 && g_e_blk == fn->rpo[0] && (int)rv < g_e_spill_nv) {
     fprintf(f, "      pp%u = %s(_t);\n", (unsigned)rv, e_direct() ? "q2_propd" : "q2_propp");
@@ -11691,7 +11913,7 @@ static int emit_typed_field_chain(
     int have_types, char hex[33], int fi, int b) {
   const ERole *role = e_roles[in->rop];
   Q2ValueId rv, d0v, d1v;
-  int s1, s2, rreg, d0reg, d1reg;
+  int s1, s2, rreg, d0reg, d1reg, str_mid = 0;
   char pent[24];
   const char *pent_p = NULL;
 
@@ -11720,7 +11942,11 @@ static int emit_typed_field_chain(
   if (t->lb[rv] != E_LB_TAG || t->lb[d0v] != E_LB_TAG) return 0;
   /* The first link's result is the second link's receiver, and the second read is an own-slot read of an object: a first link the profile saw
      hold a string (or any other non-object) would miss on every execution. */
-  if (fn->values[d0v].has_prof && (fn->values[d0v].ptypes & ~Q2_T_OBJ) != 0 && getenv("QJS_AOT_CHAIN_OLD") == NULL) {
+  /* A first link the profile saw hold only strings, then a method read on it (`this.src.charCodeAt`): the second link is served by the string
+     prototype's cell, in the plain body (a grouped or frameless body keeps the old refusal). */
+  str_mid = fn->values[d0v].has_prof && fn->values[d0v].ptypes == Q2_T_STR && !g_e_fl && !g_e_quiet && in->arg[6].kind == 'a' && in->arg[6].off >= 0 &&
+            !(e_exit_group(fn, in, s1) >= 0 && e_exit_group(fn, in, s2) >= 0) && getenv("QJS_AOT_NO_CHAINSTR") == NULL;
+  if (!str_mid && fn->values[d0v].has_prof && (fn->values[d0v].ptypes & ~Q2_T_OBJ) != 0 && getenv("QJS_AOT_CHAIN_OLD") == NULL) {
     if (g_e_fl) e_fl_block("a chain whose first link is not an object", in);
     return 0;
   }
@@ -11767,6 +11993,13 @@ static int emit_typed_field_chain(
   e_fprint_hit(f, fn, "        ", "_c0", s2, "&_c1", pent_p);
   fprintf(f, "          v%u = _c1;\n", (unsigned)d1v);
   fprintf(f, "        } else {\n");
+  if (str_mid)
+    fprintf(f,
+            "          static Q2StrCell sc_%d;\n"
+            "          if (q2_strproto_hit(ctx, _c0, &sc_%d, qjs_aot_ld_u32(q2_code(f) + %d), &_c1)) {\n"
+            "            v%u = _c1;\n"
+            "          } else {\n",
+            in->pc, in->pc, in->arg[6].off, (unsigned)d1v);
   /* Link 2 missed: restore the receiver and hand the whole instruction over. */
   fprintf(f, "          AOT_SET_B(ctx, fr, %d, _rcv);\n", rreg * 16);
   g_e_fl_miss_ok = e_site_vouched(fn, s1) && e_site_vouched(fn, s2);
@@ -11774,6 +12007,7 @@ static int emit_typed_field_chain(
     g_e_fl_miss_ok = 0;
     return 0;
   }
+  if (str_mid) fprintf(f, "          }\n");
   fprintf(f, "        }\n");
   fprintf(f, "      } else {\n");
   fprintf(f, "        AOT_SET_B(ctx, fr, %d, _rcv);\n", rreg * 16);
@@ -12167,6 +12401,16 @@ static int e_region_index(
         (unsigned)kv, pc, (unsigned)kv);
     return 1;
   }
+  /* A double key (a parameter that is an int on most calls, or an index that took part in a double computation): an array index only
+     when it is a whole number in range, which is tested here; any other value leaves the region, and the op call reads the property. */
+  if (t->lb[kv] == E_LB_F64) {
+    fprintf(
+        f,
+        "      if (__builtin_expect(!(d%u >= 0.0 && d%u <= 4294967294.0 && (double)(uint32_t)d%u == d%u), 0)) E_GOTO(vx, %d);\n"
+        "      uint32_t _i = (uint32_t)d%u;\n",
+        (unsigned)kv, (unsigned)kv, (unsigned)kv, (unsigned)kv, pc, (unsigned)kv);
+    return 1;
+  }
   return 0;
 }
 
@@ -12208,7 +12452,7 @@ static int emit_ta_region_read(
     return 0;
   if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 && t->lb[dv] != E_LB_F64 && t->lb[dv] != E_LB_BOOL)
     return 0;
-  if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG) return 0;
+  if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG && t->lb[kv] != E_LB_F64) return 0;
   dreg = fn->values[dv].reg;
   if (dreg < 0 || dreg >= fn->nregs) return 0;
   root = e_region_root(fn, in);
@@ -12318,7 +12562,7 @@ static int emit_pk_region_read(
   if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 && t->lb[dv] != E_LB_F64 &&
       t->lb[dv] != E_LB_BOOL)
     return 0;
-  if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG) return 0;
+  if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG && t->lb[kv] != E_LB_F64) return 0;
   dreg = fn->values[dv].reg;
   if (dreg < 0 || dreg >= fn->nregs) return 0;
   root = e_region_root(fn, in);
@@ -12382,7 +12626,7 @@ static int emit_elem_region_read(
   if (t->lb[dv] != E_LB_TAG && t->lb[dv] != E_LB_I32 && t->lb[dv] != E_LB_F64 &&
       t->lb[dv] != E_LB_BOOL)
     return 0;
-  if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG) return 0;
+  if (t->lb[kv] != E_LB_I32 && t->lb[kv] != E_LB_TAG && t->lb[kv] != E_LB_F64) return 0;
   dreg = fn->values[dv].reg;
   if (dreg < 0 || dreg >= fn->nregs) return 0;
   root = e_region_root(fn, in);
@@ -12418,12 +12662,12 @@ static int emit_elem_region_read(
         "      b%u = JS_VALUE_GET_BOOL(_e);\n",
         in->pc, (unsigned)dv);
   else {
-    /* Any element but a hole (and a lazy marker while one can exist). */
+    /* Any element but a hole. */
     fprintf(
         f,
         "      if (__builtin_expect(JS_VALUE_GET_TAG(_e) == JS_TAG_UNINITIALIZED%s, 0)) E_GOTO(vx, %d);\n"
         "      v%u = _e;\n",
-        g_e_nolazy ? "" : " || JS_VALUE_GET_TAG(_e) == QJS_AOT_TAG_LAZY_JSON", in->pc,
+        "", in->pc,
         (unsigned)dv);
   }
   fprintf(f, "    }\n");
@@ -12772,8 +13016,7 @@ static void e_pp_block_define(FILE *f, int g, const char *recv) {
 }
 
 /* A grouped field READ: tag and shape test (unless implied), the slot load at
-   the group's offset, the lazy-JSON test; every failure exits before the
-   instruction. */
+   the group's offset; every failure exits before the instruction. */
 static int emit_group_read(
     FILE *f, const Q2Func *fn, const Q2Insn *in, const ETypes *t,
     Q2ValueId *cur, int g, int site, Q2ValueId dv, Q2ValueId rv, int dreg) {
@@ -12802,12 +13045,6 @@ static int emit_group_read(
         fprintf(f, "      _f = *%s(%s, %s);\n", e_slotfn(site), recv, off);
     }
   }
-  if (!g_e_nolazy)
-    fprintf(
-      f,
-      "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == "
-      "QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n",
-      in->pc);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
     fprintf(
         stderr, "qjsaot: grouped read at pc %d: no guard for its def\n", in->pc);
@@ -12845,12 +13082,6 @@ static int emit_group_chain(
     e_slot_off(off, sizeof(off), g1, s1);
     fprintf(f, "      _c0 = *%s(%s, %s);\n", e_slotfn(s1), recv, off);
   }
-  if (!g_e_nolazy && cf == 0)
-    fprintf(
-      f,
-      "      if (__builtin_expect(JS_VALUE_GET_TAG(_c0) == "
-      "QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n",
-      in->pc);
   e_group_test(test, sizeof(test), ((g_e_facts->skip[e_insn_idx(fn, in)] >> 1) & 1) ? 1 : ((g_e_facts->claimskip[e_insn_idx(fn, in)] >> 1) & 1) ? 2 : 0, (g_e_facts->cellskip[e_insn_idx(fn, in)] >> 1) & 1, "_c0", g2, s2, 0);
   fprintf(f, "      if (__builtin_expect(%s, 0)) E_GOTO(vx, %d);\n", test, in->pc);
   {
@@ -12861,12 +13092,6 @@ static int emit_group_chain(
     else
       fprintf(f, "      _c1 = *%s(_c0, %s);\n", e_slotfn(s2), off);
   }
-  if (!g_e_nolazy)
-    fprintf(
-      f,
-      "      if (__builtin_expect(JS_VALUE_GET_TAG(_c1) == "
-      "QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n",
-      in->pc);
   fprintf(f, "      v%u = _c0;\n", (unsigned)d0v);
   if (e_mc_index(s2) >= 0 && t->lb[d1v] == E_LB_TAG) e_mc_def(d1v, e_mc_index(s2));
   if (t->lb[d1v] == E_LB_TAG) {
@@ -13052,7 +13277,16 @@ static int emit_group_write(
     if (!skip && !undo_ && e_group_layout(g) != 0 && strcmp(test, "0") != 0 && qjs_aot_store_xfer(dg_, osite_)) {
       fprintf(f, "    if (__builtin_expect(%s, 0)) {\n", test);
       fprintf(f, "      JSValue _xv = %s;\n", boxed);
-      fprintf(f, "      if (__builtin_expect(Q2_FORCE_MISS || !q2_put_add(ctx, pic, holders, q2_ns, %s, %d, _xv), 0)) E_GOTO(vx, %d);\n", recv, site, in->pc);
+      if (!g_e_fl && !g_e_inl)
+        fprintf(f, "      if (__builtin_expect(Q2_FORCE_MISS || !(q2_put_add(ctx, pic, holders, q2_ns, %s, %d, _xv) || qjs_aot_put_add(ctx, f, %s, _xv, %d) > 0), 0)) E_GOTO(vx, %d);\n", recv, site, recv, site, in->pc);
+      else
+        fprintf(f, "      if (__builtin_expect(Q2_FORCE_MISS || !q2_put_add(ctx, pic, holders, q2_ns, %s, %d, _xv), 0)) E_GOTO(vx, %d);\n", recv, site, in->pc);
+      {
+        /* the property pointer is defined on both paths: the second definition below must print too */
+        unsigned n_;
+        e_pp_block_define(f, g, recv);
+        if (g_e_ppblk != NULL && recv[0] == 'v' && sscanf(recv + 1, "%u", &n_) == 1 && (int)n_ < g_e_spill_nv && e_pp_of(recv) >= 0) g_e_ppblk[n_] = 0;
+      }
       fprintf(f, "    } else\n");
     }
   }
@@ -13224,12 +13458,6 @@ static int emit_poly_read(
   fprintf(f, "    { JSValue _f;\n");
   e_poly_chain(f, recv, site, in->arg[2].off, 0, in->pc);
   fprintf(f, "      _f = *q2_slotp(%s, _po);\n", recv);
-  if (!g_e_nolazy)
-  fprintf(
-        f,
-        "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) "
-        "E_GOTO(vx, %d);\n",
-        in->pc);
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
     fprintf(stderr, "qjsaot: polymorphic read at pc %d: no guard for its def\n", in->pc);
     e_fatal("internal inconsistency (see the message above)", NULL);
@@ -13452,8 +13680,6 @@ static int emit_typed_field_read(
       fprintf(f, "    pme%u = ame_%d_%d;\n    { JSValue _f = amv_%d_%d;\n", (unsigned)dv, in->own - 1, site, in->own - 1, site);
     } else {
       fprintf(f, "    { JSValue _f = *q2_slotp(v%u, aoff_%d_%d);\n", (unsigned)rv, in->own - 1, site);
-      if (!g_e_nolazy)
-        fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n", in->pc);
     }
     if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
       fprintf(stderr, "qjsaot: arm read at pc %d: no guard for its def\n", in->pc);
@@ -13498,7 +13724,6 @@ static int emit_typed_field_read(
             "      if (__builtin_expect(q2_slt_off(ctx, &cslt_%d, v%u, qjs_aot_ld_u32(icode_%d + %d), &_o), 1)) {\n"
             "        _f = *q2_slotp(v%u, _o);\n",
             in->pc, in->pc, in->pc, in->pc, (unsigned)rv, ik, in->arg[2].off, (unsigned)rv);
-        if (!g_e_nolazy) fprintf(f, "        if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n", in->pc);
         fprintf(
             f,
             "      } else if (!q2_lmt_hit(ctx, &clmt_%d, v%u, qjs_aot_ld_u32(icode_%d + %d), &_f, &_pe)) E_GOTO(vx, %d);\n",
@@ -13510,7 +13735,6 @@ static int emit_typed_field_read(
             "      if (__builtin_expect(Q2_FORCE_MISS || !q2_slt_off(ctx, &cslt_%d, v%u, qjs_aot_ld_u32(icode_%d + %d), &_o), 0)) E_GOTO(vx, %d);\n"
             "      _f = *q2_slotp(v%u, _o);\n",
             in->pc, in->pc, (unsigned)rv, ik, in->arg[2].off, in->pc, (unsigned)rv);
-        if (!g_e_nolazy) fprintf(f, "      if (__builtin_expect(JS_VALUE_GET_TAG(_f) == QJS_AOT_TAG_LAZY_JSON, 0)) E_GOTO(vx, %d);\n", in->pc);
       }
     }
     if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) {
@@ -13576,12 +13800,25 @@ static int emit_typed_field_read(
           "&pme%u, %d) ||\n"
           "          q2_own_read_hit(pic, holders, v%u, %d, (int)q2_ns, &_f)), 1)) {\n",
           (unsigned)rv, pmj, pmj, pmj, (unsigned)dv, pmj, (unsigned)rv, site);
-    else
-      fprintf(
-          f,
-          "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
-          "v%u, %d, (int)q2_ns, &_f), 1)) {\n",
-          (unsigned)rv, site);
+    else {
+      /* A site whose receivers have many shapes that keep the field at one index: after the cache's own test, a read by position
+         (the shape names the atom at that index) before the interpreter. */
+      int osite_a, slot_a = 0;
+      const uint8_t *dg_a = e_site_dg(fn, site, &osite_a);
+      if (!g_e_fl && !g_e_inl && in->own == 0 && in->arg[2].kind == 'a' && in->arg[2].off >= 0 && dg_a != NULL &&
+          qjs_aot_prof_site_atom_slot(dg_a, osite_a, &slot_a))
+        fprintf(
+            f,
+            "      if (__builtin_expect(!Q2_FORCE_MISS && (q2_own_read_hit(pic, holders, v%u, %d, (int)q2_ns, &_f) ||\n"
+            "          qjs_aot_slot_atom_hit(v%u, %du, (JSAtom)qjs_aot_ld_u32(q2_code(f) + %d), &_f)), 1)) {\n",
+            (unsigned)rv, site, (unsigned)rv, slot_a, in->arg[2].off);
+      else
+        fprintf(
+            f,
+            "      if (__builtin_expect(!Q2_FORCE_MISS && q2_own_read_hit(pic, holders, "
+            "v%u, %d, (int)q2_ns, &_f), 1)) {\n",
+            (unsigned)rv, site);
+    }
   }
   if (!emit_hit_result(f, fn, in, t, dv, dreg, "_f")) return 0;
   /* The MISS path is the wrapper -- one copy of the op-call sequence, never an
@@ -16023,9 +16260,7 @@ static FILE *g_opm_ops;
 static char *g_opm_buf;
 static size_t g_opm_len;
 static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]);
-/* A framed speculative body assumes no lazy JSON document exists (it is re-checked at entry
-   and after every safepoint), so its loads carry no lazy-marker test; the cache-hit helpers
-   take the choice from Q2_LZ. Frameless and inline bodies keep the tests. */
+/* A framed speculative body is emitted in the `_nl` form: Q2_LZ 0 and the `_nl` reference helpers around it. */
 /* The per-value local declarations of a body (`JSValue vN`, `ppN`, `pmeN`, `iN`, `dN`, `bN`) that nothing else in the body names are not written: a body of
    thousands of values declared three or four unused locals each. (QJS_AOT_KEEP_DECLS=1 keeps them; the poison mode needs them.) */
 static void e_write_without_unused_decls(FILE *f, const char *buf, size_t len) {
@@ -16925,7 +17160,7 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           if (!e_oldpin()) snprintf(pinid, sizeof(pinid), " && q2_ident_of(mcv%d) != e_mono_%d[%d]", g, g_e_mono_id, g);
                     fprintf(
               f,
-              "      mcv%d = JS_MKVAL(QJS_AOT_TAG_LAZY_JSON, 0);\n"
+              "      mcv%d = JS_UNDEFINED;\n"
               "      if (gsh%d != E_NO_SHAPE) {\n"
               "        if (__builtin_expect(q2_holder_bad_sh(gsh%d, holders, %d), 0)) {\n"
               "          E_REFUSE_NOTE(%d);\n"
@@ -16990,14 +17225,6 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
   }
   g_e_sm_on = getenv("QJS_AOT_NOSTATICSH") == NULL && g_e_facts != NULL && g_e_group_used != NULL;
   if (g_e_sm_on) e_sm_macros(f, 1);
-  if (g_e_nolazy && !g_e_inl && !g_e_kfast)
-    fprintf(
-        f,
-        "    if (__builtin_expect(E_LAZY_SEEN(ctx), 0)) {\n"
-        "        E_REFUSE_NOTE(%d);\n"
-        "        return %s;\n"
-        "    }\n",
-        fi, gen0);
   if (g_e_fl && g_e_fl_calls && !g_e_inl) e_pure_emit_entry(f);
   /* Counted only now: everything that could refuse the entry has been passed, so
      this measures speculative bodies that ACTUALLY RAN. */
@@ -17317,6 +17544,13 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
         /* The text of an inlined copy's rebinding (above) is not an emitter's output: an instruction nothing lowers must
            still be able to decline, which leaves the frameless attempt to be abandoned (e_fl_block) instead of refusing
            the function for bytes written before any emitter ran. */
+        FILE *real_f = f, *cen_mf = NULL;
+        char *cen_buf = NULL;
+        size_t cen_len = 0;
+        if (getenv("QJS_AOT_CENSUS") != NULL) {
+          cen_mf = open_memstream(&cen_buf, &cen_len);
+          if (cen_mf != NULL) f = cen_mf;
+        }
         before = ftell(f);
         emitted = e_dispatch_rop(
             f, fn, in, &types, cur, have_types, hex, fi, b, role);
@@ -17337,6 +17571,47 @@ static int e_emit_spec_body_pass_inner(FILE *f, const Q2Func *fn, char hex[33]) 
           }
         }
         emitter_bytes = ftell(f) - before;
+        {
+          /* QJS_AOT_CENSUS=FILE: one line per lowered instruction, naming the function and pc it came from, the emitter that took it (or the
+             op-call wrapper) and which marker tokens its text contains. Read by tools/aot/census.py with the profile's execution counts. */
+          static FILE *cen;
+          static int cen_init;
+          if (!cen_init) {
+            const char *cp = getenv("QJS_AOT_CENSUS");
+            cen_init = 1;
+            if (cp != NULL && cp[0]) cen = fopen(cp, "a");
+          }
+          if (cen != NULL) {
+            static const char *const marks[] = {"q2_shape_ne", "q2_own_read_hit", "q2_slt_off", "q2_lmt_hit", "aoff_", "q2_slotp", "q2_slotpp", "q2_propp",
+                                                "E_GOTO(vx", "qjs_aot_step", "regvm_s_ROP", "JS_GetPropertyInternal", "JS_SetPropertyInternal", "JS_Call(",
+                                                "aot_n_", "q2_poly", "q2_pic", "q2_epoch", "Q2_EPOCH_MOVED", "JS_IsFunction", "qjs_aot_", "q2_arr", "q2_elem",
+                                                "q2_alloc", "q2_new_", "q2_young", "js_create", "q2_layout_shape", "q2_proto", "q2_cell", "q2_vref", "gsh"};
+            const JSAotGenFunc *og = q2_insn_g(fn, in);
+            char buf[16384], dgx[33];
+            long n = emitter_bytes < (long)sizeof(buf) - 1 ? emitter_bytes : (long)sizeof(buf) - 1;
+            int k, w = 0;
+            fflush(f);
+            if (n > 0 && cen_buf != NULL && cen_len >= (size_t)(before + n)) memcpy(buf, cen_buf + before, (size_t)n);
+            else n = 0;
+            buf[n > 0 ? n : 0] = 0;
+            for (k = 0; k < 16; k++) snprintf(dgx + k * 2, 3, "%02x", og->digest[k]);
+            char rn[48];
+            e_rop_name(in->rop, rn, sizeof(rn));
+            fprintf(cen, "C %s %d %s %d %d %d %ld %s", dgx, in->opc, rn, in->own > 0, g_e_fl, g_e_inl, emitter_bytes, emitted ? "T" : "-");
+            for (k = 0; k < (int)(sizeof(marks) / sizeof(marks[0])); k++)
+              if (n > 0 && strstr(buf, marks[k]) != NULL) { fprintf(cen, "%s%s", w ? "," : " ", marks[k]); w++; }
+            if (!w) fprintf(cen, " -");
+            fprintf(cen, " %s\n", g_e_opcalls != oc0 ? "OPCALL" : "TYPED");
+          }
+        }
+        if (cen_mf != NULL) {
+          fflush(cen_mf);
+          f = real_f;
+          fwrite(cen_buf, 1, cen_len, f);
+          fclose(cen_mf);
+          free(cen_buf);
+          cen_mf = NULL;
+        }
         if (in->own > 0) {
           fprintf(f, "#undef pic\n#undef holders\n#undef q2_ns\n#undef fr\n"
                      "#undef qjs_aot_get_var_ref\n#undef qjs_aot_var_ref_ptr\n");
@@ -18531,9 +18806,8 @@ static int e_emit_inline_body_v(
   return 1;
 }
 
-/* An inline body is emitted twice: for a caller that may meet a lazy document (every load tests for the
-   marker) and for a caller that has tested for one at its entry and after each safepoint (the loads
-   carry no test, and the body's own safepoints test again). */
+/* An inline body is emitted twice, in the plain form and in the `_nl` form that callers in the `_nl` form name
+   (`_n`). The two differ only in which reference helpers they name. */
 int e_emit_inline_body(
     FILE *f, const Q2Func *fn, char hex[33], char *why, size_t whyn) {
   int nx0, leaf0, rz0, tl0, rc;

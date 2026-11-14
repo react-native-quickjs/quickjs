@@ -170,7 +170,9 @@ if [ "$FULL" = 1 ]; then
     "$CLANG" ${ASAN_OPT:--O1} $BASE -fsanitize=address,undefined -fno-omit-frame-pointer \
       -DQJS_REGVM=1 -DQJS_AOT=1 -c $S/$f.c -o "$O/obj/$f-asan.o"
   done
-  "$CLANG" ${ASAN_UNIT_OPT:-$UNIT_OPT} $BASE -I"$O" -ffp-contract=off -fsanitize=address,undefined -fno-omit-frame-pointer \
+  # The generated unit through ccsplit and at -O0 by default: a sanitized compile of the whole unit, or of its parts at -O2, needs more
+  # than 6 GB (the test262 unit is 34 MB of C).
+  CCSPLIT_CC="$CLANG" CCSPLIT_JOBS=${CCSPLIT_JOBS:-2} "$(dirname "$0")/ccsplit" ${ASAN_UNIT_OPT:--O0} $BASE -I"$O" -ffp-contract=off -fsanitize=address,undefined -fno-omit-frame-pointer \
     -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/t262.c" -o "$O/obj/t262-asan.o"
   "$CLANG" ${ASAN_OPT:--O1} $BASE -fsanitize=address,undefined -fno-omit-frame-pointer \
     -c $S/run-test262.c -o "$O/obj/run-test262-asan.o"

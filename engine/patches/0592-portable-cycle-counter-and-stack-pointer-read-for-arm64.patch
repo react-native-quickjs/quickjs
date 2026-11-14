@@ -1,0 +1,169 @@
+Subject: Portable cycle counter and stack pointer read so the engine builds for arm64
+
+What this does
+  - `js_cycles`: the time-stamp counter on x86 (as before); on Windows elsewhere QueryPerformanceCounter, and otherwise CLOCK_MONOTONIC, both scaled to nominal 3 GHz cycles; replaces the 13 direct `__builtin_ia32_rdtsc()` uses (GC admission budget, GC and nursery statistics)
+  - the conservative stack scan's stack-pointer read: the x86-64 instruction as before, `mov %0, sp` on aarch64, a local's address elsewhere
+
+Why we need it
+  The engine did not compile for aarch64 (Android NDK, Apple): `__builtin_ia32_rdtsc` is x86-only and `mov %%rsp` is x86 assembly. Found by an NDK cross-compile requested to check the JSON and regexp vector paths.
+
+Soundness
+  x86 code is unchanged (same builtin, same instruction). The GC admits a collection by comparing cycles spent with elapsed cycles / 16 plus an allowance in cycles; a clock scaled to 3 GHz keeps the ratio exact and the allowance about the same size. The x87 long-double path (0591) and the SSE2 scans (0579, 0588) were already compiled only under `__x86_64__`/`__i386__` with LDBL_MANT_DIG == 64 and `__SSE2__`, with strtod and scalar loops elsewhere. Checked: quickjs.c (-DQJS_REGVM=1 -DQJS_AOT=1, -O2), libregexp.c, libunicode.c and dtoa.c compile with NDK 27.1 aarch64-linux-android24-clang; the x86 build and json_app output are unchanged.
+
+diff --git a/quickjs.c b/quickjs.c
+index 8771faa..85da23b 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -92,6 +92,24 @@ static void fn_sample_name(const struct JSFunctionBytecode *b);
+ #include "libregexp.h"
+ #include "dtoa.h"
+ 
++/* A cycle count for the GC's time accounting and the statistics counters: the time-stamp counter on x86; elsewhere a monotonic
++   clock scaled to nominal 3 GHz cycles, so the cycle-denominated allowances keep about the same meaning */
++static inline uint64_t js_cycles(void)
++{
++#if defined(__x86_64__) || defined(__i386__)
++    return __builtin_ia32_rdtsc();
++#elif defined(_WIN32)
++    LARGE_INTEGER c, f;
++    QueryPerformanceCounter(&c);
++    QueryPerformanceFrequency(&f);
++    return (uint64_t)((double)c.QuadPart * (3e9 / (double)f.QuadPart));
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 3000000000u + (uint64_t)ts.tv_nsec * 3u;
++#endif
++}
++
+ #if QJS_REGVM
+ /* The register ISA and lowering inventory, needed by the register interpreter
+    in JS_CallInternal as well as by the compiler-side analysis below. */
+@@ -4414,7 +4432,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
+     rt->gc_young_streak = 0;
+     rt->gc_need_full = false;
+     rt->gc_full_after = 0;
+-    rt->gc_t0 = __builtin_ia32_rdtsc();
++    rt->gc_t0 = js_cycles();
+     rt->gc_spent = 0;
+     rt->gc_after_last = 0;
+     rt->gc_yield_ok = true;
+@@ -4878,7 +4896,7 @@ static void y_formless_args_slow(JSValue this_obj, const JSValue *argv, int na)
+         } } while (0)
+ #define Y_VAL(v) (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(v)))
+ static int y_tsc_on = -1;
+-static inline uint64_t y_tsc(void) { if (unlikely(y_tsc_on < 0)) y_tsc_on = getenv("QJS_Y_STATS") != NULL; return y_tsc_on ? __builtin_ia32_rdtsc() : 0; }
++static inline uint64_t y_tsc(void) { if (unlikely(y_tsc_on < 0)) y_tsc_on = getenv("QJS_Y_STATS") != NULL; return y_tsc_on ? js_cycles() : 0; }
+ #define Y_CHUNK_OF(p) ((YChunk *)((uintptr_t)(p) & ~((uintptr_t)y_chunk_sz - 1)))
+ void qjs_y_trip(JSContext *ctx) { ctx->rt->zct_limit = 0; ctx->rt->zct_nobj += 1; }
+ static void y_vec_push(YChunk ***v, uint32_t *n, uint32_t *cap, YChunk *c) {
+@@ -12502,7 +12520,16 @@ static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
+     uint32_t i, k;
+     struct list_head *el;
+     __builtin_unwind_init();
++#if defined(__x86_64__)
+     __asm__ volatile("mov %%rsp, %0" : "=r"(lo));
++#elif defined(__aarch64__)
++    __asm__ volatile("mov %0, sp" : "=r"(lo));
++#else
++    {
++        volatile uintptr_t here = 0;
++        lo = (uintptr_t)&here;
++    }
++#endif
+     ss_n = 0;
+     ss_sw_n = 0;
+     ss_sw_sorted = 0;
+@@ -13491,7 +13518,7 @@ static JSObject **gc_y_set; static size_t gc_y_cap;
+ static JSObject **gc_y_stk; static size_t gc_y_stk_cap;
+ static size_t gc_young_n, gc_young_g;
+ static uint64_t gc_ph[6];
+-#define GC_PH(i) do { if (unlikely(gc_stat_on > 0)) { uint64_t t_ = __builtin_ia32_rdtsc(); if (i) gc_ph[i - 1] += t_ - gc_ph_t; gc_ph_t = t_; } } while (0)
++#define GC_PH(i) do { if (unlikely(gc_stat_on > 0)) { uint64_t t_ = js_cycles(); if (i) gc_ph[i - 1] += t_ - gc_ph_t; gc_ph_t = t_; } } while (0)
+ static uint64_t gc_ph_t;
+ #define GC_YOUNG_OLD_RUN 256
+ 
+@@ -13769,7 +13796,7 @@ static void js_run_gc(JSRuntime *rt, bool young)
+     size_t sz0 = rt->malloc_state.malloc_size;
+     gc_stat_init();
+     if (unlikely(gc_stat_on))
+-        t0 = __builtin_ia32_rdtsc();
++        t0 = js_cycles();
+ #if QJS_REGVM && QJS_DRC_VALIDATE
+     js_drc_validate_roots(rt);
+ #endif
+@@ -13797,7 +13824,7 @@ static void js_run_gc(JSRuntime *rt, bool young)
+ static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0)
+ {
+     uint64_t t1 = 0, t2 = 0, t3 = 0, t4 = 0, tp = 0;
+-    uint64_t c_in = __builtin_ia32_rdtsc();
++    uint64_t c_in = js_cycles();
+     size_t s_in = rt->malloc_state.malloc_size;
+     if (unlikely(gc_stat_on))
+         t1 = c_in;
+@@ -13817,7 +13844,7 @@ static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0)
+         uint64_t g = 0, ex = 0;
+         int k = young;
+ 
+-        tp = __builtin_ia32_rdtsc();
++        tp = js_cycles();
+         if (young)
+             g = gc_young_g;
+         else
+@@ -13834,12 +13861,12 @@ static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0)
+         gc_stat[k].examined += ex;
+         if (ex > gc_stat[k].max_examined)
+             gc_stat[k].max_examined = ex;
+-        t2 = __builtin_ia32_rdtsc();
++        t2 = js_cycles();
+     }
+     /* free the GC objects in a cycle */
+     gc_free_cycles(rt);
+     if (unlikely(gc_stat_on))
+-        t3 = __builtin_ia32_rdtsc();
++        t3 = js_cycles();
+     js_arena_trim(rt);
+     if (!young) {
+         rt->gc_young_streak = 0;
+@@ -13854,12 +13881,12 @@ static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0)
+ 
+         rt->gc_yield_ok = freed >= (swept >> 4);
+         rt->gc_after_last = s_out;
+-        rt->gc_spent += __builtin_ia32_rdtsc() - c_in;
++        rt->gc_spent += js_cycles() - c_in;
+     }
+     if (unlikely(gc_stat_on)) {
+         int k = young;
+ 
+-        t4 = __builtin_ia32_rdtsc();
++        t4 = js_cycles();
+         gc_stat[k].n++;
+         gc_stat[k].c_pin += t1 - t0;
+         gc_stat[k].c_pass += tp - t1;
+@@ -13912,7 +13939,7 @@ static bool js_gc_admit(JSRuntime *rt)
+         return true;
+     window = js_gc_pick_young(rt) ? (size > rt->gc_after_last ? size - rt->gc_after_last : 0) : size;
+     est = (uint64_t)window * GC_ADMIT_CYC_PER_BYTE;
+-    budget = (__builtin_ia32_rdtsc() - rt->gc_t0) / 16 + GC_ADMIT_ALLOWANCE;
++    budget = (js_cycles() - rt->gc_t0) / 16 + GC_ADMIT_ALLOWANCE;
+     if (rt->gc_spent + est <= budget)
+         return true;
+     gc_admit_refused++;
+@@ -13936,7 +13963,7 @@ static void js_gc_auto_pinned(JSRuntime *rt)
+     gc_stat_init();
+     if (young)
+         rt->gc_young_streak++;
+-    js_gc_passes(rt, young, unlikely(gc_stat_on) ? __builtin_ia32_rdtsc() : 0, sz0);
++    js_gc_passes(rt, young, unlikely(gc_stat_on) ? js_cycles() : 0, sz0);
+     if (young && js_gc_full_due(rt))
+         rt->gc_need_full = true;
+     js_gc_rearm_pace(rt, sz0, rt->malloc_state.malloc_size);
+@@ -100049,7 +100076,7 @@ static void re_st_report(void);
+ static inline uint64_t re_st_tsc(void)
+ {
+ #if defined(__x86_64__)
+-    return __builtin_ia32_rdtsc();
++    return js_cycles();
+ #else
+     struct timespec ts;
+     clock_gettime(CLOCK_MONOTONIC, &ts);

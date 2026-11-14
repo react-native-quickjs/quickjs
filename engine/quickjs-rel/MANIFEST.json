@@ -2123,15 +2123,171 @@
       "sha256": "9b0f6685e5b78481a04a5aa33ecf5a96a7210a37fc3b5ac237ec6f3bdee957e7"
     },
     {
+      "name": "0568-aot-layout-hash-thread-safe-and-registry-lock.patch",
+      "sha256": "2d9117fb12065ce9a404909eed9a7387f9fdb0a935cdd2939812b7c621f30450"
+    },
+    {
+      "name": "0569-aot-native-entry-seals-the-callers-light-frame.patch",
+      "sha256": "78cdfea94df87ad7f3b7f474f2231db6dd31f6be1df6842d3bada0fd8ae598c5"
+    },
+    {
+      "name": "0570-fnsample-table-carries-the-function-digest.patch",
+      "sha256": "6fdd4d6effab7a3bc0780cbcab1bc0aee2a2eac20972c85d8e232f48751d445b"
+    },
+    {
+      "name": "0571-formless-units-promote-the-callers-args-at-the-interpreter-entry.patch",
+      "sha256": "f5c8fb219dfcd2e5e48613d17f57051ffb05168c6376d71e526a9b69f3f2fa64"
+    },
+    {
+      "name": "0572-shared-add-transition-table-for-stores-into-many-shapes.patch",
+      "sha256": "2c1b1dd4ce64e3923670aeabdc73d7d865b160bc8720dcfae794fb2beb2ed692"
+    },
+    {
+      "name": "0573-compiled-field-reads-by-position-for-sites-of-many-shapes.patch",
+      "sha256": "da2271c656b3c28e1dbba45db1705428fd106ff4b9ad2a70ecaf36e8f36830c9"
+    },
+    {
+      "name": "0574-shared-add-table-probed-and-filled-only-by-sites-holding-another-shape.patch",
+      "sha256": "600fc34b000952ad562ecd8f2c75c281ba6ea1658f083e3aeea281a8099aa1fb"
+    },
+    {
+      "name": "0575-compiled-string-append-skips-the-register-scan-when-the-generator-proved-no-alias.patch",
+      "sha256": "17cd8659e3cd532e9b7962a7563e74874e6f6dac90b58dd51c0262359d12c3ee"
+    },
+    {
+      "name": "0576-splice-on-a-dense-array-of-values-moves-the-tail-with-one-memmove.patch",
+      "sha256": "23347d6e3b4db36a9d14599d0f87c2f2a8a93f7b6b71b0d295eae16399c3beca"
+    },
+    {
+      "name": "0577-regexp-matchers-generated-ahead-of-time-from-pattern-bytecode.patch",
+      "sha256": "5a52d80259a6094bb63e653fff824eef8f194b89b6c485ef0c69f329b77b13a7"
+    },
+    {
+      "name": "0578-regexp-replace-with-a-constant-8-bit-string-allocates-the-result-once.patch",
+      "sha256": "7a0472808754c48d44d7e81ef08b021ca8eb121b840a986fbb788df965e8a680"
+    },
+    {
+      "name": "0579-regexp-required-literal-scan-of-16-bit-subjects-eight-units-at-a-time.patch",
+      "sha256": "cba2a6204f5b8eefacb27b871def9f88e0a66d1510c2b6c7c98256404ad39b1d"
+    },
+    {
+      "name": "0580-replace-length-of-a-compiled-site-without-the-result-string.patch",
+      "sha256": "7ec0fcc382bc788848fe2b8a7a185ef9ff1b31b8a14056bac39febc232932879"
+    },
+    {
+      "name": "0581-json-parse-of-an-8-bit-string-reads-its-own-bytes.patch",
+      "sha256": "5101728d7245cf2d1c7fdb9ffefd696d486ca3cb65658fe968d2e7e9993396f5"
+    },
+    {
+      "name": "0582-json-parse-keys-from-the-expected-shape-and-a-per-parse-key-cache.patch",
+      "sha256": "fa804a1707ac8ffcd8f94f5cd47ab279ffbf24c32e69315ad53565c80cf9191c"
+    },
+    {
+      "name": "0583-json-parse-doubles-by-the-exact-fast-path.patch",
+      "sha256": "f15d433ddaa398892369b91e0f7b7badec632aa5450543827b4352086d3aef8e"
+    },
+    {
+      "name": "0584-shortest-double-to-string-by-one-exact-division-for-short-decimals.patch",
+      "sha256": "4971ba13769901c2f1292f5c811bd2621f184373527696e332bb7e877697b49f"
+    },
+    {
+      "name": "0585-json-stringify-walks-a-plain-objects-shape.patch",
+      "sha256": "b41f52e5a166a15aa4d14087a9e52bca0aae1fd26af4adbac522e5cad0872392"
+    },
+    {
+      "name": "0586-json-stringify-output-inline-and-checked-shapes-cached.patch",
+      "sha256": "d2e9b1c5005027a7d226ec69ada270a3047d2551242ad0dc203fbc6ea46e0244"
+    },
+    {
+      "name": "0587-json-parse-direct-parser-without-a-token-stream.patch",
+      "sha256": "5d5b4a01f40e82e5d974633a54aaf4916057b96e8205c48c011b86c569ce0dff"
+    },
+    {
+      "name": "0588-json-parse-plain-key-hints-and-sixteen-byte-string-scan.patch",
+      "sha256": "1f5e4838445d7aa862e13a3b70bbf6134947298cb6a669acde9369fecfb3bab9"
+    },
+    {
+      "name": "0589-json-stringify-writes-primitive-members-without-recursing-and-copies-plain-8-bit-strings-in-one-piece.patch",
+      "sha256": "e8b7ff78b6d22e465645080fc74dfe27ef56e78d7d0b6bfc3bd8a50522d6d494"
+    },
+    {
+      "name": "0590-json-parse-keeps-a-shape-chain-per-path-and-creates-each-object-with-room-for-it.patch",
+      "sha256": "5ea82e0fb3f50174459545961934ca481388be094062e158732bd8405d461a32"
+    },
+    {
+      "name": "0591-json-parse-reads-a-number-in-one-pass-and-rounds-long-doubles-with-one-long-double-operation.patch",
+      "sha256": "7c22ebf67dd235d7c7fb76ffd270866663411557de4aab2004ede25ba74c9c4f"
+    },
+    {
+      "name": "0592-portable-cycle-counter-and-stack-pointer-read-for-arm64.patch",
+      "sha256": "d6ede0e2d2ef2406db3a39dfc753b2c32f6934f83425bd20f93a4850e72c48ec"
+    },
+    {
+      "name": "0593-shortest-16-and-17-digit-doubles-in-exact-128-bit-integer-arithmetic.patch",
+      "sha256": "ef08f563abf89f40e1447e95ba5126d3c9c516918d340b3fbbe5bfd68fcd4f9a"
+    },
+    {
+      "name": "0594-json-stringify-writes-plain-keys-and-primitive-members-from-the-slot.patch",
+      "sha256": "de469dd571d5db9d80355284bc4e0faf2bbe150d8e7332e825defc6c7950612b"
+    },
+    {
+      "name": "0595-json-parse-reads-an-expected-plain-key-and-its-string-or-number-value-in-place.patch",
+      "sha256": "b47760243e7e431f9fb2e6fdd8e6be51e9b9f019724e1148eedf0c7623c6b163"
+    },
+    {
+      "name": "0596-json-stringify-keeps-each-cached-shapes-key-fragments-side-by-side.patch",
+      "sha256": "700f02daeaaae1010145f7f1f2d3d9f75003b942c23eac0ca55892024f6d09d1"
+    },
+    {
+      "name": "0597-json-parse-compares-an-expected-short-key-with-one-16-byte-compare.patch",
+      "sha256": "83e1894e98cbba9a8ecfaaa33ee0f73967fa21270f10b92b239b595b29ec3de5"
+    },
+    {
+      "name": "0598-json-parse-takes-the-expected-key-path-for-literals-and-nested-values.patch",
+      "sha256": "966be94e5f3964836ace4d9bee4f66e2d03b41232ed7ea5b3e11b2ed0d3dc52f"
+    },
+    {
+      "name": "0599-shortest-16-and-17-digit-doubles-from-one-exact-128-bit-step.patch",
+      "sha256": "78e4afc5026bd1ec675af7a6aa06c701b29fba41db2970961e29b1e302fd8914"
+    },
+    {
+      "name": "0600-remove-lazy-json-parse.patch",
+      "sha256": "a907fb2145b06d9dd176df8b071e18a4ede980bbd3e15f086cf113d865b6e44a"
+    },
+    {
+      "name": "0601-shortest-decimal-of-a-power-of-two-tries-the-neighbour-across-d.patch",
+      "sha256": "3e38817111e8f76d1aee35a9558dce005137fe5d405514c9af65045d814b89b8"
+    },
+    {
+      "name": "0602-replace-length-helper-only-in-aot-builds.patch",
+      "sha256": "18d0855d9a2e7ee6e6c7ba95467763157f055f602f5581026da388c538b65f71"
+    },
+    {
+      "name": "0603-gcc-and-single-step-register-vm-builds-compile-again.patch",
+      "sha256": "31dbdda6b272726fd4d2f2a4b0e47759d418b7e15926194b0798df94f53c75b8"
+    },
+    {
+      "name": "0604-store-replayed-from-the-shared-add-table-is-profiled-and-releases-its-shape.patch",
+      "sha256": "9232be1d95a27571eac8d5faeea56175cb2a5836886134c22e76b12d9d95ec39"
+    },
+    {
+      "name": "0605-profile-notes-of-freed-shapes-are-deleted.patch",
+      "sha256": "9f11650857630512abf5e6a1c39a4c6652ea50ab464f5c7f5b3871dfbebfb28e"
+    },
+    {
+      "name": "0606-sites-leave-shapes-with-a-deleted-property-unhashed.patch",
+      "sha256": "c81be10d725e072e61da4bbc5213474b0180baa3a305b70b7722cf84fc1102b2"
+    },
+    {
       "name": "9999-bc-version-bump.patch",
       "sha256": "efc679bdc9c8b3e2dfbbd88544d87e820096c53f8dfb0bb35100254cc393451f"
     }
   ],
   "files": {
-    "quickjs.c": "a5faff594676aa50353ae8e266967d5143eecbc5992acf79cc0640b221206c9f",
-    "libregexp.c": "cb6a62b9e453cd5f13924aeb9ef874d923f80fed7909b5cbd29ad721c31790e3",
+    "quickjs.c": "db9943140b9e183b0c88cc61beb903a0be47e19b4728efe879b4c1f80342e6a0",
+    "libregexp.c": "0ca74b5c529cd04a9d63b4be23dc3122d00a1bc52b9bf171ea0ef024cc7f8075",
     "libunicode.c": "d755606498ff707dc3a93826713c749f77b9222d8a6b066621d72a308460bf2d",
-    "dtoa.c": "4a83270c607eca93f30f5d906faf5df859164ae59c2c863ff52a7bbe41381046",
+    "dtoa.c": "f1d45dca054a7b01fb85f75037674be8d793b101e87564f90d4c17b21b3c79ae",
     "builtin-array-fromasync.h": "f88d0ca977755819a17b6c611a64309ca230dd0cb2d5ce7c1f0ee2dfc689d27a",
     "builtin-array-fromasync.regvm.h": "481b1fcc19c8a439f9c8ace3b309e83fe3c01ecdb3e9a0e833f10b5b81027874",
     "builtin-iterator-zip-keyed.h": "e6e902b6b5714366f5497816c23a6277686a68f42a99787753d24a094edbff3c",
@@ -2142,7 +2298,8 @@
     "dtoa.h": "1c4a4540c0038632c8a4c225472fbc21bd476fb35c4da4a857a11965b58231b9",
     "libregexp-opcode.h": "2a98d646089f3a72f25480116297c5fdb5b28fd9f815447273951f4ade4a115e",
     "libregexp-backtrack.c.inc": "7ebca3788b6431265ca6a0da7a6cbe64cfc0d864b8c45109f4a179cff386c63e",
-    "libregexp.h": "932cd9cfc23e5b9580e8ad8c5569a69422707160cb2869cbced3fb4f51ad3026",
+    "libregexp-exec.h": "e03dcf1f53cf930b592677aa12d6c38129ac817d0c44b55de3a934ab83b59b20",
+    "libregexp.h": "e311af9adadf8d14047ba88d9f4104e9041669c139cdf28520ca88ee859aed0d",
     "libunicode-table.h": "5840a921ac11664b505ee37b1219f518fff2a04972fe848b4bdf1e85c5a0bd83",
     "libunicode.h": "ad13f66aaea3fab1616e84b9c048f2a315e1bdbab628b966617a7a3e55bcba2b",
     "list.h": "cb6e24e8ee54bccdd66234fe54cd702d1160b9841db2b9b9adeb5003afe301d5",
@@ -2150,7 +2307,7 @@
     "quickjs-c-atomics.h": "29883c742a5c512278fce54d19b1b9af949006e1d7dfc9ffa2e0946b184d8c5c",
     "quickjs-opcode.h": "8fdc4a83ce25e4368288dc8ddf7f8b8be376d643ff01dd91bb5fdcf0c9fcbc73",
     "quickjs-regvm.h": "aa59094dc26b68e27d92fdb4c34d86ea32dad8a785eb9ba6415d1ba1496cf7c5",
-    "quickjs.h": "04c62a4ca6cc11b258776596f5be54b05579f13160a5a22b23ac2f46b3af9377",
+    "quickjs.h": "5e31da3f4717e3d8205ccf0740e0d1b84160edca46d6cade165aa3cca04ac369",
     "LICENSE": "96f73f9d2a16c21a36b418f06073be26e7d6d5e7c1bc99756b21a4f2c74ef171"
   }
 }

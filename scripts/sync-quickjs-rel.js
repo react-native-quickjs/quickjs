@@ -62,6 +62,7 @@ const FILES = [
   'dtoa.h',
   'libregexp-opcode.h',
   'libregexp-backtrack.c.inc',
+  'libregexp-exec.h',
   'libregexp.h',
   'libunicode-table.h',
   'libunicode.h',

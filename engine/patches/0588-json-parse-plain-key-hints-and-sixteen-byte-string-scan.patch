@@ -1,0 +1,184 @@
+Subject: JSON.parse matches an expected key with one memcmp and scans string bodies sixteen bytes at a time
+
+What this does
+  - `JSONShapeCache.plain`: per cached key, whether its atom is an 8-bit string of bytes a JSON key holds unescaped (`json_atom_plain`, computed once when the key enters the chain); only such keys are passed as the expected-key hint, and `json_parse_key_string` then needs only the closing quote and a memcmp
+  - `json_scan_plain`: the end of a run a JSON string copies as it is (quote, backslash, control character, a byte >= 0x80 unless Latin-1 input), sixteen bytes at a time with SSE2, never reading past the input's end; used by both loops of `json_parse_string`
+
+Why we need it
+  After 0587 the key match (a five-condition test per byte) and the byte-at-a-time string scan were 20% of parse cycles on the app-traffic benchmark. json_app parse only: -6.0% cycles, -6.6% instructions.
+
+Soundness
+  A plain key's bytes are each accepted by the general key scan, so equal input bytes followed by a quote are a key the scan would read as the same atom. The vector test is the scalar one (signed compare below 0x20 catches control characters and bytes >= 0x80; the Latin-1 form masks the latter out) and the first set bit is the first such byte; the loop runs only while sixteen bytes remain. Differentials identical: 49,200 strings and keys with each special byte (quote, backslash, escape, 0x01, 0x1f, 0x7f, 0x80, é, ÿ, €) at every position of lengths 0-39, complete and truncated; and all earlier JSON differentials.
+
+diff --git a/quickjs.c b/quickjs.c
+index 323f250..2108cc4 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -49286,6 +49286,7 @@ typedef struct JSONShapeCache {
+     int n;              /* number of valid transitions (keys) */
+     int cap;
+     JSAtom *atoms;      /* atoms[k] = the k-th key */
++    uint8_t *plain;     /* plain[k]: atoms[k] is an 8-bit string of bytes a key needs no escape for (printable ASCII, no quote or backslash) */
+     JSShape **shapes;   /* shapes[k] = shape after k keys; shapes[n] is valid */
+ } JSONShapeCache;
+ 
+@@ -49308,6 +49309,7 @@ typedef struct JSParseState {
+     bool json_key_mode;
+     bool json_latin1;   /* JSON.parse of an 8-bit string's own bytes: a byte >= 0x80 is that code point, not UTF-8 */
+     JSAtom json_key_hint; /* JSON.parse: the key the shape being built expects next (only during json_next_key_token) */
++    bool json_key_hint_plain; /* ... and its string needs no escape, so the input only has to hold the same bytes */
+     JSAtom *json_kcache;  /* JSON.parse: JSON_KCACHE_N recent keys by a hash of their bytes (each holds a count), allocated at the first key */
+ 
+     /* JSON.parse shape-reuse cache, indexed by object nesting depth */
+@@ -50698,6 +50700,36 @@ static int json_parse_error(JSParseState *s, const uint8_t *curp, const char *ms
+                           msg, position, line, (int)(p - line_start) + 1);
+ }
+ 
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
++
++/* The first byte in [q, end) that ends a run a JSON string copies as it is: a quote, a backslash, a control character, or (unless
++   latin1) a byte >= 0x80; `end` when there is none. Sixteen bytes at a time where SSE2 is there, never reading past `end`. */
++static inline const uint8_t *json_scan_plain(const uint8_t *q, const uint8_t *end, bool latin1)
++{
++#if defined(__SSE2__)
++    const __m128i vq = _mm_set1_epi8('"'), vb = _mm_set1_epi8('\\'), v20 = _mm_set1_epi8(0x20), z = _mm_setzero_si128();
++    while (end - q >= 16) {
++        __m128i x = _mm_loadu_si128((const __m128i *)q);
++        /* signed compare: < 0x20 is a control character or (as a negative) a byte >= 0x80 */
++        __m128i lo = _mm_cmplt_epi8(x, v20);
++        __m128i m;
++        int mask;
++        if (latin1)
++            lo = _mm_andnot_si128(_mm_cmplt_epi8(x, z), lo);
++        m = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(x, vq), _mm_cmpeq_epi8(x, vb)), lo);
++        mask = _mm_movemask_epi8(m);
++        if (mask)
++            return q + __builtin_ctz(mask);
++        q += 16;
++    }
++#endif
++    while (q < end && *q != '"' && *q != '\\' && *q >= 0x20 && (*q < 0x80 || latin1))
++        q++;
++    return q;
++}
++
+ static int json_parse_string(JSParseState *s, const uint8_t **pp)
+ {
+     const uint8_t *p, *p_next;
+@@ -50710,9 +50742,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
+     /* Fast path: a pure-ASCII string with no escapes can be built directly from
+        the source range, skipping the StringBuffer entirely. */
+     {
+-        const uint8_t *q = p;
+-        while (q < s->buf_end && *q != '"' && *q != '\\' && *q >= 0x20 && (*q < 0x80 || s->json_latin1))
+-            q++;
++        const uint8_t *q = json_scan_plain(p, s->buf_end, s->json_latin1);
+         if (q < s->buf_end && *q == '"') {
+             JSValue str = js_new_string8_len(s->ctx, (const char *)p, q - p);
+             if (JS_IsException(str))
+@@ -50735,9 +50765,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
+ 
+         // Fast path: batch consecutive ASCII characters
+         const uint8_t *p_start = p;
+-        while (p < s->buf_end && *p != '"' && *p != '\\' && *p >= 0x20 && (*p < 0x80 || s->json_latin1)) {
+-            p++;
+-        }
++        p = json_scan_plain(p, s->buf_end, s->json_latin1);
+ 
+         // Write batched ASCII in one call
+         if (p > p_start) {
+@@ -50837,15 +50865,10 @@ static int json_parse_key_string(JSParseState *s, const uint8_t **pp)
+        accepts (printable ASCII, no quote, no backslash), then the closing quote */
+     if (s->json_key_hint != JS_ATOM_NULL && !__JS_AtomIsTaggedInt(s->json_key_hint)) {
+         JSString *ap = s->ctx->rt->atom_array[s->json_key_hint];
+-        if (!ap->is_wide_char && (size_t)(s->buf_end - start) > ap->len) {
+-            const uint8_t *q = str8(ap);
+-            uint32_t i, n = ap->len;
+-            for (i = 0; i < n; i++) {
+-                uint8_t c = q[i];
+-                if (c != start[i] || c < 0x20 || c >= 0x80 || c == '"' || c == '\\')
+-                    break;
+-            }
+-            if (i == n && start[n] == '"') {
++        /* a hint is only ever a plain key (JSONShapeCache.plain), so equal bytes are bytes the scan accepts */
++        if ((size_t)(s->buf_end - start) > ap->len) {
++            uint32_t n = ap->len;
++            if (start[n] == '"' && memcmp(str8(ap), start, n) == 0) {
+                 s->token.val = TOK_IDENT;
+                 s->token.u.ident.atom = JS_DupAtom(s->ctx, s->json_key_hint);
+                 s->token.u.ident.has_escape = false;
+@@ -51395,7 +51418,7 @@ static int json_next_key_token(JSParseState *s)
+ /* The key read next with the one the depth's shape cache expects at position k as a hint (json_parse_key_string checks it byte for byte) */
+ static int json_next_key_token_hint(JSParseState *s, const JSONShapeCache *c, int k)
+ {
+-    if (c && c->atoms && k < c->n)
++    if (c && c->atoms && k < c->n && c->plain[k])
+         s->json_key_hint = c->atoms[k];
+     return json_next_key_token(s);
+ }
+@@ -105938,6 +105961,7 @@ static void json_shape_cache_free(JSContext *ctx, JSParseState *s)
+             js_free(ctx, c->shapes);
+         }
+         js_free(ctx, c->atoms);
++        js_free(ctx, c->plain);
+     }
+     js_free(ctx, s->json_shapes);
+     s->json_shapes = NULL;
+@@ -105984,6 +106008,12 @@ static int json_shape_cache_reserve(JSContext *ctx, JSONShapeCache *c, int n)
+     if (!na)
+         return -1;
+     c->atoms = na;
++    {
++        uint8_t *np = js_realloc(ctx, c->plain, newcap);
++        if (!np)
++            return -1;
++        c->plain = np;
++    }
+     ns = js_realloc(ctx, c->shapes, sizeof(JSShape *) * (newcap + 1));
+     if (!ns)
+         return -1;
+@@ -106013,6 +106043,25 @@ static int json_obj_adopt_shape(JSContext *ctx, JSObject *p, JSShape *new_sh,
+     return 0;
+ }
+ 
++/* Whether the atom is an 8-bit string whose every byte a JSON key holds unescaped (printable ASCII, no quote, no backslash). */
++static bool json_atom_plain(JSContext *ctx, JSAtom a)
++{
++    JSString *ap;
++    const uint8_t *q;
++    uint32_t i;
++
++    if (__JS_AtomIsTaggedInt(a))
++        return false;
++    ap = ctx->rt->atom_array[a];
++    if (ap->is_wide_char)
++        return false;
++    q = str8(ap);
++    for (i = 0; i < ap->len; i++)
++        if (q[i] < 0x20 || q[i] >= 0x80 || q[i] == '"' || q[i] == '\\')
++            return false;
++    return true;
++}
++
+ /* The shape cache of `depth` for a new object being built (see JSONShapeCache): *matched when the cached chain starts at its shape. */
+ static JSONShapeCache *json_obj_begin(JSContext *ctx, JSParseState *s, int depth, JSObject *jsobj, int *matched)
+ {
+@@ -106073,6 +106122,7 @@ static int json_obj_add(JSContext *ctx, JSParseState *s, int depth, JSValue val,
+         if (ret >= 0 && jsc && jsc->n == k) {
+             if (json_shape_cache_reserve(ctx, jsc, k + 1) == 0) {
+                 jsc->atoms[k] = JS_DupAtom(ctx, prop_name);
++                jsc->plain[k] = json_atom_plain(ctx, prop_name);
+                 jsc->shapes[k + 1] = js_dup_shape(jsobj->shape);
+                 jsc->n = k + 1;
+             }
+@@ -106437,7 +106487,7 @@ static int json_fast_value(JSParseState *s, const uint8_t **pp, int depth, JSVal
+                     if (*p != '"')
+                         goto obj_fail;
+                     p++;
+-                    if (jsc && matched && jsc->atoms && k < jsc->n)
++                    if (jsc && matched && jsc->atoms && k < jsc->n && jsc->plain[k])
+                         s->json_key_hint = jsc->atoms[k];
+                     if (json_parse_key_string(s, &p)) {
+                         s->json_key_hint = JS_ATOM_NULL;

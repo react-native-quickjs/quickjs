@@ -1,0 +1,67 @@
+Subject: Native entries seal the caller's light frame before running
+
+What this does
+  - Every place that calls a unit's native entry (aot_nfn) directly from C (JS_CallInternal, JS_Call, the construct fast path, the Array.prototype.sort comparator call) now seals the current register frame first through regvm_light_seal_out (an out-of-line wrapper, so the hot call paths carry one test and a call), as the other call paths already do.
+
+Why we need it
+  A light interpreter frame sits above the arena top until it is sealed. The native entry's step operations (construct, calls) take frames from the arena top, so a frame they allocated overwrote the live light caller. The caller then read its registers back as garbage: a closure variable came out wrong, an inline cache handler ran on a garbage record, and box2d crashed or threw TypeErrors on 'm_flags' and 'm_pointCount' when the hot-cover selection left a constructor compiled and its caller interpreted.
+
+Soundness
+  regvm_light_seal only raises the arena top over a frame that is already live; it changes nothing when the frame is already covered and is a no-op without the record call path.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -33476,6 +33476,13 @@
+     }
+ }
+ 
++/* The seal for the native-entry call sites in the call machinery, kept out of
++   line so those hot paths carry one test and a call. */
++static __attribute__((noinline)) void regvm_light_seal_out(JSRuntime *rt, JSRegRun *lf)
++{
++    regvm_light_seal(rt, lf);
++}
++
+ /* Build the callee light frame and return it, or NULL when the chunk is full.
+    Inlined into both handlers. */
+ static __attribute__((always_inline)) inline JSRegRun *
+@@ -43561,6 +43568,8 @@
+             JSValue aot_ret;
+             js_aot_enter_count++;
+             Y_FORMLESS_ARGS(this_obj, argv, argc);
++            if (rt->regvm_cur != NULL)
++                regvm_light_seal_out(rt, rt->regvm_cur);
+             aot_ret = ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
+                                              (JSValue *)argv, argc);
+             return aot_ret;
+@@ -47173,6 +47182,8 @@
+                 if (js_poll_interrupts(ctx))
+                     return JS_EXCEPTION;
+                 Y_FORMLESS_ARGS(this_obj, argv, argc);
++                if (rt->regvm_cur != NULL)
++                    regvm_light_seal_out(rt, rt->regvm_cur);
+                 res = ((JSAotNFn)b->aot_nfn)(ctx, rt->regvm_cur, p, this_obj, (JSValue *)argv, argc);
+                 if (rt->current_stack_frame == NULL && regvm_light_head(rt->regvm_cur) == NULL)
+                     js_drc_safepoint(rt);
+@@ -72605,10 +72616,11 @@
+     }
+     init = (JSObject *)wc[AOT_WC_INIT];
+     cb2 = init->u.func.function_bytecode;
+-    if (cb2->aot_nfn != NULL && argc >= cb2->arg_count)
++    if (cb2->aot_nfn != NULL && argc >= cb2->arg_count) {
++        regvm_light_seal_out(ctx->rt, caller_f);
+         ret = ((JSValue (*)(JSContext *, JSRegRun *, JSObject *, JSValue, JSValue *, int))cb2->aot_nfn)(
+             ctx, caller_f, init, thisv, argv, argc);
+-    else
++    } else
+         ret = JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, init), thisv, argc, vc(argv));
+     if (JS_IsException(ret))
+         return ret;
+@@ -96621,6 +96633,7 @@
+                         !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1)))) {
+                 if (js_poll_interrupts(ctx))
+                     goto exception;
++                regvm_light_seal_out(rt, rt->regvm_cur);
+                 res = ((JSAotNFn)b->aot_nfn)(ctx, rt->regvm_cur, JS_VALUE_GET_OBJ(psc->method),
+                                              JS_UNDEFINED, (JSValue *)argv, 2);
+             } else {

@@ -31,11 +31,9 @@ K() {
   fi
 }
 
-# Same as K, but with lazy JSON enabled. Lazy JSON needs a document of at least
-# 4096 bytes, so these kernels pad the text. Without this the lazy-marker paths
-# (a marker that survives in a property slot, and a second object sharing the
-# shape of an object whose slot was already materialised) are not covered at
-# all: the default QJS_JSON_LAZY is 0.
+# Same as K, for kernels over JSON documents of at least 4096 bytes. (They were
+# written for the removed lazy JSON.parse; QJS_JSON_LAZY is ignored now, and they
+# remain as large-document regression kernels for the eager parser.)
 KLAZY() {
   name="$1"; k="$2"; shift 2
   s=$(QJS_JSON_LAZY=1 timeout 20 "$STACK" "$k" "$@" 2>&1); se=$?
@@ -486,7 +484,7 @@ K readonly-frozen-strict 'function(n){ "use strict"; var o = Object.freeze({}); 
 K readonly-frozen-elem 'function(n){ "use strict"; var o = Object.freeze({}); try { o["x"] = 1; return "no-throw"; } catch(err) { return err.constructor.name; } }' 0
 
 # Work A: property-cache correctness gates. Keep these ahead of PIC changes;
-# run the lazy-JSON kernel with QJS_JSON_LAZY=1 so JSON.parse creates lazy slots.
+# the large-document JSON kernel runs through KLAZY.
 K a-proto-getter-add 'function(n){ var p = {}; var o = Object.create(p); Object.defineProperty(p, "x", { configurable: true, get: function(){ return 3; } }); function read(v){ return v.x; } var a = read(o) + read(o); Object.defineProperty(p, "x", { configurable: true, get: function(){ return 8; } }); return a + ":" + read(o); }' 0
 K a-delete-readd 'function(n){ var o = { x: 4 }; function read(v){ return v.x; } var a = read(o) + read(o); delete o.x; o.x = 9; return a + ":" + read(o); }' 0
 K a-shared-shape-mutate 'function(n){ var a = { x: 2, y: 3 }, b = { x: 5, y: 6 }; function read(v){ return v.x; } var before = read(a) + read(b); b.z = 10; b.x = 11; return before + ":" + read(a) + ":" + read(b); }' 0

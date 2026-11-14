@@ -1,0 +1,21 @@
+Subject: A form-less unit's body entered from js_regvm_execute promotes the caller's this and arguments
+
+What this does
+  - The AOT entry in js_regvm_execute, in a build whose unit has no young-cell forms (y_formless), already promoted the nursery cells held in the callee's registers. It now also promotes the cells named by `this_obj` and `argv` (Y_FORMLESS_ARGS), the values the compiled body reads from the argument buffer and the frame's this slot rather than from its registers.
+
+Why we need it
+  A compiled constructor entered through `new` from interpreted code (JS_CallConstructorInternal -> js_regvm_execute) read a nursery argument from the argument buffer and stored it in `this` with a counted reference. The cell was never promoted nor recorded as a root, so the next collection freed a live object: gc_decref_child assertion (`JS_REF_COUNT(p) > 0`), QJS_Y_STRICT reports the plain object holding an unpromoted nursery cell. It appeared once the hot-cover selection left a constructor (typescript SymbolScopeBuilder) compiled and its callers interpreted; a minimal case is `function D(a){this.a=a}` compiled and `new D({x:i})` interpreted.
+
+Soundness
+  Only runs when y_formless is set and the entry is at pc 0; promoting a young cell early is always safe (it is what the register loop next to it does).
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -38004,6 +38004,7 @@
+                 js_aot_enter_count++;
+                 if (unlikely(y_formless) && aot_entry_pc == 0) {
+                     int nr = regvm_frame_regs(b), k;
++                    Y_FORMLESS_ARGS(this_obj, argv, argc);
+                     for (k = 0; k < nr; k++)
+                         if (JS_VALUE_GET_TAG(regs[k]) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(regs[k])) && Y_YOUNG(JS_VALUE_GET_PTR(regs[k])))
+                             y_promote_now(JS_VALUE_GET_OBJ(regs[k]));

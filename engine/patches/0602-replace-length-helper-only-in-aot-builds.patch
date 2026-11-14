@@ -1,0 +1,19 @@
+Subject: Replace-length helper only in AOT builds
+
+What this does
+  qjs_aot_replace_len (0580) is compiled only when QJS_AOT is set, like the other compiled-code entry points.
+
+Why we need it
+  Its QJS_AOT_STUB attribute comes from quickjs-aot-rt.h, which only AOT builds include, so every build without QJS_AOT (the register VM CMake build, the test262 runner, the React Native library) stopped compiling at 0580 with "unknown type name 'QJS_AOT_STUB'".
+
+Soundness
+  Its only caller is code the generator emits, which links against an AOT engine. Nothing else changes.
+
+diff --git a/quickjs.c b/quickjs.c
+index 1ad9452..6c6182c 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -104968,0 +104969 @@ static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx)
++#if QJS_AOT
+@@ -105023,0 +105025 @@ QJS_AOT_STUB int qjs_aot_replace_len(JSContext *ctx, JSValue this_val, JSValue r
++#endif

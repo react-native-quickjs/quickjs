@@ -1,0 +1,94 @@
+Subject: JSON.parse compares an expected key of up to 14 bytes with one 16-byte compare
+
+What this does
+  - `JSONShapeCache.k16`: for each chain key that is plain and at most 14 bytes, its bytes, its closing quote, zeros, and its length in byte 15, written when the chain is extended (`plain[k]` is then 2)
+  - the direct parser's expected-key test (0595) compares the input with that slot in one SSE2 compare and checks the first length + 1 lanes, when 16 input bytes remain; otherwise, and without SSE2, the byte comparison against the atom's string as before
+
+Why we need it
+  The expected-key test read each key's atom string header (scattered, often a cache miss) and called memcmp. json_app parse only: -2.5% to -3% cycles over two runs, -2.5% instructions.
+
+Soundness
+  Lanes 0..n of the slot are the key's n bytes and its quote, so a full match of those lanes is exactly the old test (bytes equal, then a quote). The load reads 16 input bytes only when at least 16 remain; the slot is 16 bytes. Slots are written with the chain's atoms and are only read for k < n, where plain[k] was set with them. Differentials identical old vs new: new jk16.js (5,040 inputs: warm chains with keys of 0-20 bytes, inputs with the key extended, shortened, last byte changed, escaped, padded, near the end of input and truncated), jrec, jslot, jdiff, jdiff2, jedge, jscan, jnum.
+
+diff --git a/quickjs.c b/quickjs.c
+index 0d85765..ea541bb 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -49469,7 +49469,9 @@ typedef struct JSONShapeCache {
+     int n;              /* number of valid transitions (keys) */
+     int cap;
+     JSAtom *atoms;      /* atoms[k] = the k-th key */
+-    uint8_t *plain;     /* plain[k]: atoms[k] is an 8-bit string of bytes a key needs no escape for (printable ASCII, no quote or backslash) */
++    uint8_t *plain;     /* plain[k]: atoms[k] is an 8-bit string of bytes a key needs no escape for (printable ASCII, no quote or backslash);
++                           2 when also k16[k] holds it */
++    uint8_t (*k16)[16]; /* k16[k]: a plain key of at most 14 bytes, its closing quote, zeros, and its length in byte 15 */
+     JSShape **shapes;   /* shapes[k] = shape after k keys; shapes[n] is valid */
+ } JSONShapeCache;
+ 
+@@ -106145,6 +106147,7 @@ static void json_shape_cache_free(JSContext *ctx, JSParseState *s)
+         }
+         js_free(ctx, c->atoms);
+         js_free(ctx, c->plain);
++        js_free(ctx, c->k16);
+     }
+     js_free(ctx, s->json_shapes);
+     s->json_shapes = NULL;
+@@ -106197,6 +106200,12 @@ static int json_shape_cache_reserve(JSContext *ctx, JSONShapeCache *c, int n)
+             return -1;
+         c->plain = np;
+     }
++    {
++        uint8_t (*nk)[16] = js_realloc(ctx, c->k16, sizeof(*nk) * newcap);
++        if (!nk)
++            return -1;
++        c->k16 = nk;
++    }
+     ns = js_realloc(ctx, c->shapes, sizeof(JSShape *) * (newcap + 1));
+     if (!ns)
+         return -1;
+@@ -106314,6 +106323,16 @@ static int json_obj_add(JSContext *ctx, JSParseState *s, int depth, JSValue val,
+             if (json_shape_cache_reserve(ctx, jsc, k + 1) == 0) {
+                 jsc->atoms[k] = JS_DupAtom(ctx, prop_name);
+                 jsc->plain[k] = json_atom_plain(ctx, prop_name);
++                if (jsc->plain[k]) {
++                    JSString *ap = ctx->rt->atom_array[prop_name];
++                    if (ap->len <= 14) {
++                        memset(jsc->k16[k], 0, 16);
++                        memcpy(jsc->k16[k], json_str8(ap), ap->len);
++                        jsc->k16[k][ap->len] = '"';
++                        jsc->k16[k][15] = (uint8_t)ap->len;
++                        jsc->plain[k] = 2;
++                    }
++                }
+                 jsc->shapes[k + 1] = js_dup_shape(jsobj->shape);
+                 jsc->n = k + 1;
+             }
+@@ -106694,10 +106713,25 @@ static int json_fast_value(JSParseState *s, const uint8_t **pp, int depth, JSVal
+                        store (a string or number reader touches no shape cache) */
+                     if (jsc && matched && k < jsc->n && jsc->plain[k] && jsc->shapes[k] == jsobj->shape &&
+                         jsc->shapes[k + 1] != jsc->shapes[k]) {
+-                        JSString *ap = ctx->rt->atom_array[jsc->atoms[k]];
+-                        uint32_t n = ap->len;
++                        uint32_t n;
+                         const uint8_t *q;
+-                        if ((size_t)(s->buf_end - p) > n + 1 && p[n] == '"' && memcmp(json_str8(ap), p, n) == 0) {
++                        bool kmatch;
++#if defined(__SSE2__)
++                        if (jsc->plain[k] == 2 && s->buf_end - p >= 16) {
++                            /* the key and its closing quote against the stored 16 bytes, one compare */
++                            unsigned mask;
++                            n = jsc->k16[k][15];
++                            mask = (2u << n) - 1;
++                            kmatch = (_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i *)p),
++                                                                       _mm_loadu_si128((const __m128i *)jsc->k16[k]))) & mask) == mask;
++                        } else
++#endif
++                        {
++                            JSString *ap = ctx->rt->atom_array[jsc->atoms[k]];
++                            n = ap->len;
++                            kmatch = (size_t)(s->buf_end - p) > n + 1 && p[n] == '"' && memcmp(json_str8(ap), p, n) == 0;
++                        }
++                        if (kmatch) {
+                             q = json_fast_ws(p + n + 1);
+                             if (*q == ':') {
+                                 q = json_fast_ws(q + 1);

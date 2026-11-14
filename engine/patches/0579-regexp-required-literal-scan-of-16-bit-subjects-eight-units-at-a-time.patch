@@ -1,0 +1,82 @@
+Subject: The regexp required-literal and first-character scans of a 16-bit subject compare eight units at a time
+
+What this does
+  - new `js_regexp_find_u16` (SSE2 compare of eight 16-bit units, scalar tail and scalar where SSE2 is absent; `emmintrin.h` included under `__SSE2__` beside it)
+  - `js_regexp_find_literal` on a 16-bit subject without case folding searches the literal's rarest unit with it and checks the whole literal around each hit; with case folding the scalar loop stays
+  - `js_regexp_indexof_char_range` uses it for 16-bit subjects
+
+Why we need it
+  The 16-bit branch of `js_regexp_find_literal` was a scalar loop and was the hottest part of the function (5.5% of the regexp row at fixed work). Regexp row -4.5% cycles, -6.6% instructions.
+
+Soundness
+  Same candidates in the same order, each checked by the unchanged `js_regexp_lit_at`; the vector loop returns the first equal unit. 1260 cases of 16-bit subjects with required literals at every offset (lengths 0-69, three phases, six literals incl. non-Latin-1) equal an `indexOf` reference; the row checksum passes.
+
+diff --git a/quickjs.c b/quickjs.c
+index c07a545..f356342 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -102586,6 +102586,29 @@ static inline bool js_regexp_atom_starts_at(JSString *str, int start,
+     return true;
+ }
+ 
++#if defined(__SSE2__)
++#include <emmintrin.h>
++#endif
++/* Index of the first unit equal to c in s[0..n), or -1, eight units at a time where SSE2 is there. */
++static inline int js_regexp_find_u16(const uint16_t *s, unsigned c, int n)
++{
++    int i = 0;
++#if defined(__SSE2__)
++    {
++        __m128i vc = _mm_set1_epi16((short)c);
++        for (; i + 8 <= n; i += 8) {
++            int mask = _mm_movemask_epi8(_mm_cmpeq_epi16(_mm_loadu_si128((const __m128i *)(s + i)), vc));
++            if (mask)
++                return i + (__builtin_ctz((unsigned)mask) >> 1);
++        }
++    }
++#endif
++    for (; i < n; i++)
++        if (s[i] == c)
++            return i;
++    return -1;
++}
++
+ /* Return the first index in [from, to) where character 'c' occurs, or -1. */
+ static inline int js_regexp_indexof_char_range(JSString *str, int c,
+                                                      int from, int to)
+@@ -102595,10 +102618,8 @@ static inline int js_regexp_indexof_char_range(JSString *str, int c,
+     if (str->is_wide_char) {
+         if (c > 0xffff)
+             return -1;
+-        for(i = from; i < to; i++) {
+-            if (str16(str)[i] == c)
+-                return i;
+-        }
++        i = js_regexp_find_u16(str16(str) + from, (unsigned)c, to - from);
++        return i < 0 ? -1 : from + i;
+     } else if ((c & ~0xff) == 0) {
+         const uint8_t *p = memchr(str8(str) + from, c, to - from);
+ 
+@@ -102998,6 +103019,21 @@ static int js_regexp_find_literal(const JSReReq *e, JSString *str, int from)
+         return -1;
+     } else {
+         const uint16_t *s = str16(str);
++        if (!ci) {
++            /* the rare unit by vector search, then the literal around it */
++            int lim = n - m + 1;
++            i = from;
++            while (i < lim) {
++                int k = js_regexp_find_u16(s + i + r, u, lim - i);
++                if (k < 0)
++                    return -1;
++                i += k;
++                if (js_regexp_lit_at(e, str, i))
++                    return i;
++                i++;
++            }
++            return -1;
++        }
+         for (i = from; i + m <= n; i++) {
+             unsigned c = s[i + r];
+             if (ci)

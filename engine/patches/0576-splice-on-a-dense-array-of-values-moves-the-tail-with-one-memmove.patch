@@ -1,0 +1,55 @@
+Subject: `Array.prototype.splice` on a dense array of values moves the tail with one memmove
+
+What this does
+  - in `js_array_slice`'s splice tail, when the receiver is an extensible dense fast array of `JSValue`s (not packed int32/double, not holey) whose count equals its length, the deleted run is released, the tail is moved with `memmove`, the inserted values are stored, and the count is set; growth goes through `expand_fast_array`
+  - every other receiver keeps the `JS_CopySubArray` / delete / `JS_SetPropertyInt64` path
+
+Why we need it
+  Packed arrays already had `js_arr_packed_splice`; arrays holding mixed values went through `JS_CopySubArray` element by element (3.3% of pdfjs, from the Type1 charstring flattening).
+
+Soundness
+  The removed values were already copied into the result array before this point; the stores replace slots the move left stale; frozen, sealed and non-extensible arrays and arrays with accessors or holes fail `js_get_fast_array` or the `extensible` test and keep the generic path.
+
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -96289,8 +96289,30 @@
+         goto exception;
+ 
+     if (splice) {
++        JSValue *sp_vals;
++        uint32_t sp_count;
++        bool sp_fast = false;
++
+         new_len = len + item_count - del_count;
+-        if (item_count != del_count) {
++        /* A dense array of values with the deleted run already copied out: the tail moves in one memmove, the deleted values are
++           released, and the inserted values are stored into the slots the move left stale. */
++        if (item_count != del_count && js_get_fast_array(ctx, obj, &sp_vals, &sp_count) && sp_count == len &&
++            JS_VALUE_GET_OBJ(obj)->extensible && new_len <= INT32_MAX && start + del_count <= len &&
++            (new_len <= (int64_t)JS_VALUE_GET_OBJ(obj)->u.array.u1.size ||
++             expand_fast_array(ctx, JS_VALUE_GET_OBJ(obj), (uint32_t)new_len) == 0)) {
++            JSObject *sp = JS_VALUE_GET_OBJ(obj);
++
++            sp_vals = JS_ARR_VALS(sp);
++            for (k = start; k < start + del_count; k++)
++                JS_FreeValue(ctx, sp_vals[k]);
++            memmove(sp_vals + start + item_count, sp_vals + start + del_count,
++                    (size_t)(len - (start + del_count)) * sizeof(JSValue));
++            for (i = 0; i < item_count; i++)
++                sp_vals[start + i] = js_dup(argv[i + 2]);
++            sp->u.array.count = (uint32_t)new_len;
++            sp_fast = true;
++        }
++        if (!sp_fast && item_count != del_count) {
+             if (JS_CopySubArray(ctx, obj, start + item_count,
+                                 start + del_count, len - (start + del_count),
+                                 item_count <= del_count ? +1 : -1) < 0)
+@@ -96301,7 +96323,7 @@
+                     goto exception;
+             }
+         }
+-        for (i = 0; i < item_count; i++) {
++        for (i = 0; !sp_fast && i < item_count; i++) {
+             if (JS_SetPropertyInt64(ctx, obj, start + i, js_dup(argv[i + 2])) < 0)
+                 goto exception;
+         }

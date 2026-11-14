@@ -1,0 +1,191 @@
+Subject: JSON.stringify writes primitive members without recursing and copies plain 8-bit strings in one piece
+
+What this does
+  - `json_is_prim` / `json_put_prim`: with no replacer, an int, double, bool, null or string member of an object (shape walk) or element of an array is written straight to the buffer, skipping `js_json_check` (which returns such a value unchanged when there is no replacer) and the recursive `js_json_to_str` call with its frame setup
+  - `json_put_float64`: the double writer of `js_json_to_str`, moved out so both paths share it
+  - `json_quote_str`: an 8-bit string with nothing to escape, going into an 8-bit buffer with room for it and both quotes, is checked with `json_scan_plain` and copied with one memcpy
+
+Why we need it
+  After 0588, `js_json_to_str` (per-value frame) and `json_quote_str` (a table test and a bounds-checked write per run) were half of stringify cycles on the app-traffic benchmark. json_app stringify only: -18.3% cycles, -14.5% instructions; whole json_app -3.8% cycles.
+
+Soundness
+  `js_json_check` only looks up toJSON for objects and BigInts, and calls the replacer only when there is one; for the five tags taken here with no replacer it returns the value itself, and `js_json_to_str` writes those tags exactly as `json_put_prim` does (same integer, double, literal and quoting code). Undefined, symbols, functions, ropes, objects and BigInts still take the general path. `json_scan_plain` with latin1 set stops at exactly the bytes the table escapes (quote, backslash, < 0x20); anything else falls back to the existing loop. Differentials identical old vs new: 19,938 stringify outputs (each special byte at every position of lengths 0-39, plain, in arrays, as keys, with gaps; buffer-room boundaries; edge numbers, replacers, property lists, getters that delete or change properties, holes, toJSON on Number/String prototypes, wrappers, wide strings, BigInt errors) and all earlier JSON differentials.
+
+diff --git a/quickjs.c b/quickjs.c
+index 2108cc4..6460596 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -23879,12 +23879,28 @@ static inline __attribute__((always_inline)) int json_putc8(StringBuffer *b, uin
+     return string_buffer_putc8(b, c);
+ }
+ 
++static inline const uint8_t *json_scan_plain(const uint8_t *q, const uint8_t *end, bool latin1);
++
+ static int json_quote_str(StringBuffer *b, JSString *p)
+ {
+     char buf[16];
+     uint32_t c;
+     int i;
+ 
++    /* an 8-bit string with nothing to escape, into an 8-bit buffer with room: one scan, one copy */
++    if (!p->is_wide_char && !b->is_wide_char && b->size - b->len >= (int)p->len + 2) {
++        const uint8_t *s8 = str8(p);
++        uint32_t n = p->len;
++        if (json_scan_plain(s8, s8 + n, true) == s8 + n) {
++            uint8_t *d = str8(b->str) + b->len;
++            d[0] = '\"';
++            memcpy(d + 1, s8, n);
++            d[n + 1] = '\"';
++            b->len += n + 2;
++            return 0;
++        }
++    }
++
+     if (json_putc8(b, '\"'))
+         return -1;
+ 
+@@ -108060,6 +108076,73 @@ exception:
+     return JS_EXCEPTION;
+ }
+ 
++static int json_put_float64(StringBuffer *b, double d)
++{
++    char numbuf[JS_DTOA_MAX_DIGITS + 32];
++    JSDTOATempMem dtoa_mem;
++    int64_t i64;
++    size_t n;
++    if (!isfinite(d))
++        return string_buffer_write8(b, (const uint8_t *)"null", 4);
++    /* Integral doubles -- timestamps, ids, counts, prices in minor
++       units -- are most of the numbers in a real payload, and their
++       shortest round-trip representation is simply their digits.
++       js_dtoa reaches for multi-precision arithmetic to work that out;
++       profiling a number-heavy payload puts ~60% of the time inside
++       mpb_shr_round / mul_pow / mp_div1norm.
++
++       Exact within +/-2^53, where every integer is representable, so
++       the round trip is exact by construction. -0 takes this path and
++       prints "0", which is what Number(-0).toString() gives. */
++    if (d >= -9007199254740992.0 && d <= 9007199254740992.0 &&
++        (double)(i64 = (int64_t)d) == d) {
++        n = i64toa(numbuf, i64);
++        return string_buffer_write8(b, (const uint8_t *)numbuf, n);
++    }
++    n = js_dtoa_short(numbuf, d);
++    if (n == 0)
++        n = js_dtoa(numbuf, d, 10, 0, JS_DTOA_FORMAT_FREE, &dtoa_mem);
++    return string_buffer_write8(b, (const uint8_t *)numbuf, n);
++}
++
++/* A value js_json_check passes through unchanged when there is no replacer, and that js_json_to_str writes without recursing */
++static inline bool json_is_prim(JSValueConst v)
++{
++    switch (JS_VALUE_GET_NORM_TAG(v)) {
++    case JS_TAG_INT:
++    case JS_TAG_FLOAT64:
++    case JS_TAG_BOOL:
++    case JS_TAG_NULL:
++    case JS_TAG_STRING:
++        return true;
++    default:
++        return false;
++    }
++}
++
++/* Write a value json_is_prim accepts, as js_json_to_str does, and free it */
++static int json_put_prim(JSContext *ctx, StringBuffer *b, JSValue v)
++{
++    char numbuf[16];
++    int ret, n;
++    switch (JS_VALUE_GET_NORM_TAG(v)) {
++    case JS_TAG_INT:
++        n = i32toa(numbuf, JS_VALUE_GET_INT(v));
++        return string_buffer_write8(b, (const uint8_t *)numbuf, n);
++    case JS_TAG_FLOAT64:
++        return json_put_float64(b, JS_VALUE_GET_FLOAT64(v));
++    case JS_TAG_BOOL:
++        return JS_VALUE_GET_BOOL(v) ? string_buffer_write8(b, (const uint8_t *)"true", 4)
++                                    : string_buffer_write8(b, (const uint8_t *)"false", 5);
++    case JS_TAG_NULL:
++        return string_buffer_write8(b, (const uint8_t *)"null", 4);
++    default: /* JS_TAG_STRING */
++        ret = json_quote_str(b, JS_VALUE_GET_STRING(v));
++        JS_FreeValue(ctx, v);
++        return ret;
++    }
++}
++
+ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                           JSValueConst holder, JSValue val,
+                           JSValueConst indent)
+@@ -108142,6 +108225,11 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                 v = JS_GetPropertyInt64(ctx, val, i);
+                 if (JS_IsException(v))
+                     goto exception;
++                if (JS_IsUndefined(jsc->replacer_func) && json_is_prim(v)) {
++                    if (json_put_prim(ctx, jsc->b, v))
++                        goto exception;
++                    continue;
++                }
+ 
+                 if (!JS_IsUndefined(jsc->replacer_func) ||
+                     (JS_IsObject(v) || JS_IsBigInt(v))) {
+@@ -108214,6 +108302,21 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+                             v = JS_GetProperty(ctx, val, atom);
+                         if (JS_IsException(v))
+                             goto exception_sh;
++                        if (JS_IsUndefined(jsc->replacer_func) && json_is_prim(v)) {
++                            if (has_content)
++                                json_putc8(jsc->b, ',');
++                            if (has_gap) string_buffer_concat_value(jsc->b, sep);
++                            if (json_quote_str(jsc->b, ctx->rt->atom_array[atom])) {
++                                JS_FreeValue(ctx, v);
++                                goto exception_sh;
++                            }
++                            json_putc8(jsc->b, ':');
++                            if (has_gap) string_buffer_concat_value(jsc->b, sep1);
++                            if (json_put_prim(ctx, jsc->b, v))
++                                goto exception_sh;
++                            has_content = true;
++                            continue;
++                        }
+                         if (!JS_IsUndefined(jsc->replacer_func) || (JS_IsObject(v) || JS_IsBigInt(v))) {
+                             prop = JS_AtomToString(ctx, atom);
+                             if (JS_IsException(prop)) {
+@@ -108388,35 +108491,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
+             goto exception;
+         goto concat_value;
+     case JS_TAG_FLOAT64:
+-        {
+-
+-            double d = JS_VALUE_GET_FLOAT64(val);
+-            char numbuf[JS_DTOA_MAX_DIGITS + 32];
+-            JSDTOATempMem dtoa_mem;
+-            int64_t i64;
+-            size_t n;
+-            if (!isfinite(d))
+-                return string_buffer_write8(jsc->b, (const uint8_t *)"null", 4);
+-            /* Integral doubles -- timestamps, ids, counts, prices in minor
+-               units -- are most of the numbers in a real payload, and their
+-               shortest round-trip representation is simply their digits.
+-               js_dtoa reaches for multi-precision arithmetic to work that out;
+-               profiling a number-heavy payload puts ~60% of the time inside
+-               mpb_shr_round / mul_pow / mp_div1norm.
+-
+-               Exact within +/-2^53, where every integer is representable, so
+-               the round trip is exact by construction. -0 takes this path and
+-               prints "0", which is what Number(-0).toString() gives. */
+-            if (d >= -9007199254740992.0 && d <= 9007199254740992.0 &&
+-                (double)(i64 = (int64_t)d) == d) {
+-                n = i64toa(numbuf, i64);
+-                return string_buffer_write8(jsc->b, (const uint8_t *)numbuf, n);
+-            }
+-            n = js_dtoa_short(numbuf, d);
+-            if (n == 0)
+-                n = js_dtoa(numbuf, d, 10, 0, JS_DTOA_FORMAT_FREE, &dtoa_mem);
+-            return string_buffer_write8(jsc->b, (const uint8_t *)numbuf, n);
+-        }
++        return json_put_float64(jsc->b, JS_VALUE_GET_FLOAT64(val));
+     case JS_TAG_INT:
+         {
+             /* format integers straight into the buffer (no JSString alloc) */

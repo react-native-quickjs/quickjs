@@ -94,22 +94,12 @@ class ReactNativeDelegate: RCTDefaultReactNativeFactoryDelegate {
 
 Then run `pod install`.
 
-### Lazy JSON parsing
+### Lazy JSON parsing (removed)
 
-Lazy JSON parsing is disabled by default. To opt in without editing a Podfile
-or Gradle file, add this to the app's existing `package.json`:
-
-```json
-{
-  "react-native-quickjs": {
-    "lazyJson": true
-  }
-}
-```
-
-The iOS Podspec and Android CMake integration read the same setting. The
-low-level compile definition and `JS_SetJSONLazyEnabled()` API remain available
-to embedders; `QJS_JSON_LAZY=0/1` remains useful for tests.
+Lazy JSON parsing has been removed: `JSON.parse` is always eager, and the eager
+parser is now faster than the lazy one was. A `react-native-quickjs.lazyJson`
+key in `package.json` is ignored, and `JS_SetJSONLazyEnabled()` remains as a
+no-op for API compatibility.
 
 ## Android
 

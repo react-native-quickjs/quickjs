@@ -1,0 +1,24 @@
+Subject: A store replayed from the shared add table is profiled and releases its shape
+
+What this does
+  In regvm_put_field_ic, a store that the shared add-transition table (0572) completes no longer returns early: it goes on to the profile record and the release of the profile's pre-store shape reference, as every other store does.
+
+Why we need it
+  With QJS_AOT_PROFILE_OUT set, each replayed store leaked one reference to the receiver's pre-store shape, and with it the shape's prototype. JS_FreeRuntime then failed its `list_empty(&rt->gc_obj_list)` assertion: on box2d (check.js) 11,377 GC objects were left (shapes, the prototypes they hold, and what those reach). m1.sh build hid this because it pipes the profiling run through `tail -1`. The replayed stores were also missing from the profile.
+
+Soundness
+  The skipped work is regvm_put_pic_fill and the pre_sh release; pre_sh is still NULL on this path, and the early return skipped the fill already, so the store itself is unchanged. Only profiling builds read the new label's following block. With the fix, QJS_DEBUG_LEAK reports nothing for box2d, richards, deltablue, raytrace, typescript and earleyboyer under QJS_AOT_PROFILE_OUT.
+
+diff --git a/quickjs.c b/quickjs.c
+index f3af35d..6bf6da0 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -30146,2 +30146,4 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b,
+-                if (ah != 0)
+-                    return ah < 0 ? -1 : 0;
++                if (ah != 0) {
++                    ret = ah < 0 ? -1 : 0;
++                    goto stored;
++                }
+@@ -30167,0 +30170 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b,
++ stored:

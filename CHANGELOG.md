@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning][semver].
 
 ## [Unreleased]
 
+### Removed
+- Patch `0600`: lazy `JSON.parse` (patch `0011` and its extensions). The eager
+  parser is faster on every measured case; the marker tests it needed on every
+  property and element read are gone. The `react-native-quickjs.lazyJson`
+  package.json option is ignored and `JS_SetJSONLazyEnabled()` is a no-op.
+
 ### Changed
 - Patch `0034`: dispatches interpreter-issued calls directly to supported
   native functions while retaining the existing fallback for other callables.

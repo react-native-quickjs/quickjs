@@ -1,0 +1,222 @@
+Subject: Shortest 16 and 17 digit doubles in exact 128-bit integer arithmetic
+
+What this does
+  - `dtoa_exact_nd`: for a non-integral normal double a = m * 2^q below 2^53, the decimal of exactly nd significant digits in a's rounding interval nearest to a (ties to even), from T = 4m * 10^k in unsigned 128-bit integers: floor(a * 10^k) is T >> (2 - q) and the remainder gives the distances to it and to the next integer
+  - `js_dtoa_short` (Number.prototype.toString and JSON.stringify, 1e-6 <= |d| < 1e15): tries 15 digits exactly first; when there is no 15-digit decimal it returns the 16-, else 17-digit one, skipping the float loop and the multi-precision `js_dtoa`; otherwise the existing float loop runs as before
+  - `dtoa_fixed_out`: the fixed-notation writer, shared
+
+Why we need it
+  Doubles from arithmetic usually need 16-17 digits; each went through up to 16 failed float tries and then js_dtoa's multi-precision path, ~23% of stringify cycles on the app-traffic benchmark. json_app stringify only: -8.5% cycles, -9.3% instructions.
+
+Soundness
+  A decimal of n digits in the interval gives one of n + 1 (append a zero), so the shortest length is the first n with one, and 15 failing means at least 16. All arithmetic is exact: 4m < 2^55, 10^k <= 10^21 < 2^70, S = 2 - q <= 120, so T < 2^125; k is chosen so floor(a * 10^k) has nd digits and corrected exactly. The interval is [4m - lo, 4m + 2] in units of 2^(q-2), lo = 1 at a power of two (half gap below), closed when m is even (round-half-even maps the ends to a). Nearest wins, ties to even R. A carry to nd + 1 digits, k outside 0..21 or no __int128 return to the existing paths. Differentials identical old vs new: new jdt2.js (3,300,481 values: random bit patterns 2^-26..2^53, powers of two and their neighbours, neighbours of 1e-7..1e15, 14-17 digit decimals scaled and their neighbours, quotients; String() and JSON.stringify; all round-trip), jdtoa (1.5M), jstr, jprim, jnum.
+
+diff --git a/quickjs.c b/quickjs.c
+index 85da23b..7409227 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -23710,39 +23710,22 @@ static JSValue js_bigint_to_string(JSContext *ctx, JSValueConst val)
+ 
+ /*---- floating point number to string conversions ----*/
+ 
+-/* The shortest round-trip decimal of d in the fixed notation of Number.prototype.toString, when it has at most 15 significant digits
+-   and 1e-6 <= |d| < 1e15; 0 (nothing written) otherwise. For the smallest k with R = round(|d| * 10^k) and R / 10^k == |d| (both
+-   exact doubles, R <= 2^53 and k <= 15, so the division is rounded once and the test is the round trip), R/10^k is the answer: no
+-   decimal with fewer fraction digits round-trips, and at most one decimal of 15 or fewer significant digits rounds to a given double,
+-   so it is also the one nearest to d. */
+-static int js_dtoa_short(char *buf, double d)
++/* Write sign, then R with k fraction digits (R > 0, k >= 0), trailing fraction zeros dropped, in the fixed notation of
++   Number.prototype.toString; returns the length (buf is NUL-terminated). */
++static int dtoa_fixed_out(char *buf, bool neg, uint64_t r, int k)
+ {
+-    static const double p10[16] = { 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15 };
+-    double a = fabs(d), v;
+-    uint64_t r;
+     char dig[24];
+-    int k, nd, i, n = 0;
++    int nd = 0, i, n = 0;
+ 
+-    if (!(a >= 1e-6 && a < 1e15))
+-        return 0;
+-    for (k = 0; k <= 15; k++) {
+-        v = a * p10[k];
+-        if (v >= 9007199254740992.0)
+-            return 0;
+-        r = (uint64_t)(v + 0.5);
+-        if ((double)r / p10[k] == a)
+-            break;
++    while (k > 0 && r % 10 == 0) {
++        r /= 10;
++        k--;
+     }
+-    if (k > 15 || r == 0)
+-        return 0;
+-    nd = 0;
+     while (r != 0) {
+         dig[nd++] = (char)('0' + r % 10);
+         r /= 10;
+     }
+-    if (nd > 15)
+-        return 0;
+-    if (d < 0)
++    if (neg)
+         buf[n++] = '-';
+     if (nd <= k) {
+         buf[n++] = '0';
+@@ -23762,6 +23745,156 @@ static int js_dtoa_short(char *buf, double d)
+     return n;
+ }
+ 
++#ifdef __SIZEOF_INT128__
++/* For a = |d| = m * 2^q, normal, non-integral, below 2^53: the decimal with exactly nd significant digits (R, k fraction digits)
++   that lies in a's rounding interval and is nearest to a (ties to even R), all in exact 128-bit integers. Returns 1 and sets
++   *pr / *pk when there is one, 0 when there is none, -1 when the scale is out of this routine's range (the caller falls back).
++   In units of 2^(q-2): a is V = 4m, the interval is [V - lo, V + 2] (lo = 1 at a power of two, where the gap below is half the gap
++   above, else 2), closed when m is even (round-half-even maps the ends to a), open otherwise. With T = V * 10^k and S = 2 - q,
++   floor(a * 10^k) = T >> S and the remainder T mod 2^S is the distance below a * 10^k in the same units, so a candidate R is in
++   the interval when its distance is at most lo * 10^k (below) or 2 * 10^k (above). */
++static int dtoa_exact_nd(uint64_t m, int q, int nd, uint64_t *pr, int *pk)
++{
++    static const uint64_t p10[20] = {
++        1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL,
++        10000000000ULL, 100000000000ULL, 1000000000000ULL, 10000000000000ULL, 100000000000000ULL,
++        1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL, 1000000000000000000ULL,
++        10000000000000000000ULL,
++    };
++    typedef unsigned __int128 u128;
++    int S = 2 - q, k, tries;
++    u128 V = (u128)m << 2, T, pk10, rem, one, below_ok, above_ok;
++    uint64_t rf, lo;
++    bool closed = (m & 1) == 0;
++
++    if (S < 3 || S > 120)
++        return -1;
++    lo = (m == ((uint64_t)1 << 52)) ? 1 : 2;
++    /* k for nd digits from the integer part's length, then corrected by the exact floor */
++    {
++        uint64_t ip = (uint64_t)(V >> S);
++        int e10 = -1;
++        if (ip != 0) {
++            while (e10 + 1 < 20 && ip >= p10[e10 + 1])
++                e10++;
++        } else {
++            /* a < 1: e10 = -(number of leading fraction zeros + 1), found below by correction from a start of -1 */
++        }
++        k = nd - 1 - e10;
++    }
++    for (tries = 0; tries < 40; tries++) {
++        if (k < 0 || k > 21)
++            return -1;
++        pk10 = k <= 19 ? (u128)p10[k] : (u128)p10[19] * p10[k - 19];
++        T = V * pk10;
++        if ((T >> S) >> 64)
++            return -1;
++        rf = (uint64_t)(T >> S);
++        if (rf < p10[nd - 1]) {
++            k++;
++            continue;
++        }
++        if (rf >= p10[nd]) {
++            k--;
++            continue;
++        }
++        break;
++    }
++    if (tries == 40)
++        return -1;
++    one = (u128)1 << S;
++    rem = T & (one - 1);
++    /* rf: distance rem below; rf + 1: distance one - rem above (only when rem != 0) */
++    below_ok = closed ? rem <= (u128)lo * pk10 : rem < (u128)lo * pk10;
++    above_ok = rem != 0 && (closed ? one - rem <= (u128)2 * pk10 : one - rem < (u128)2 * pk10);
++    if (below_ok && above_ok) {
++        if (rem < one - rem)
++            above_ok = 0;
++        else if (rem > one - rem)
++            below_ok = 0;
++        else if (rf & 1)
++            below_ok = 0;
++        else
++            above_ok = 0;
++    }
++    if (below_ok) {
++        *pr = rf;
++    } else if (above_ok) {
++        if (rf + 1 >= p10[nd])
++            return -1; /* a carry to nd + 1 digits: a shorter form exists, leave it to the general routine */
++        *pr = rf + 1;
++    } else {
++        return 0;
++    }
++    *pk = k;
++    return 1;
++}
++#endif
++
++/* The shortest round-trip decimal of d in the fixed notation of Number.prototype.toString, when 1e-6 <= |d| < 1e15; 0 (nothing
++   written) when it is not found here.
++   - At most 15 significant digits: for the smallest k with R = round(|d| * 10^k) and R / 10^k == |d| (both exact doubles,
++     R <= 2^53 and k <= 15, so the division is rounded once and the test is the round trip), R/10^k is the answer: no decimal with
++     fewer fraction digits round-trips, and at most one decimal of 15 or fewer significant digits rounds to a given double, so it is
++     also the one nearest to d.
++   - 16 or 17: dtoa_exact_nd. A decimal of n digits in the interval gives one of n + 1 (append a zero), so the shortest length is
++     the first n that has one; 15 is tried exactly first, and when it has none the float loop is skipped for 16, then 17. */
++static int js_dtoa_short(char *buf, double d)
++{
++    static const double p10[16] = { 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15 };
++    double a = fabs(d), v;
++    uint64_t r;
++    int k;
++
++    if (!(a >= 1e-6 && a < 1e15))
++        return 0;
++#ifdef __SIZEOF_INT128__
++    {
++        uint64_t u, m;
++        int be, q, nd, ret;
++        memcpy(&u, &a, sizeof(u));
++        be = (int)(u >> 52);
++        m = (u & (((uint64_t)1 << 52) - 1)) | ((uint64_t)1 << 52);
++        q = be - 1075;
++        /* non-integral: below 1 (q <= -53), or some of the -q fraction bits set */
++        if (q < 0 && (q <= -53 || (m & ((((uint64_t)1) << -q) - 1)) != 0)) {
++            ret = dtoa_exact_nd(m, q, 15, &r, &k);
++            if (ret == 0) {
++                for (nd = 16; nd <= 17; nd++) {
++                    ret = dtoa_exact_nd(m, q, nd, &r, &k);
++                    if (ret != 0)
++                        break;
++                }
++                if (ret == 1)
++                    return dtoa_fixed_out(buf, d < 0, r, k);
++                return 0;
++            }
++        }
++    }
++#endif
++    for (k = 0; k <= 15; k++) {
++        v = a * p10[k];
++        if (v >= 9007199254740992.0)
++            return 0;
++        r = (uint64_t)(v + 0.5);
++        if ((double)r / p10[k] == a)
++            break;
++    }
++    if (k > 15 || r == 0)
++        return 0;
++    {
++        uint64_t t = r;
++        int nd = 0;
++        while (t != 0) {
++            nd++;
++            t /= 10;
++        }
++        if (nd > 15)
++            return 0;
++    }
++    return dtoa_fixed_out(buf, d < 0, r, k);
++}
++
+ static JSValue js_dtoa2(JSContext *ctx,
+                         double d, int radix, int n_digits, int flags)
+ {
