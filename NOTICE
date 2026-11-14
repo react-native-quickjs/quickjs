@@ -9,8 +9,8 @@ QuickJS-NG
 https://github.com/quickjs-ng/quickjs
 
 The JavaScript engine. Its sources are redistributed in this package under
-engine/quickjs-rel, pre-patched with the changes in engine/patches -- each of
-which is described in engine/patches/README.md.
+engine/quickjs-ng, from our fork https://github.com/react-native-quickjs/quickjs-ng
+(branch develop): upstream plus our changes, one commit each.
 
   Copyright (c) 2016-2026 Fabrice Bellard
   Copyright (c) 2017-2025 Charlie Gordon

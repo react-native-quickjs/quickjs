@@ -29,13 +29,10 @@ jobs:
           node-version: 22
           cache: npm
 
-      # postinstall applies the engine patches.
       - run: npm ci
 
-      - name: Check the patches and the engine projection
-        run: |
-          node scripts/apply-patches.js --check
-          node scripts/sync-quickjs-rel.js --check
+      - name: Check the engine submodule and the tarball's engine files
+        run: node scripts/check-engine.js
 
       - name: Build
         run: |

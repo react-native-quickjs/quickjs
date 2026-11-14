@@ -4,9 +4,11 @@
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  *
- * Rebuilds QuickJS's embedded bytecode with the compiler produced by the
- * complete patch stack, updates the final bytecode-version patch, and refreshes
- * engine/quickjs-rel.
+ * Rebuilds QuickJS's embedded bytecode (the builtin-*.h blobs) in
+ * engine/quickjs-ng with the qjsc built from it, and smoke-tests the result.
+ * The blobs are loadable only by the BC_VERSION they were compiled with, so run
+ * this after a bytecode-format change or an upstream sync, then commit the
+ * changed blobs in the fork (see engine/README.md).
  */
 
 'use strict';
@@ -18,21 +20,13 @@ const {spawnSync} = require('child_process');
 
 const root = path.join(__dirname, '..');
 const engine = path.join(root, 'engine', 'quickjs-ng');
-const patchPath = path.join(
-  root,
-  'engine',
-  'patches',
-  '9999-bc-version-bump.patch',
-);
 const buildDir = path.join(engine, 'build-builtin-blobs');
 const ccacheDir = path.join(root, '.local', 'ccache');
-const files = [
-  'quickjs.c',
+const builtins = [
   'builtin-array-fromasync.h',
   'builtin-iterator-zip.h',
   'builtin-iterator-zip-keyed.h',
 ];
-const builtins = files.slice(1);
 
 function fail(message) {
   console.error(`\n[regenerate-builtin-blobs] ${message}\n`);
@@ -62,54 +56,9 @@ function writeAtomic(file, contents) {
   fs.renameSync(temporary, file);
 }
 
-function copyInto(dir) {
-  fs.mkdirSync(dir, {recursive: true});
-  for (const name of files) {
-    fs.copyFileSync(path.join(engine, name), path.join(dir, name));
-  }
-}
-
-function diffFile(beforeDir, afterDir, name) {
-  const result = spawnSync(
-    'git',
-    ['diff', '--no-index', '--', `before/${name}`, `after/${name}`],
-    {
-      cwd: path.dirname(beforeDir),
-      encoding: 'utf8',
-      maxBuffer: 64 * 1024 * 1024,
-    },
-  );
-  if (result.status === 0) return '';
-  if (result.status !== 1) {
-    fail(`could not create the 9999 diff for ${name}:\n${result.stderr}`);
-  }
-  return result.stdout
-    .replaceAll('a/before/', 'a/')
-    .replaceAll('b/after/', 'b/');
-}
-
-run(process.execPath, ['scripts/apply-patches.js', '--check']);
-
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'rnqjs-builtins-'));
-const beforeDir = path.join(scratch, 'before');
-const afterDir = path.join(scratch, 'after');
 
 try {
-  copyInto(beforeDir);
-  copyInto(afterDir);
-
-  run(
-    'git',
-    [
-      'apply',
-      '--reverse',
-      '--whitespace=nowarn',
-      '--unidiff-zero',
-      patchPath,
-    ],
-    {cwd: beforeDir},
-  );
-
   fs.mkdirSync(ccacheDir, {recursive: true});
   const buildEnvironment = {...process.env, CCACHE_DIR: ccacheDir};
   run(
@@ -130,7 +79,7 @@ try {
     const source = name.replace(/\.h$/, '.js');
     run(
       qjsc,
-      ['-C', '-ss', '-o', path.join(afterDir, name), source],
+      ['-C', '-ss', '-o', path.join(scratch, name), source],
       {cwd: engine},
     );
   }
@@ -139,65 +88,12 @@ try {
     name =>
       !fs
         .readFileSync(path.join(engine, name))
-        .equals(fs.readFileSync(path.join(afterDir, name))),
+        .equals(fs.readFileSync(path.join(scratch, name))),
   );
-
-  if (changed.length === 0) {
-    console.log('[regenerate-builtin-blobs] built-in blobs are up to date');
-  } else {
-    const oldPatch = fs.readFileSync(patchPath, 'utf8');
-    const marker = oldPatch.match(/^(?:diff --git |--- a\/)/m);
-    if (!marker) fail('9999 has no patch body');
-
-    const header = oldPatch.slice(0, marker.index);
-    const body = files
-      .map(name => diffFile(beforeDir, afterDir, name))
-      .join('');
-    if (!body) fail('regenerated 9999 would contain no diff');
-
-    const candidate = path.join(scratch, 'candidate');
-    copyInto(candidate);
-    run(
-      'git',
-      [
-        'apply',
-        '--reverse',
-        '--whitespace=nowarn',
-        '--unidiff-zero',
-        patchPath,
-      ],
-      {cwd: candidate},
-    );
-    const candidatePatch = path.join(scratch, '9999.patch');
-    fs.writeFileSync(candidatePatch, header + body);
-    run(
-      'git',
-      ['apply', '--whitespace=nowarn', '--unidiff-zero', candidatePatch],
-      {cwd: candidate},
-    );
-    for (const name of files) {
-      if (
-        !fs
-          .readFileSync(path.join(candidate, name))
-          .equals(fs.readFileSync(path.join(afterDir, name)))
-      ) {
-        fail(`regenerated 9999 does not reproduce ${name}`);
-      }
-    }
-
-    writeAtomic(patchPath, header + body);
-    for (const name of builtins) {
-      writeAtomic(
-        path.join(engine, name),
-        fs.readFileSync(path.join(afterDir, name)),
-      );
-    }
-    console.log(
-      `[regenerate-builtin-blobs] regenerated ${changed.join(', ')}`,
-    );
+  for (const name of changed) {
+    writeAtomic(path.join(engine, name), fs.readFileSync(path.join(scratch, name)));
   }
 
-  run(process.execPath, ['scripts/sync-quickjs-rel.js'], {stdio: 'inherit'});
   run(
     'cmake',
     ['--build', buildDir, '--target', 'qjs_exe', '--parallel'],
@@ -211,12 +107,11 @@ try {
       'if (actual !== "function|function|function|[[1,3],[2,4]]") ' +
       'throw new Error(actual);',
   ]);
-  run(process.execPath, ['scripts/apply-patches.js', '--check'], {
-    stdio: 'inherit',
-  });
-  run(process.execPath, ['scripts/sync-quickjs-rel.js', '--check'], {
-    stdio: 'inherit',
-  });
+  console.log(
+    changed.length === 0
+      ? '[regenerate-builtin-blobs] built-in blobs are up to date'
+      : `[regenerate-builtin-blobs] regenerated ${changed.join(', ')}: commit them in engine/quickjs-ng (develop), then the pointer`,
+  );
 } finally {
   fs.rmSync(scratch, {recursive: true, force: true});
 }

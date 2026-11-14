@@ -9,23 +9,20 @@
  *
  * This package is installed in two situations that need opposite behaviour:
  *
- *   1. THIS REPOSITORY, from git. engine/quickjs-ng is a submodule that has to
- *      be initialised and patched, or nothing builds.
+ *   1. THIS REPOSITORY, from git. engine/quickjs-ng is a submodule (our fork of
+ *      quickjs-ng) that has to be checked out, or nothing builds.
  *
- *   2. A CONSUMER'S node_modules, from the npm tarball. That ships
- *      engine/quickjs-rel already patched, there is no submodule, and there is
- *      no git repository.
+ *   2. A CONSUMER'S node_modules, from the npm tarball. That ships the engine
+ *      files the build needs under engine/quickjs-ng, there is no submodule, and
+ *      there is no git repository.
  *
- * Running the first in the second breaks three ways at once: `git submodule
- * update` with no .git of its own walks UP out of node_modules and operates on
- * the consuming app's repository; engine/patches is not published, so the patch
- * script has nothing to apply; and shelling out to a package manager assumes
- * one the consumer may not use.
+ * Running the first in the second breaks two ways: `git submodule update` with
+ * no .git of its own walks UP out of node_modules and operates on the consuming
+ * app's repository, and shelling out to a package manager assumes one the
+ * consumer may not use.
  *
  * So detect the situation, and in (2) do nothing at all.
  */
-
-'use strict';
 
 const fs = require('fs');
 const path = require('path');
@@ -33,10 +30,11 @@ const { spawnSync } = require('child_process');
 
 const root = path.join(__dirname, '..');
 
-// engine/patches is absent from the tarball on purpose, and its absence is the
-// signal. Checking for .git would be wrong: a consumer who vendors this package
-// inside their own repository has a .git above them.
-if (!fs.existsSync(path.join(root, 'engine', 'patches'))) {
+// .gitmodules is never in the tarball (package.json "files" does not list it, and
+// "!**/.*" excludes dotfiles), so its absence is the signal. Checking for .git
+// would be wrong: a consumer who vendors this package inside their own
+// repository has a .git above them.
+if (!fs.existsSync(path.join(root, '.gitmodules'))) {
   process.exit(0);
 }
 
@@ -67,8 +65,3 @@ run('submodule checkout', 'git', [
   '--recursive',
 ]);
 
-// Invoked through node rather than a package manager, so this behaves the same
-// under npm, yarn, pnpm and bun.
-run('patch application', process.execPath, [
-  path.join(root, 'scripts', 'apply-patches.js'),
-]);

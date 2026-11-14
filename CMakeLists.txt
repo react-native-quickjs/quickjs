@@ -50,11 +50,11 @@ target_link_libraries(qjsc PRIVATE quickjs)
 
 add_executable(qjs-bench tools/benchmark/qjs-bench.c)
 target_link_libraries(qjs-bench PRIVATE quickjs)
-target_include_directories(qjs-bench PRIVATE "${CMAKE_CURRENT_LIST_DIR}/engine/quickjs-rel")
+target_include_directories(qjs-bench PRIVATE "${CMAKE_CURRENT_LIST_DIR}/engine/quickjs-ng")
 
 add_executable(native-call-bench tools/benchmark/calls.c)
 target_link_libraries(native-call-bench PRIVATE quickjs)
-target_include_directories(native-call-bench PRIVATE "${CMAKE_CURRENT_LIST_DIR}/engine/quickjs-rel")
+target_include_directories(native-call-bench PRIVATE "${CMAKE_CURRENT_LIST_DIR}/engine/quickjs-ng")
 
 # Harnesses for the experimental register VM, declared only in a QJS_REGVM=ON
 # tree so the shipping host build neither compiles nor ships them.

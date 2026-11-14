@@ -302,8 +302,7 @@ fi
 
 note "== coherence"
 if command -v node >/dev/null 2>&1; then
-    ( cd "$ROOT" && node scripts/apply-patches.js --check ) || bad "apply-patches --check"
-    ( cd "$ROOT" && node scripts/sync-quickjs-rel.js --check ) || bad "sync-quickjs-rel --check"
+    ( cd "$ROOT" && node scripts/check-engine.js --no-pack ) || bad "check-engine"
 else
     note "   node not on PATH (skipped)"
 fi

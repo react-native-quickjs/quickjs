@@ -9,13 +9,13 @@
  *   node scripts/release.js --tag alpha --dry-run
  *
  * Gates, in order, so a bad package cannot reach the registry:
- *   1. engine integrity  check-submodule / apply-patches --check /
- *      sync-quickjs-rel --check / guard-selftest
+ *   1. engine integrity  check-engine (submodule at its recorded commit, no
+ *      uncommitted engine edits, engine files in the tarball) / guard-selftest
  *   2. clean working tree and a package-lock.json that matches package.json,
  *      and any @react-native-quickjs/* workspace-module dependency pinned
  *      exact to the module's current, published version (a drifting range
  *      nests a second module copy and breaks the folded Android build)
- *   3. a fresh `npm ci` (re-applies submodules and patches) followed by the
+ *   3. a fresh `npm ci` (re-checks out the submodule) followed by the
  *      full host test suite (configure + build + ctest)
  *   4. a `npm pack --dry-run` whose tarball is sanity-checked (engine present,
  *      submodule/node_modules absent)
@@ -314,9 +314,7 @@ async function main() {
   }
 
   console.log(`\n[1/6] Engine integrity for ${NAME}@${currentVersion()}\n`);
-  runEngineGuard('check-submodule.js', 'engine submodule is at its recorded commit');
-  runEngineGuard('apply-patches.js', 'engine patches are applied', ['--check']);
-  runEngineGuard('sync-quickjs-rel.js', 'engine/quickjs-rel is in sync', ['--check']);
+  runEngineGuard('check-engine.js', 'engine submodule is at its recorded commit, clean, and packed');
   runEngineGuard('guard-selftest.js', 'the engine guards can fail (self-test)');
 
   console.log(`\n[2/6] Tree, lockfile and module dependencies\n`);
@@ -325,11 +323,10 @@ async function main() {
   guardModuleDepVersions();
 
   if (!noCi) {
-    console.log('\n[3/6] Fresh install (npm ci) -- re-checks submodules and patches\n');
+    console.log('\n[3/6] Fresh install (npm ci) -- re-checks the submodule\n');
     run('npm', ['ci', '--no-audit', '--no-fund']);
     console.log('\nRe-checking the engine after the fresh install...\n');
-    runEngineGuard('apply-patches.js', 'engine patches are applied after npm ci', ['--check']);
-    runEngineGuard('sync-quickjs-rel.js', 'engine/quickjs-rel in sync after npm ci', ['--check']);
+    runEngineGuard('check-engine.js', 'engine submodule checked out and packed after npm ci');
   } else {
     console.log('\n[3/6] Skipping npm ci (--no-ci)');
   }
@@ -348,16 +345,19 @@ async function main() {
   const files = (packed[0]?.files || []).map((f) => f.path);
   const names = new Set(files);
   const expectPresent = [
-    'engine/quickjs-rel/quickjs.c',
-    'engine/quickjs-rel/libunicode.c',
+    'engine/quickjs-ng/quickjs.c',
+    'engine/quickjs-ng/libunicode.c',
+    'engine/quickjs-ng/LICENSE',
     'src/module/QuickJSModule.h',
     'scripts/postinstall.js',
     'bin/qjsc/darwin-arm64/qjsc',
   ];
   const missing = expectPresent.filter((f) => !names.has(f));
   const shouldBeAbsent = [
-    'engine/quickjs-ng/quickjs.c',
-    'engine/patches/0001-runtime-malloc-size-accessor.patch',
+    'engine/quickjs-ng/qjs.c',
+    'engine/quickjs-ng/run-test262.c',
+    'engine/quickjs-ng/.git',
+    '.gitmodules',
   ];
   const leaked = shouldBeAbsent.filter((f) => names.has(f));
   if (missing.length || leaked.length) {
@@ -368,7 +368,7 @@ async function main() {
   const totalBytes = packed[0]?.unpackedSize || 0;
   console.log(
     `ok    tarball has ${files.length} files (${(totalBytes / 1024).toFixed(0)} KB unpacked); ` +
-      'engine present, submodule and patches absent'
+      'engine present, engine programs and git metadata absent'
   );
 
   /* Dist-tag + version, interactive. */

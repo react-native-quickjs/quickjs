@@ -1,7 +1,7 @@
 [submodule "engine/quickjs-ng"]
 	path = engine/quickjs-ng
-	url = https://github.com/quickjs-ng/quickjs.git
-	ignore = dirty
+	url = https://github.com/react-native-quickjs/quickjs-ng.git
+	branch = develop
 [submodule "tools/benchmark/jetstream3/JetStream"]
 	path = tools/benchmark/jetstream3/JetStream
 	url = https://github.com/WebKit/JetStream.git

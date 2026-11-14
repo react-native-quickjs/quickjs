@@ -22,10 +22,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const root = path.join(__dirname, '..');
-const patchDir = path.join(root, 'engine', 'patches');
-const readme = path.join(patchDir, 'README.md');
 const engineFile = path.join(root, 'engine', 'quickjs-ng', 'quickjs.h');
-const projection = path.join(root, 'engine', 'quickjs-rel', 'quickjs.h');
 
 function run(script, args = []) {
   return spawnSync(process.execPath, [path.join(root, 'scripts', script), ...args], {
@@ -33,19 +30,24 @@ function run(script, args = []) {
     encoding: 'utf8',
   }).status;
 }
+function git(args) {
+  const r = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+  if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+  return r.stdout.trim();
+}
 
 let failures = 0;
 
 /* Break one thing, assert the guard goes red, put it back, assert it goes green. */
-function expectRed(label, script, breakIt, restore) {
+function expectRed(label, script, args, breakIt, restore) {
   let red;
   try {
     breakIt();
-    red = run(script, ['--check']) !== 0;
+    red = run(script, args) !== 0;
   } finally {
     restore();
   }
-  const green = run(script, ['--check']) === 0;
+  const green = run(script, args) === 0;
   const ok = red && green;
   console.log(`${ok ? 'ok  ' : 'FAIL'}  ${label}${ok ? '' : `  (red=${red}, green=${green})`}`);
   if (!ok) failures += 1;
@@ -58,35 +60,39 @@ function withSaved(file, mutate) {
 }
 
 expectRed(
-  'apply-patches notices an edited engine',
-  'apply-patches.js',
+  'check-engine notices an uncommitted engine edit',
+  'check-engine.js',
+  ['--no-pack'],
   ...withSaved(engineFile, () => fs.appendFileSync(engineFile, '\n/* selftest */\n'))
 );
 
-expectRed(
-  'apply-patches notices a patch missing from the table',
-  'apply-patches.js',
-  ...withSaved(readme, (saved) =>
-    fs.writeFileSync(readme, saved.toString().replace(/^\| `0003`.*\n/m, ''))
-  )
-);
+{
+  const f = path.join(root, 'engine', 'quickjs-ng', 'dtoa.h');
+  const away = `${f}.selftest`;
+  expectRed(
+    'check-engine notices a missing engine file',
+    'check-engine.js',
+    [],
+    () => fs.renameSync(f, away),
+    () => fs.renameSync(away, f)
+  );
+}
 
-expectRed(
-  'apply-patches notices a stray BC_VERSION change',
-  'apply-patches.js',
-  ...withSaved(path.join(patchDir, '0001-runtime-malloc-size-accessor.patch'), (saved) =>
-    fs.writeFileSync(
-      path.join(patchDir, '0001-runtime-malloc-size-accessor.patch'),
-      saved + '\n+#define BC_VERSION 99\n'
-    )
-  )
-);
-
-expectRed(
-  'sync-quickjs-rel notices a stale projection',
-  'sync-quickjs-rel.js',
-  ...withSaved(projection, () => fs.appendFileSync(projection, '\n/* selftest */\n'))
-);
+/* The pointer the main repository records (its index entry) moved away from the submodule's HEAD; only the index entry changes. */
+{
+  const head = git(['-C', 'engine/quickjs-ng', 'rev-parse', 'HEAD']);
+  const other = git(['-C', 'engine/quickjs-ng', 'rev-parse', 'HEAD~1']);
+  const recorded = git(['ls-files', '-s', 'engine/quickjs-ng']).split(/\s+/)[1];
+  expectRed(
+    'check-engine notices the submodule off the recorded commit',
+    'check-engine.js',
+    ['--no-pack'],
+    () => git(['update-index', '--cacheinfo', `160000,${other},engine/quickjs-ng`]),
+    () => git(['update-index', '--cacheinfo', `160000,${recorded},engine/quickjs-ng`])
+  );
+  if (git(['ls-files', '-s', 'engine/quickjs-ng']).split(/\s+/)[1] !== recorded || head !== recorded)
+    console.log(`note: recorded pointer ${recorded}, submodule HEAD ${head}`);
+}
 
 console.log(
   failures === 0

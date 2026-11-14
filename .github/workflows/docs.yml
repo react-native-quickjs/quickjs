@@ -31,8 +31,8 @@ jobs:
           node-version: 22
           cache: npm
 
-      # --ignore-scripts because postinstall fetches and patches the engine
-      # submodule, which a landing page has no use for.
+      # --ignore-scripts because postinstall checks out the engine submodule,
+      # which a landing page has no use for.
       - run: npm ci --ignore-scripts
 
       - run: npx vitepress build docs

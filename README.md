@@ -213,18 +213,13 @@ npm test          # configures, builds, and runs the suites
 | `src/` | The `jsi::Runtime` implementation, shared by both platforms. |
 | `android/` | Gradle module, CMake build, fbjni hybrid, and `QuickJSInstance.kt`. |
 | `apple/` | `jsrt_create_quickjs_factory()`, the iOS entry point. |
-| `engine/quickjs-ng/` | quickjs-ng, as a pinned git submodule. |
-| `engine/patches/` | The engine patches applied to it. See [its README](engine/patches/README.md). |
-| `engine/quickjs-rel/` | Generated: the submodule with the patches applied. This is what ships. |
+| `engine/quickjs-ng/` | The engine: our fork of quickjs-ng (branch `develop`), as a git submodule. This is what ships. See [engine/README.md](engine/README.md). |
 | `modules/cdp/` | The Chrome DevTools Protocol backend, in C. See [its README](modules/cdp/README.md). |
 | `cmake/quickjs.cmake` | The quickjs target, shared by the Android and host builds. |
 | `tools/bytecode/` | `qjsc`, the ahead-of-time bytecode compiler. |
 | `tests/` | Host suites, Hermes' JSI conformance suite, and the differential corpus. |
 | `example/` | An app that runs on QuickJS, used as the end-to-end check. |
 | `docs/` | The landing page. |
-
-`engine/quickjs-rel` is generated, never hand-edited. The build fails if it
-disagrees with the submodule plus the patches.
 
 ## License
 

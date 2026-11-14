@@ -5,7 +5,7 @@ package = JSON.parse(File.read(File.join(__dir__, "package.json")))
 # --- locating the engine package -------------------------------------------
 #
 # This module compiles against the engine's headers (src/ for the module ABI,
-# engine/quickjs-rel/ for quickjs itself), so it has to know where
+# engine/quickjs-ng/ for quickjs itself), so it has to know where
 # @react-native-quickjs/quickjs actually is.
 #
 # That path used to be hardcoded as
@@ -103,7 +103,7 @@ Pod::Spec.new do |s|
       "\"#{rnqjs_root}/src/bytecode\" " \
       "\"#{rnqjs_root}/src/module\" " \
       "\"#{rnqjs_root}/src/runtime\" " \
-      "\"#{rnqjs_root}/engine/quickjs-rel\" " \
+      "\"#{rnqjs_root}/engine/quickjs-ng\" " \
       '"$(PODS_TARGET_SRCROOT)/cpp" ' \
       '"$(DERIVED_FILE_DIR)/rnqjs-intl"',
   }

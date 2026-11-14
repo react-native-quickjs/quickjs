@@ -161,7 +161,7 @@ target_include_directories(${RNQJS_MODULE_NAME} PUBLIC
   ${REACT_NATIVE_QUICKJS_DIR}/src/bytecode
   ${REACT_NATIVE_QUICKJS_DIR}/src/module
   ${REACT_NATIVE_QUICKJS_DIR}/src/runtime
-  ${REACT_NATIVE_QUICKJS_DIR}/engine/quickjs-rel
+  ${REACT_NATIVE_QUICKJS_DIR}/engine/quickjs-ng
 )
 if(RNQJS_INTL_JSI_INCLUDE)
   target_include_directories(${RNQJS_MODULE_NAME} PUBLIC ${RNQJS_INTL_JSI_INCLUDE})
@@ -213,7 +213,7 @@ if(RNQJS_INTL_BUILD_CLI)
   target_include_directories(intl-cli PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp
     ${RNQJS_INTL_GENERATED}
-    ${REACT_NATIVE_QUICKJS_DIR}/engine/quickjs-rel)
+    ${REACT_NATIVE_QUICKJS_DIR}/engine/quickjs-ng)
   target_compile_features(intl-cli PRIVATE cxx_std_20)
   target_link_libraries(intl-cli quickjs)
 
@@ -224,7 +224,7 @@ if(RNQJS_INTL_BUILD_CLI)
   target_include_directories(intl-bench PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/cpp
     ${RNQJS_INTL_GENERATED}
-    ${REACT_NATIVE_QUICKJS_DIR}/engine/quickjs-rel)
+    ${REACT_NATIVE_QUICKJS_DIR}/engine/quickjs-ng)
   target_compile_features(intl-bench PRIVATE cxx_std_20)
   target_link_libraries(intl-bench quickjs)
 
@@ -264,7 +264,7 @@ if(RNQJS_INTL_BUILD_CLI)
     target_include_directories(intl-cli-apple PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/cpp
       ${RNQJS_INTL_GENERATED}
-      ${REACT_NATIVE_QUICKJS_DIR}/engine/quickjs-rel)
+      ${REACT_NATIVE_QUICKJS_DIR}/engine/quickjs-ng)
     target_compile_features(intl-cli-apple PRIVATE cxx_std_20)
     # ARC, because that is what the pod gets: CocoaPods defaults s.requires_arc
     # to true, so a non-ARC host build would measure a different program than

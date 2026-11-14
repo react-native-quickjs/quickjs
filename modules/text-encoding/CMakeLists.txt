@@ -34,7 +34,7 @@ target_include_directories(${RNQJS_MODULE_NAME} PUBLIC
   ${REACT_NATIVE_QUICKJS_DIR}/src/bytecode
   ${REACT_NATIVE_QUICKJS_DIR}/src/module
   ${REACT_NATIVE_QUICKJS_DIR}/src/runtime
-  ${REACT_NATIVE_QUICKJS_DIR}/engine/quickjs-rel
+  ${REACT_NATIVE_QUICKJS_DIR}/engine/quickjs-ng
 )
 
 target_compile_features(${RNQJS_MODULE_NAME} PUBLIC cxx_std_20)

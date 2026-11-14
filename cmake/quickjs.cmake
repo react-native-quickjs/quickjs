@@ -5,9 +5,8 @@
 #
 # Defines the `quickjs` static library.
 #
-# It compiles engine/quickjs-rel, the committed pre-patched copy, not the
-# engine/quickjs-ng submodule -- see the header of scripts/sync-quickjs-rel.js
-# for why the submodule cannot be the thing that ships.
+# It compiles engine/quickjs-ng, the submodule: our fork of quickjs-ng (branch develop; see engine/README.md). The same directory ships
+# in the npm package.
 #
 # Upstream's own CMakeLists is deliberately not used: it also declares qjs,
 # qjsc and api-test, none of which link for Android or iOS, and we want direct
@@ -29,44 +28,12 @@
 # reads an undefined macro as 0.
 option(QJS_REGVM "Build the experimental register VM engine" OFF)
 
-if(QJS_REGVM)
-  # A register build compiles the patched submodule directly.
-  set(QUICKJS_DIR "${CMAKE_CURRENT_LIST_DIR}/../engine/quickjs-ng")
-else()
-  set(QUICKJS_DIR "${CMAKE_CURRENT_LIST_DIR}/../engine/quickjs-rel")
-endif()
+set(QUICKJS_DIR "${CMAKE_CURRENT_LIST_DIR}/../engine/quickjs-ng")
 
 if(NOT EXISTS "${QUICKJS_DIR}/quickjs.c")
   message(FATAL_ERROR
     "${QUICKJS_DIR} is missing.\n"
-    "Run: node scripts/sync-quickjs-rel.js")
-endif()
-
-# Patch development edits the submodule in place, but the shipping target
-# compiles the projection, so an unsynced edit would be silently ignored. In a
-# source checkout -- never in a consumer's node_modules -- fail instead, and name
-# the command that fixes it. A register build compiles the submodule directly,
-# so the projection's freshness is not what it is testing.
-if(NOT QJS_REGVM
-   AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../engine/quickjs-ng/quickjs.c"
-   AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/../scripts/sync-quickjs-rel.js")
-  find_program(QUICKJS_NODE_EXECUTABLE node)
-  if(QUICKJS_NODE_EXECUTABLE)
-    execute_process(
-      COMMAND "${QUICKJS_NODE_EXECUTABLE}"
-              "${CMAKE_CURRENT_LIST_DIR}/../scripts/sync-quickjs-rel.js" --check
-      RESULT_VARIABLE QUICKJS_REL_STALE
-      OUTPUT_QUIET
-      ERROR_VARIABLE QUICKJS_REL_ERROR)
-    if(NOT QUICKJS_REL_STALE EQUAL 0)
-      message(FATAL_ERROR "${QUICKJS_REL_ERROR}")
-    endif()
-  else()
-    message(STATUS
-      "quickjs: node not found, skipping the projection staleness check. "
-      "Engine edits made in engine/quickjs-ng will NOT be compiled until you "
-      "run scripts/sync-quickjs-rel.js.")
-  endif()
+    "Run: git submodule update --init --recursive")
 endif()
 
 add_library(quickjs STATIC

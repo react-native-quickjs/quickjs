@@ -27,44 +27,30 @@ jobs:
     outputs:
       stale: ${{ steps.compare.outputs.stale }}
       version: ${{ steps.compare.outputs.version }}
-      patch_changed: ${{ steps.compare.outputs.patch_changed }}
     steps:
+      # The engine is the engine/quickjs-ng submodule (our fork); only its quickjs.c is read here.
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          submodules: true
       - id: compare
         env:
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_BEFORE: ${{ github.event.before }}
-          EVENT_SHA: ${{ github.sha }}
         run: |
           node <<'NODE'
             const fs = require('fs');
-            const { spawnSync } = require('child_process');
-            const engine = fs.readFileSync('engine/quickjs-rel/quickjs.c', 'utf8');
+            const engine = fs.readFileSync('engine/quickjs-ng/quickjs.c', 'utf8');
             const version = Number(/^#define BC_VERSION (\d+)/m.exec(engine)[1]);
             const path = 'bin/qjsc/manifest.json';
             const built = fs.existsSync(path)
               ? JSON.parse(fs.readFileSync(path, 'utf8')).bcVersion
               : null;
-            let patchChanged = process.env.EVENT_NAME === 'workflow_dispatch';
-            if (!patchChanged) {
-              const before = process.env.EVENT_BEFORE;
-              const sha = process.env.EVENT_SHA;
-              const range = before && !/^0+$/.test(before)
-                ? `${before}..${sha}`
-                : `${sha}^..${sha}`;
-              patchChanged = spawnSync(
-                'git',
-                ['diff', '--quiet', range, '--', 'engine/patches/9999-bc-version-bump.patch']
-              ).status !== 0;
-            }
+            // Rebuild when the engine's BC_VERSION differs from the one the committed compilers were built for (a manual run rebuilds anyway).
+            const manual = process.env.EVENT_NAME === 'workflow_dispatch';
             const stale = built !== version;
             fs.appendFileSync(process.env.GITHUB_OUTPUT,
-              `version=${version}\nstale=${stale || patchChanged}\npatch_changed=${patchChanged}\n`);
+              `version=${version}\nstale=${stale || manual}\n`);
             console.error(
-              `engine BC_VERSION ${version}, compilers built for ${built}; ` +
-              `9999 patch changed: ${patchChanged}`);
+              `engine BC_VERSION ${version}, compilers built for ${built}; manual run: ${manual}`);
           NODE
 
   build:
@@ -84,12 +70,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      # The engine sources are committed, so the submodule is not needed.
-      # --ignore-scripts skips the postinstall that would fetch and patch it;
+      # The engine is the engine/quickjs-ng submodule, checked out above (its own test-suite submodules are not needed).
+      # --ignore-scripts skips the postinstall that would check it out recursively;
       # react-native is still installed, which cmake/jsi.cmake checks for.
       - run: npm ci --ignore-scripts
 

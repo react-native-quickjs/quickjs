@@ -726,7 +726,7 @@ async function main() {
   const engines = enginesFromArgs(args, hermesHost);
   if (args.device) {
     try {
-      const built = device.crossBuild(join(ROOT, "engine", "quickjs-rel"));
+      const built = device.crossBuild(join(ROOT, "engine", "quickjs-ng"));
       for (const e of engines) if (e.kind === "qjs") e.device = built;
       if (args.engines.includes("hermes")) {
         const androidHermes = await hermes.ensureAndroidHermes();
