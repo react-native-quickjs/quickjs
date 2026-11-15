@@ -765,7 +765,7 @@ static std::vector<std::string> mutationMessages(
   std::vector<std::string> messages;
   JSValue fn = JS_Eval(
       ctx, source, std::strlen(source), name,
-      evalFlags | JS_EVAL_FLAG_COMPILE_ONLY);
+      evalFlags | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_OPTIMIZE);
   EXPECT_FALSE(JS_IsException(fn));
   size_t size = 0;
   uint8_t *buf = JS_WriteObject(ctx, &size, fn, JS_WRITE_OBJ_BYTECODE);
@@ -851,7 +851,7 @@ TEST(Bytecode, RegisterFunctionWithMoreThan65535PropertySitesRoundTrips) {
   JSContext *ctx = JS_NewContext(rt);
   ASSERT_NE(ctx, nullptr);
   JSValue fn =
-      JS_Eval(ctx, src.data(), src.size(), "big.js", JS_EVAL_FLAG_COMPILE_ONLY);
+      JS_Eval(ctx, src.data(), src.size(), "big.js", JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_OPTIMIZE);
   ASSERT_FALSE(JS_IsException(fn));
   size_t size = 0;
   uint8_t *buf = JS_WriteObject(ctx, &size, fn, JS_WRITE_OBJ_BYTECODE);
@@ -889,7 +889,7 @@ TEST(Bytecode, RegisterFunctionFromBytecodeKeepsTheCompilersVariableArea) {
   JSContext *ctx = JS_NewContext(rt);
   ASSERT_NE(ctx, nullptr);
   JSValue fn =
-      JS_Eval(ctx, src, std::strlen(src), "v.js", JS_EVAL_FLAG_COMPILE_ONLY);
+      JS_Eval(ctx, src, std::strlen(src), "v.js", JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_OPTIMIZE);
   ASSERT_FALSE(JS_IsException(fn));
   size_t size = 0;
   uint8_t *buf = JS_WriteObject(ctx, &size, fn, JS_WRITE_OBJ_BYTECODE);
@@ -924,7 +924,7 @@ TEST(Bytecode, RegisterFunctionVariableAreaBelowWhatTheProgramNamesIsRejected) {
   JSContext *ctx = JS_NewContext(rt);
   ASSERT_NE(ctx, nullptr);
   JSValue fn =
-      JS_Eval(ctx, src, std::strlen(src), "v.js", JS_EVAL_FLAG_COMPILE_ONLY);
+      JS_Eval(ctx, src, std::strlen(src), "v.js", JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_OPTIMIZE);
   ASSERT_FALSE(JS_IsException(fn));
   size_t size = 0;
   uint8_t *buf = JS_WriteObject(ctx, &size, fn, JS_WRITE_OBJ_BYTECODE);

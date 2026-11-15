@@ -19,7 +19,7 @@
  * because bytecode is only loadable by the exact engine build that produced
  * it.
  *
- *   usage: qjsc [--no-checksum] [--strip-source] <input.js> <output.bc>
+ *   usage: qjsc [--no-checksum] [--strip-source] [--fast-compile] <input.js> <output.bc>
  *
  * `--strip-source` drops the embedded source text of every function: 3.30 MB
  * -> 1.16 MB on a 990 KB production Metro bundle, and the same saving in
@@ -28,6 +28,11 @@
  * distinguishable from a real native function. Line and column numbers are
  * written under a separate flag and are unaffected, so error.stack is
  * byte-identical either way.
+ *
+ * `--fast-compile` lowers with the register VM's fast compile mode, the code
+ * eval() and runtime source loads get. It exists to measure that mode and to
+ * test its programs through a bytecode round trip; bytecode that ships is
+ * compiled without it.
  *
  * JS_WRITE_OBJ_STRIP_DEBUG is deliberately not exposed. It saves a further
  * 0.18 MB and destroys every line and column number in every stack trace,
@@ -104,12 +109,15 @@ static void nsbc_clear_checksum(uint8_t *payload, size_t len) {
 int main(int argc, char **argv) {
   bool keep_checksum = true;
   bool strip_source = false;
+  int compile_flag = JS_EVAL_FLAG_OPTIMIZE;
   int argi = 1;
   while (argi < argc && argv[argi][0] == '-') {
     if (strcmp(argv[argi], "--no-checksum") == 0) {
       keep_checksum = false;
     } else if (strcmp(argv[argi], "--strip-source") == 0) {
       strip_source = true;
+    } else if (strcmp(argv[argi], "--fast-compile") == 0) {
+      compile_flag = JS_EVAL_FLAG_FAST_COMPILE;
     } else {
       fprintf(stderr, "unknown option %s\n", argv[argi]);
       return 2;
@@ -119,7 +127,7 @@ int main(int argc, char **argv) {
   if (argc - argi != 2) {
     fprintf(
         stderr,
-        "usage: %s [--no-checksum] [--strip-source] <input.js> <output.bc>\n",
+        "usage: %s [--no-checksum] [--strip-source] [--fast-compile] <input.js> <output.bc>\n",
         argv[0]);
     return 2;
   }
@@ -143,10 +151,12 @@ int main(int argc, char **argv) {
   }
 
   /* Compile without running. The completion value of the compiled top level is
-   * the same function object the runtime would produce from source. */
+   * the same function object the runtime would produce from source. The
+   * register VM lowers it with the optimising compiler unless --fast-compile:
+   * written bytecode is what ships, and what an AOT unit binds to. */
   JSValue compiled = JS_Eval(
       ctx, (const char *)src, src_len, in_path,
-      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY | compile_flag);
   free(src);
 
   if (JS_IsException(compiled)) {

@@ -107,8 +107,17 @@ static uint8_t *read_file(const char *path, size_t *out_size) {
 #define QJS_RUN_THREAD_STACK ((size_t)128 * 1024 * 1024)
 
 static int run_main(int argc, char **argv) {
+  /* Source is compiled optimised unless --fast-compile: the corpus checks the
+     compiler that ships bytecode by default, and the fast compile mode on
+     request. */
+  int compile_mode = JS_COMPILE_OPTIMIZE;
+  if (argc == 3 && strcmp(argv[1], "--fast-compile") == 0) {
+    compile_mode = JS_COMPILE_FAST;
+    argv++;
+    argc--;
+  }
   if (argc != 2) {
-    fprintf(stderr, "usage: qjs-run <file.js|file.bc>\n");
+    fprintf(stderr, "usage: qjs-run [--fast-compile] <file.js|file.bc>\n");
     return 2;
   }
 
@@ -120,6 +129,7 @@ static int run_main(int argc, char **argv) {
   }
 
   JSRuntime *rt = JS_NewRuntime();
+  JS_SetCompileMode(rt, compile_mode);
   /* The corpus has fixed-depth recursion fixtures; an unoptimised or sanitizer build needs more C stack for the same depth, so
      the limit follows the build and the interpreter runs on a thread whose stack is far larger than any limit set here. */
   JS_SetMaxStackSize(rt, QJS_RUN_STACK_LIMIT);

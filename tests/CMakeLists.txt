@@ -99,6 +99,17 @@ if(NODE_EXECUTABLE)
   add_test(NAME differential_leaks
     COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
             --qjs $<TARGET_FILE:qjs-run> --leak-check)
+  # The fast compile mode (eval, new Function and runtime source loads in an app): the corpus compiled by it, with
+  # the leak check.
+  add_test(NAME differential_fast
+    COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
+            --qjs $<TARGET_FILE:qjs-run> --qjs-arg --fast-compile --leak-check)
+  # Mixed programs: the host part as qjsc's optimised bytecode, every payload compiled at run time by the fast
+  # mode, calling, capturing and throwing through each other.
+  add_test(NAME differential_mixed
+    COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
+            --corpus mixed --qjs $<TARGET_FILE:qjs-run> --qjsc $<TARGET_FILE:qjsc>
+            --via-bytecode --qjs-arg --fast-compile --leak-check)
   # Under the GC stress mode the differential test above runs with the allocation stress; this one adds a
   # collection at every back edge and call. The two catch different missed roots (engine/patches/0619).
   if(QJS_GC_STRESS)
@@ -106,6 +117,11 @@ if(NODE_EXECUTABLE)
       COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
               --qjs $<TARGET_FILE:qjs-run>)
     set_tests_properties(differential_gc_stress_poll PROPERTIES ENVIRONMENT "QJS_GC_STRESS_POLL=1")
+    add_test(NAME differential_mixed_gc_stress_poll
+      COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
+              --corpus mixed --qjs $<TARGET_FILE:qjs-run> --qjsc $<TARGET_FILE:qjsc>
+              --via-bytecode --qjs-arg --fast-compile)
+    set_tests_properties(differential_mixed_gc_stress_poll PROPERTIES ENVIRONMENT "QJS_GC_STRESS_POLL=1")
   endif()
 else()
   message(STATUS "rnqjs: node not found, differential corpus will not run")

@@ -18,6 +18,7 @@
  *   node tests/differential/run.mjs --via-bytecode         # through qjsc-ng
  *   node tests/differential/run.mjs --corpus pending       # a sibling directory
  *   node tests/differential/run.mjs --leak-check           # also fail a file whose run leaves objects at teardown
+ *   node tests/differential/run.mjs --qjs-arg --fast-compile  # pass an argument to the engine (repeatable)
  *
  * `--via-bytecode` compiles each file with qjsc-ng and runs the container
  * instead of the source. That is the path React Native actually ships, and it
@@ -43,12 +44,14 @@ let qjs = null;
 let qjsc = null;
 let viaBytecode = false;
 let leakCheck = false;
+const qjsArgs = [];
 const filters = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--qjs') qjs = args[++i];
   else if (args[i] === '--qjsc') qjsc = args[++i];
   else if (args[i] === '--via-bytecode') viaBytecode = true;
   else if (args[i] === '--leak-check') leakCheck = true;
+  else if (args[i] === '--qjs-arg') qjsArgs.push(args[++i]);
   else if (args[i] === '--corpus') CORPUS = join(HERE, args[++i]);
   else filters.push(args[i]);
 }
@@ -128,14 +131,14 @@ for (const f of files) {
   if (leakCheck) {
     // QJS_DEBUG_LEAK makes JS_FreeRuntime report the GC objects still alive after its final collection: a reference
     // counted but never released (in release builds too, where the teardown assertion is compiled out).
-    const r = spawnSync(qjs, [input], { encoding: 'utf8', maxBuffer: 64 << 20,
+    const r = spawnSync(qjs, [...qjsArgs, input], { encoding: 'utf8', maxBuffer: 64 << 20,
       env: { ...process.env, QJS_DEBUG_LEAK: '1' } });
     a = r.status === 0 ? r.stdout : `<<qjs exited ${r.status}>>\n${r.stdout || ''}${r.stderr || ''}`;
     const m = /leak: (\d+) objects left/.exec(r.stderr || '');
     if (m) leak = m[1];
   } else {
     try {
-      a = execFileSync(qjs, [input], { encoding: 'utf8', maxBuffer: 64 << 20 });
+      a = execFileSync(qjs, [...qjsArgs, input], { encoding: 'utf8', maxBuffer: 64 << 20 });
     } catch (e) {
       a = `<<qjs exited ${e.status}>>\n${e.stdout || ''}${e.stderr || ''}`;
     }

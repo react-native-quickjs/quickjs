@@ -1144,7 +1144,7 @@ QuickJSRuntime::prepareJavaScript(
   const std::string owned(reinterpret_cast<const char *>(data), size);
   JSValue compiled = checkException(JS_Eval(
       context_, owned.c_str(), owned.size(), sourceURL.c_str(),
-      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY));
+      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_OPTIMIZE));
 
   size_t length = 0;
   uint8_t *bytes =

@@ -275,6 +275,9 @@ static int shell_run_timer(int *status) {
 static JSValue js_run_string(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 
 static int shell_intl; /* --intl: every shell realm gets Intl */
+/* Source is compiled optimised, so steady-state rows measure the optimising
+   compiler's code; --fast-compile measures the fast compile mode instead. */
+static int bench_compile_mode = JS_COMPILE_OPTIMIZE;
 
 static void shell_install(JSContext *ctx, JSValueConst g) {
 #if defined(QJS_BENCH_INTL) && QJS_BENCH_INTL
@@ -681,6 +684,7 @@ static JSValue js_host_second_runtime(
   src = JS_ToCString(ctx, argv[0]);
   if (!src) return JS_EXCEPTION;
   rt2 = JS_NewRuntime();
+  JS_SetCompileMode(rt2, bench_compile_mode);
   c2 = JS_NewContext(rt2);
   g = JS_GetGlobalObject(c2);
   JS_SetPropertyStr(c2, g, "print", JS_NewCFunction(c2, js_print, "print", 1));
@@ -708,6 +712,8 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--mem"))
       mem = 1;
+    else if (!strcmp(argv[i], "--fast-compile"))
+      bench_compile_mode = JS_COMPILE_FAST;
     else if (!strcmp(argv[i], "--stats"))
       stats = 1;
     else if (!strncmp(argv[i], "--bytecode-mode=", 16))
@@ -738,7 +744,7 @@ int main(int argc, char **argv) {
   if (!path) {
     fprintf(
         stderr,
-        "usage: qjs-bench [--mem] [--stats] [--shell [--intl]] "
+        "usage: qjs-bench [--mem] [--stats] [--fast-compile] [--shell [--intl]] "
         "[--bytecode-mode=<eager|lazy-copy|lazy-borrow>] <file.js|file.bc> "
         "[-- args]\n");
     return 2;
@@ -762,6 +768,7 @@ int main(int argc, char **argv) {
 
   double t_boot = now_ms();
   JSRuntime *rt = JS_NewRuntime();
+  JS_SetCompileMode(rt, bench_compile_mode);
   /* An interrupt every N polls, so a poll can be tested the way the
      interpreter's is: the same script must stop at the same point. Driven by
      the environment so the poll test needs no separate harness. */
