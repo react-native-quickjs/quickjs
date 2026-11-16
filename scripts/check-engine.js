@@ -44,6 +44,28 @@ for (const f of needed) {
   if (!fs.existsSync(path.join(root, f))) fail(`${f} is missing (run: git submodule update --init --recursive)`);
 }
 
+// Every file the engine sources include with #include "..." (transitively) must be listed.
+{
+  const listed = new Set(needed);
+  const seen = new Set();
+  const queue = needed.filter((f) => f.endsWith('.c'));
+  while (queue.length) {
+    const from = queue.pop();
+    if (seen.has(from) || !fs.existsSync(path.join(root, from))) continue;
+    seen.add(from);
+    const text = fs.readFileSync(path.join(root, from), 'utf8');
+    for (const m of text.matchAll(/^[ \t]*#[ \t]*include[ \t]+"([^"]+)"/gm)) {
+      const inc = path.posix.normalize(path.posix.join(path.posix.dirname(from), m[1]));
+      if (!inc.startsWith(`${ENGINE}/`) || !fs.existsSync(path.join(root, inc))) continue;
+      if (!listed.has(inc)) {
+        fail(`${inc} is included by ${from} but not in package.json files`);
+        listed.add(inc);
+      }
+      queue.push(inc);
+    }
+  }
+}
+
 const inRepo = fs.existsSync(path.join(root, '.gitmodules')) && git(['rev-parse', '--git-dir']).status === 0;
 if (inRepo && !failed) {
   const st = git(['submodule', 'status', ENGINE]);
