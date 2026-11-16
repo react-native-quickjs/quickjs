@@ -44,6 +44,7 @@ typedef struct RX {
   uint8_t *skip;/* skip[pc]: the instruction is the body of a greedy run, which the run code replaces */
   const char *name;
   int ncls;     /* classes emitted so far in this function */
+  int nlabels;  /* label addresses the function pushes (splits and runs): the backtrack dispatch exists only if there are some */
 } RX;
 
 static int rx_insn_len(const uint8_t *code, int pc)
@@ -204,6 +205,7 @@ static void rx_atom_cond(RX *x, int apc, const char *v, char *cond, size_t cn)
 #define LBL(pc) pc
 static void rx_push_split(RX *x, int resume_pc)
 {
+  x->nlabels++;
   fprintf(x->o, "    RX_PUSH_SPLIT(&&L%d);\n", resume_pc);
 }
 
@@ -229,6 +231,7 @@ static void rx_run(RX *x, int apc, int alen, int exitpc)
     if (x->w == 8) fprintf(o, "    while (p < e) { c = *p; if (!(%s)) break; p++; }\n", cond);
     else fprintf(o, "    while (p < e) { c = *(const uint16_t *)p; %sif (!(%s)) break; p += 2; }\n", rx_pre(x, apc), cond);
   }
+  x->nlabels++;
   fprintf(o, "    if (p > cptr) { RX_PUSH_RUN(&&L%d, p); cptr = p; }\n", exitpc);
   rx_poll(x);
   fprintf(o, "    goto L%d;\n    }\n", exitpc);
@@ -348,6 +351,7 @@ static void rx_func(RX *x)
       fprintf(o, "        goto L%d;\n      }\n", t);
       if (adv) fprintf(o, "      if (capture[%u] == cptr && val2 != %uu) goto no_match;\n", idx + 1, limit);
       fprintf(o, "      if (val2 != 0) {\n");
+      x->nlabels++;
       if (nextfirst) { fprintf(o, "        RX_PUSH_SPLIT(&&L%d);\n      }\n", t); }
       else { fprintf(o, "        RX_PUSH_SPLIT(&&L%d);\n        goto L%d;\n      }\n", next, t); }
       fprintf(o, "    }\n");
@@ -368,13 +372,18 @@ static void rx_func(RX *x)
     pc += n;
   }
   /* the end of the code is reached only through a match opcode: nothing falls off it */
-  fprintf(o, "  no_match:\n  for (;;) {\n    REExecStateEnum type;\n    if (bp == s->stack_buf) return 0;\n");
-  fprintf(o, "    while (sp > bp) { capture[sp[-2].val] = sp[-1].ptr; sp -= 2; }\n");
-  fprintf(o, "    rpc = sp[-3].ptr; cptr = sp[-2].ptr; type = sp[-1].bp.type;\n");
-  fprintf(o, "    if (type == RE_EXEC_STATE_RUN) {\n      PREV_CHAR(cptr, s->cbuf, cbuf_type);\n");
-  fprintf(o, "      if (cptr > sp[-4].ptr) { sp[-2].ptr = (uint8_t *)cptr; } else { bp = s->stack_buf + sp[-1].bp.val; sp -= 4; }\n      break;\n    }\n");
-  fprintf(o, "    bp = s->stack_buf + sp[-1].bp.val; sp -= 3;\n    break;\n  }\n");
-  fprintf(o, "  if (lre_poll_timeout(s)) return LRE_RET_TIMEOUT;\n  goto *rpc;\n");
+  /* Nothing pushes a resume point without a label address, so a function with none has an empty stack at no_match: the failure is final. clang rejects a computed goto in a function that never takes a label address. */
+  if (x->nlabels == 0) {
+    fprintf(o, "  no_match:\n  (void)rpc; (void)sp; (void)bp; (void)stack_end;\n  return 0;\n");
+  } else {
+    fprintf(o, "  no_match:\n  for (;;) {\n    REExecStateEnum type;\n    if (bp == s->stack_buf) return 0;\n");
+    fprintf(o, "    while (sp > bp) { capture[sp[-2].val] = sp[-1].ptr; sp -= 2; }\n");
+    fprintf(o, "    rpc = sp[-3].ptr; cptr = sp[-2].ptr; type = sp[-1].bp.type;\n");
+    fprintf(o, "    if (type == RE_EXEC_STATE_RUN) {\n      PREV_CHAR(cptr, s->cbuf, cbuf_type);\n");
+    fprintf(o, "      if (cptr > sp[-4].ptr) { sp[-2].ptr = (uint8_t *)cptr; } else { bp = s->stack_buf + sp[-1].bp.val; sp -= 4; }\n      break;\n    }\n");
+    fprintf(o, "    bp = s->stack_buf + sp[-1].bp.val; sp -= 3;\n    break;\n  }\n");
+    fprintf(o, "  if (lre_poll_timeout(s)) return LRE_RET_TIMEOUT;\n  goto *rpc;\n");
+  }
   fprintf(o, "  /* (the class macros end here) */\n}\n");
   { int k; for (k = 0; k < x->ncls; k++) fprintf(o, "#undef RC%d\n", k); }
 }
@@ -413,10 +422,10 @@ int rx_emit(FILE *o, const char *name, const uint8_t *bc, size_t len, int want16
   x.o = o;
   if (!rx_prepass(&x)) { free(x.tgt); free(x.skip); return 0; }
   rx_preamble(o);
-  x.w = 8; x.ncls = 0;
+  x.w = 8; x.ncls = 0; x.nlabels = 0;
   rx_func(&x);
   *has16 = want16 && !x.uni;
-  if (*has16) { x.w = 16; x.ncls = 0; rx_func(&x); }
+  if (*has16) { x.w = 16; x.ncls = 0; x.nlabels = 0; rx_func(&x); }
   free(x.tgt); free(x.skip);
   return 1;
 }
