@@ -929,7 +929,8 @@ JSValue QuickJSRuntime::throwAsJSException(
     return JS_Throw(
         context_, JS_DupValue(context_, toJSValue(jsError->value())));
   }
-  return JS_ThrowInternalError(
+  // A plain Error, so script can catch it (an InternalError is uncatchable).
+  return JS_ThrowPlainError(
       context_, "Exception in %s: %s", origin,
       e != nullptr ? e->what() : "unknown C++ exception");
 }

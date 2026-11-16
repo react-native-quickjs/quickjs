@@ -1021,7 +1021,7 @@ JSValue buildIntl(JSContext *ctx) {
   if (JS_IsException(factory)) return factory;
   if (!JS_IsFunction(ctx, factory)) {
     JS_FreeValue(ctx, factory);
-    return JS_ThrowInternalError(
+    return JS_ThrowPlainError(
         ctx, "Intl layer did not evaluate to a factory");
   }
 
