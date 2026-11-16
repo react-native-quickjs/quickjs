@@ -20,7 +20,7 @@
  *
  *   qjs-bench [--mem] [--stats] [--shell [--intl]] [--bytecode-mode=<mode>] <file.js|file.bc> [-- args]
  *
- * --shell adds what a JS shell provides (printErr, readFile, read, loadString,
+ * --shell adds what a JS shell provides (printErr, readFile, read, loadString, loadBytecode,
  * runString, setTimeout/clearTimeout, `arguments` from the words after --), for drivers such as
  * JetStream's cli.js; without it the global object is as described above.
  *
@@ -139,7 +139,7 @@ static uint8_t *read_file(const char *path, size_t *out_size) {
 }
 
 /* ---- --shell: what a JS shell gives a script (JetStream's cli.js) -------------------------------
-   printErr, readFile(path), read(path[, "binary"]), setTimeout, loadString(src) -- evaluated as a global script
+   printErr, readFile(path), read(path[, "binary"]), setTimeout, loadString(src) -- evaluated as a global script, loadBytecode(path) likewise for a qjsc file --
    in the realm the function belongs to -- and runString(src), which makes a new global (a context on
    the same runtime) carrying the same functions, evaluates src there and returns that global. Only
    installed under --shell, so every other run keeps `print` alone. */
@@ -198,6 +198,33 @@ static JSValue js_load_string(
   if (name) JS_FreeCString(ctx, name);
   JS_FreeCString(ctx, src);
   return r;
+}
+
+/* loadBytecode(path): runs a qjsc bytecode file (an NSBCNGS container) as a global script in the realm the
+   function belongs to, as loadString does for source. A driver loads its workload files this way when they
+   were precompiled, so the benchmark runs the optimised program a real app ships instead of compiling it. */
+static JSValue js_load_bytecode(
+    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  const char *path;
+  uint8_t *buf;
+  size_t size = 0;
+  JSValue fn;
+  (void)this_val;
+  (void)argc;
+  path = JS_ToCString(ctx, argv[0]);
+  if (!path) return JS_EXCEPTION;
+  buf = read_file(path, &size);
+  if (!buf || size < NSBC_HEADER_SIZE || memcmp(buf, NSBC_MAGIC, 7) != 0) {
+    fn = JS_ThrowTypeError(ctx, "%s is not a bytecode file", path);
+    free(buf);
+    JS_FreeCString(ctx, path);
+    return fn;
+  }
+  JS_FreeCString(ctx, path);
+  fn = JS_ReadObject(ctx, buf + NSBC_HEADER_SIZE, size - NSBC_HEADER_SIZE, JS_READ_OBJ_BYTECODE);
+  free(buf);
+  if (JS_IsException(fn)) return fn;
+  return JS_EvalFunction(ctx, fn);
 }
 
 /* setTimeout/clearTimeout: a timer runs when no promise job is pending, in order of its due time on
@@ -275,9 +302,11 @@ static int shell_run_timer(int *status) {
 static JSValue js_run_string(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 
 static int shell_intl; /* --intl: every shell realm gets Intl */
-/* Source is compiled optimised, so steady-state rows measure the optimising
-   compiler's code; --fast-compile measures the fast compile mode instead. */
-static int bench_compile_mode = JS_COMPILE_OPTIMIZE;
+/* Source compiled at run time uses the runtime's default, the fast mode, as in
+   an app: benchmarks run qjsc bytecode, so this only reaches code a workload
+   compiles itself (eval, new Function, loadString). --optimize-compile
+   compiles run-time source with the optimising compiler instead. */
+static int bench_compile_mode = JS_COMPILE_FAST;
 
 static void shell_install(JSContext *ctx, JSValueConst g) {
 #if defined(QJS_BENCH_INTL) && QJS_BENCH_INTL
@@ -288,6 +317,7 @@ static void shell_install(JSContext *ctx, JSValueConst g) {
   JS_SetPropertyStr(ctx, g, "readFile", JS_NewCFunction(ctx, js_read_file, "readFile", 1));
   JS_SetPropertyStr(ctx, g, "read", JS_NewCFunction(ctx, js_read_file, "read", 2));
   JS_SetPropertyStr(ctx, g, "loadString", JS_NewCFunction(ctx, js_load_string, "loadString", 2));
+  JS_SetPropertyStr(ctx, g, "loadBytecode", JS_NewCFunction(ctx, js_load_bytecode, "loadBytecode", 1));
   JS_SetPropertyStr(ctx, g, "runString", JS_NewCFunction(ctx, js_run_string, "runString", 1));
   JS_SetPropertyStr(ctx, g, "setTimeout", JS_NewCFunction(ctx, js_set_timeout, "setTimeout", 2));
   JS_SetPropertyStr(ctx, g, "clearTimeout", JS_NewCFunction(ctx, js_clear_timeout, "clearTimeout", 1));
@@ -712,8 +742,8 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--mem"))
       mem = 1;
-    else if (!strcmp(argv[i], "--fast-compile"))
-      bench_compile_mode = JS_COMPILE_FAST;
+    else if (!strcmp(argv[i], "--optimize-compile"))
+      bench_compile_mode = JS_COMPILE_OPTIMIZE;
     else if (!strcmp(argv[i], "--stats"))
       stats = 1;
     else if (!strncmp(argv[i], "--bytecode-mode=", 16))
@@ -744,7 +774,7 @@ int main(int argc, char **argv) {
   if (!path) {
     fprintf(
         stderr,
-        "usage: qjs-bench [--mem] [--stats] [--fast-compile] [--shell [--intl]] "
+        "usage: qjs-bench [--mem] [--stats] [--optimize-compile] [--shell [--intl]] "
         "[--bytecode-mode=<eager|lazy-copy|lazy-borrow>] <file.js|file.bc> "
         "[-- args]\n");
     return 2;

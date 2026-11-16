@@ -8,11 +8,12 @@
 /*
  * qjsaot -- the AOT unit generator.
  *
- *   qjsaot --out aot_unit.c [--all] [--budget N] [--profile app.qjsprof] bundle.js ...
+ *   qjsaot --out aot_unit.c [--all] [--budget N] [--profile app.qjsprof] [--from-source] bundle.bc ...
  *
- * The generator links a QJS_REGVM engine built with -DQJS_AOT_GEN. It compiles
- * each bundle exactly as the app will (same flags, so the same register
- * bytecode and therefore the same digest), enumerates every eligible function,
+ * The generator links a QJS_REGVM engine built with -DQJS_AOT_GEN. It reads
+ * each bundle's qjsc bytecode, the program the app loads (so the same register
+ * bytecode and therefore the same digest); --from-source compiles a source
+ * bundle here instead, optimised as qjsc does. It enumerates every eligible function,
  * and emits a translation unit of step-only bodies plus the digest-sorted
  * binding table. Hot opcodes get inline templates (Layer A) and typed loop
  * regions (Layer B); every other instruction calls qjs_aot_step.
@@ -59,6 +60,55 @@ static char *read_file(const char *path, long *len_out) {
   fclose(f);
   *len_out = len;
   return buf;
+}
+
+/* An input is a qjsc bytecode file by default: an NSBCNGS container (a
+   12-byte header, then JS_WriteObject's bytes), read eagerly so every function
+   is materialized for the collector. The unit binds to the digests of the
+   program as read, which is the program the app loads. `from_source` is the
+   explicit path that compiles a source input here instead (always optimised in
+   the generator build, as qjsc would). Returns the top-level value, kept alive
+   by the caller until the collector has run, or JS_EXCEPTION with the reason
+   printed. */
+#define QJSAOT_NSBC_MAGIC "NSBCNGS"
+#define QJSAOT_NSBC_HEADER_SIZE 12
+int qjsaot_from_source;
+static char *read_file(const char *path, long *len_out);
+JSValue qjsaot_load_input(JSContext *ctx, const char *path) {
+  long len = 0;
+  char *buf = read_file(path, &len);
+  JSValue v;
+  if (!buf) {
+    fprintf(stderr, "qjsaot: cannot read %s\n", path);
+    return JS_EXCEPTION;
+  }
+  if (len >= QJSAOT_NSBC_HEADER_SIZE && memcmp(buf, QJSAOT_NSBC_MAGIC, 7) == 0) {
+    v = JS_ReadObject(ctx, (const uint8_t *)buf + QJSAOT_NSBC_HEADER_SIZE,
+                      (size_t)len - QJSAOT_NSBC_HEADER_SIZE, JS_READ_OBJ_BYTECODE);
+  } else if (!qjsaot_from_source) {
+    fprintf(stderr, "qjsaot: %s is not a qjsc bytecode file; compile it with qjsc, "
+            "or pass --from-source to compile the source here\n", path);
+    free(buf);
+    return JS_EXCEPTION;
+  } else {
+    v = JS_Eval(ctx, buf, (size_t)len, path,
+                JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(v)) {
+      JS_FreeValue(ctx, JS_GetException(ctx));
+      v = JS_Eval(ctx, buf, (size_t)len, path,
+                  JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    }
+  }
+  if (JS_IsException(v)) {
+    JSValue e = JS_GetException(ctx);
+    const char *m = JS_ToCString(ctx, e);
+    fprintf(stderr, "qjsaot: %s: %s\n", path, m ? m : "(unprintable)");
+    JS_FreeCString(ctx, m);
+    JS_FreeValue(ctx, e);
+    v = JS_EXCEPTION;
+  }
+  free(buf);
+  return v;
 }
 
 static int digest_cmp(const void *a, const void *b) {
@@ -3381,6 +3431,8 @@ int qjsaot_driver_main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--verify-ir") == 0 ||
                strcmp(argv[i], "--stats") == 0) {
       /* ditto */
+    } else if (strcmp(argv[i], "--from-source") == 0) {
+      qjsaot_from_source = 1;
     } else if (argv[i][0] == '-') {
       fprintf(stderr, "qjsaot: unknown option %s\n", argv[i]);
       free(inputs);
@@ -3394,7 +3446,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         stderr,
         "usage: qjsaot --out aot_unit.c [--all] [--budget N] "
         "[--hot-cover F] [--min-ops N] [--profile app.qjsprof] "
-        "bundle.js ...\n");
+        "[--from-source] bundle.bc ...\n");
     free(inputs);
     return 2;
   }
@@ -3424,33 +3476,12 @@ int qjsaot_driver_main(int argc, char **argv) {
   }
 
   for (i = 0; i < ninputs; i++) {
-    long len = 0;
-    char *src = read_file(inputs[i], &len);
-    JSValue v;
-    if (!src) {
-      fprintf(stderr, "qjsaot: cannot read %s\n", inputs[i]);
+    JSValue v = qjsaot_load_input(ctx, inputs[i]);
+    if (JS_IsException(v)) {
       fails++;
       continue;
     }
-    v = JS_Eval(
-        ctx, src, (size_t)len, inputs[i],
-        JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
-    if (JS_IsException(v)) {
-      JS_FreeValue(ctx, JS_GetException(ctx));
-      v = JS_Eval(
-          ctx, src, (size_t)len, inputs[i],
-          JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    }
-    if (JS_IsException(v)) {
-      JSValue e = JS_GetException(ctx);
-      const char *s = JS_ToCString(ctx, e);
-      fprintf(stderr, "qjsaot: %s: %s\n", inputs[i], s ? s : "(unprintable)");
-      JS_FreeCString(ctx, s);
-      JS_FreeValue(ctx, e);
-      fails++;
-    }
     keep[nkeep++] = v;
-    free(src);
   }
   free(inputs);
 

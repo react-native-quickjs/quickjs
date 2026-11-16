@@ -38,6 +38,7 @@ One try is change → build → measure → decide, in minutes.
 
 ## Measuring
 
+- Benchmarks, profiles and AOT run on qjsc bytecode; compile speed is measured separately (`tools/bytecode/compile-bench.sh`).
 - Cycles decide: `perf stat -e cycles:u,instructions:u` on a fixed-work run. Instructions explain, never decide. Benchmark scores are not used.
 - One run each for A and B, back to back; repeat only when the difference is under ~2%.
 - A and B use the identical build recipe; only the change differs.

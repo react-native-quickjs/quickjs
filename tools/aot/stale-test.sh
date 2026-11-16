@@ -56,21 +56,28 @@ done
 "$CLANG" -o "$O/plain-run" "$O/obj/qjs-bench.o" \
   "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm $LDX || exit 1
 
+# Both bundles are qjsc bytecode from this engine, as an app ships them.
+"$CLANG" -O2 $BASE -c tools/bytecode/qjsc.c -o "$O/obj/qjsc.o" || exit 1
+"$CLANG" -o "$O/qjsc" "$O/obj/qjsc.o" \
+  "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm $LDX || exit 1
+"$O/qjsc" "$O/bundleA.js" "$O/bundleA.bc" > /dev/null || exit 1
+"$O/qjsc" "$O/bundleB.js" "$O/bundleB.bc" > /dev/null || exit 1
+
 log "generate unit from bundle A"
-"$O/qjsaot" --out "$O/unitA.c" --layout-header "$O/unitA-layout.h" --all "$O/bundleA.js" 2>"$O/unitA.census" || exit 1
+"$O/qjsaot" --out "$O/unitA.c" --layout-header "$O/unitA-layout.h" --all "$O/bundleA.bc" 2>"$O/unitA.census" || exit 1
 "$CLANG" -O2 $BASE -I"$O" -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/unitA.c" -o "$O/obj/unitA.o" || exit 1
 "$CLANG" -o "$O/bench-A" "$O/obj/qjs-bench.o" "$O/obj/unitA.o" \
   "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm $LDX || exit 1
 
 # --- run --------------------------------------------------------------------
 log "run plain interpreter on both bundles"
-"$O/plain-run" "$O/bundleA.js" > "$O/plainA.out" 2>&1
-"$O/plain-run" "$O/bundleB.js" > "$O/plainB.out" 2>&1
+"$O/plain-run" "$O/bundleA.bc" > "$O/plainA.out" 2>&1
+"$O/plain-run" "$O/bundleB.bc" > "$O/plainB.out" 2>&1
 
 log "run the bundle-A unit against bundle A (all bind)"
-QJS_AOT_STATS=1 "$O/bench-A" "$O/bundleA.js" > "$O/aotA.out" 2> "$O/aotA.err"
+QJS_AOT_STATS=1 "$O/bench-A" "$O/bundleA.bc" > "$O/aotA.out" 2> "$O/aotA.err"
 log "run the bundle-A unit against bundle B (f2 stale)"
-QJS_AOT_STATS=1 "$O/bench-A" "$O/bundleB.js" > "$O/aotB.out" 2> "$O/aotB.err"
+QJS_AOT_STATS=1 "$O/bench-A" "$O/bundleB.bc" > "$O/aotB.out" 2> "$O/aotB.err"
 
 # --- check ------------------------------------------------------------------
 chk() { # chk <label> <plain> <aot>

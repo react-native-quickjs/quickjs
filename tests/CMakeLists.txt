@@ -84,9 +84,11 @@ if(NODE_EXECUTABLE)
   # Twice, because they are not the same path: React Native ships bytecode, and
   # anything the compiler derives from source that the serializer drops is
   # present in one run and absent in the other.
+  # Source is compiled with the optimising compiler (the one that writes bytecode) here, and with the runtime's
+  # default, the fast mode, in differential_fast.
   add_test(NAME differential
     COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
-            --qjs $<TARGET_FILE:qjs-run>)
+            --qjs $<TARGET_FILE:qjs-run> --qjs-arg --optimize-compile)
   add_test(NAME differential_bytecode
     COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
             --qjs $<TARGET_FILE:qjs-run> --qjsc $<TARGET_FILE:qjsc>
@@ -98,29 +100,29 @@ if(NODE_EXECUTABLE)
   # A reference counted and never released leaves objects at teardown; QJS_DEBUG_LEAK reports them in any build.
   add_test(NAME differential_leaks
     COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
-            --qjs $<TARGET_FILE:qjs-run> --leak-check)
+            --qjs $<TARGET_FILE:qjs-run> --qjs-arg --optimize-compile --leak-check)
   # The fast compile mode (eval, new Function and runtime source loads in an app): the corpus compiled by it, with
   # the leak check.
   add_test(NAME differential_fast
     COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
-            --qjs $<TARGET_FILE:qjs-run> --qjs-arg --fast-compile --leak-check)
+            --qjs $<TARGET_FILE:qjs-run> --leak-check)
   # Mixed programs: the host part as qjsc's optimised bytecode, every payload compiled at run time by the fast
   # mode, calling, capturing and throwing through each other.
   add_test(NAME differential_mixed
     COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
             --corpus mixed --qjs $<TARGET_FILE:qjs-run> --qjsc $<TARGET_FILE:qjsc>
-            --via-bytecode --qjs-arg --fast-compile --leak-check)
+            --via-bytecode --leak-check)
   # Under the GC stress mode the differential test above runs with the allocation stress; this one adds a
   # collection at every back edge and call. The two catch different missed roots (engine/patches/0619).
   if(QJS_GC_STRESS)
     add_test(NAME differential_gc_stress_poll
       COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
-              --qjs $<TARGET_FILE:qjs-run>)
+              --qjs $<TARGET_FILE:qjs-run> --qjs-arg --optimize-compile)
     set_tests_properties(differential_gc_stress_poll PROPERTIES ENVIRONMENT "QJS_GC_STRESS_POLL=1")
     add_test(NAME differential_mixed_gc_stress_poll
       COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/differential/run.mjs
               --corpus mixed --qjs $<TARGET_FILE:qjs-run> --qjsc $<TARGET_FILE:qjsc>
-              --via-bytecode --qjs-arg --fast-compile)
+              --via-bytecode)
     set_tests_properties(differential_mixed_gc_stress_poll PROPERTIES ENVIRONMENT "QJS_GC_STRESS_POLL=1")
   endif()
 else()
@@ -151,5 +153,7 @@ if(QJS_AOT AND QJS_AOT_UNIT AND NOT MSVC)
       -DROOT=${PROJECT_SOURCE_DIR}
       -DUNIT=${QJS_AOT_UNIT}
       -DBIN=$<TARGET_FILE:qjs-bench>
+      -DQJSC=$<TARGET_FILE:qjsc>
+      -DWORK=${CMAKE_CURRENT_BINARY_DIR}
       -P ${CMAKE_CURRENT_SOURCE_DIR}/aot-unit-binds.cmake)
 endif()

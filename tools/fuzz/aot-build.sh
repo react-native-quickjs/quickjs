@@ -1,6 +1,8 @@
 #!/bin/bash
 # aot-build.sh TRAIN.js OUTDIR : profile TRAIN.js, generate and compile its AOT unit (no LTO, -O1), link OUTDIR/run
-# Needs the m1 objects (.local/m1/m1.sh build). The binary runs a script like qjs-bench/run-plain.
+# Needs the m1 objects (.local/m1/m1.sh build). The binary runs a script like qjs-bench/run-plain. The profile run and
+# the generator load TRAIN.js as qjsc bytecode (m1's qjsc, OUTDIR/train.bc), as an app ships it; run the binary on .bc.
+
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 M=${M:-$ROOT/.local/m1}; S=$ROOT/engine/quickjs-ng
@@ -8,6 +10,8 @@ T=$1; O=$2; mkdir -p "$O"
 BASE="-std=gnu11 -D_GNU_SOURCE -DJS_ENABLE_DEBUGGER=0 -I$S"
 LDX=; [ "$(uname)" = Darwin ] && LDX="-Wl,-undefined,dynamic_lookup"
 L="$M/libregexp.o $M/libunicode.o $M/dtoa.o -lm"
+$M/qjsc "$T" "$O/train.bc" > "$O/qjsc.out" 2>&1 || { echo "qjsc failed"; exit 6; }
+T=$O/train.bc
 QJS_AOT_PROFILE_OUT=$O/p.qjsprof timeout ${PROF_TIMEOUT:-60} $M/run-prof "$T" > "$O/prof.out" 2>&1
 prc=$?
 if [ $prc -ge 124 ] || grep -q Assertion "$O/prof.out"; then echo "profile-run failed rc=$prc"; exit 2; fi

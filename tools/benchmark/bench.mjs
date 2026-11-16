@@ -19,7 +19,6 @@ import {
 } from "node:fs";
 import { join, dirname, resolve, relative, basename } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
 import * as device from "./lib/device.mjs";
 import * as hermes from "./lib/hermes.mjs";
 import * as js3 from "./jetstream3/jetstream3.mjs";
@@ -31,6 +30,38 @@ const OCTANE = join(HERE, "octane");
 const KERNELS = join(HERE, "kernels");
 const LIB = join(HERE, "lib");
 const HARNESS = join(LIB, "harness.js");
+const BCCACHE = join(ROOT, "tools", "bytecode", "bccache");
+/* Files bench.mjs writes for a run (a workload joined with its harness, a
+   kernel file rewritten for one row) live here, never in /tmp. */
+const SCRATCH = join(ROOT, "build-bench", "tmp");
+
+function scratchFile(stem, ext) {
+  mkdirSync(SCRATCH, { recursive: true });
+  return join(
+    SCRATCH,
+    `${stem}-${process.pid}-${Math.random().toString(36).slice(2)}${ext}`,
+  );
+}
+
+/* Every qjs row runs qjsc bytecode, the program an app ships: the file is
+   compiled once by the qjsc of the engine's own build (beside its qjs-bench,
+   or the host qjsc built with a device's flags) and cached by
+   tools/bytecode/bccache. Code a workload compiles at run time (eval, new
+   Function) still compiles there, with the runtime's fast mode. Other engines
+   take the source. */
+function qjscFor(engine) {
+  if (engine.device) return engine.device.qjsc;
+  const p = join(dirname(engine.bin), "qjsc");
+  if (!existsSync(p))
+    fail(`no qjsc beside ${engine.bin}: build the qjsc target of that build`);
+  return p;
+}
+function toBytecode(engine, file) {
+  if (engine.kind !== "qjs") return file;
+  return execFileSync(BCCACHE, ["--qjsc", qjscFor(engine), file], {
+    encoding: "utf8",
+  }).trim();
+}
 
 function fail(msg, code = 2) {
   console.error(`bench: ${msg}`);
@@ -60,6 +91,7 @@ function parseArgs(argv) {
     n: null,
     ab_label: null,
     device: false,
+    startup_source: false,
     ab_only: false,
     ab_baseline: null,
     all: false,
@@ -83,6 +115,7 @@ function parseArgs(argv) {
     else if (a === "--mem") out.mem = true;
     else if (a === "--no-mem") out.no_mem = true;
     else if (a === "--device") out.device = true;
+    else if (a === "--startup-source") out.startup_source = true;
     else if (a === "--reps") out.reps = Math.max(1, Number(argv[++i]));
     else if (a === "--min-ms") {
       out.min_ms = Number(argv[++i]);
@@ -129,7 +162,8 @@ options:
   --reps N             process reps (default 1)
   --min-ms N           workload calibration floor (default 100)
   --scale N            multiply every workload's n (default 1)
-  --n N                one-shot for startup: bundle path
+  --n N                one-shot for startup: bundle path (timed as its qjsc
+                       bytecode; --startup-source times the source instead)
   --mem / --no-mem     capture/don't capture engine memory per row
   --save [file]        record to baseline
   --against [file]     compare, exit 1 on regression (pinned iters)
@@ -416,13 +450,17 @@ function runWorkload(suite, row, engine, args, baselineIters) {
     ) +
     src +
     tail;
-  const tmp = join(
-    tmpdir(),
-    `rnqjs-bench-${process.pid}-${Math.random().toString(36).slice(2)}.js`,
-  );
+  const tmp = scratchFile("workload", ".js");
   writeFileSync(tmp, combined);
   const wantMem = args.mem || engine.kind === "qjs";
-  const argv = engine.extra.concat(wantMem ? ["--mem"] : [], [tmp]);
+  let input;
+  try {
+    input = toBytecode(engine, tmp);
+  } catch (e) {
+    spawnSync("rm", [tmp], { stdio: "ignore" });
+    return { error: `qjsc: ${String(e.message || e).slice(0, 200)}` };
+  }
+  const argv = engine.extra.concat(wantMem ? ["--mem"] : [], [input]);
   const p = launch(engine, argv);
   try {
     spawnSync("rm", [tmp], { stdio: "ignore" });
@@ -471,8 +509,14 @@ function runOctane(suite, row, engine, args) {
   const file = join(corpusDir, `${row}.js`);
   if (!existsSync(file)) return { error: "row not in corpus" };
   const wantMem = args.no_mem ? false : args.mem || engine.kind === "qjs";
+  let input;
+  try {
+    input = toBytecode(engine, file);
+  } catch (e) {
+    return { error: `qjsc: ${String(e.message || e).slice(0, 200)}` };
+  }
   const argv = engine.extra.concat(["--stats"], wantMem ? ["--mem"] : [], [
-    file,
+    input,
   ]);
   const p = launch(engine, argv, { timeout: 300000 });
   if (p.status !== 0)
@@ -509,10 +553,33 @@ function runJetStream3(suite, row, engine, args) {
     iterations: args.js3_iterations,
     worstCase: args.js3_worst,
   });
-  const tail = ["--"].concat(js3.shimArgs(), driver);
+  let tail = ["--"].concat(js3.shimArgs(), driver);
   let argv;
+  let mf = null;
   let mem = null;
   const wantMem = engine.kind === "qjs" && !args.no_mem;
+  if (engine.kind === "qjs" && !engine.device) {
+    /* The workload's scripts run from qjsc bytecode: each is compiled from
+       the JetStream directory under the name the driver loads it by (so the
+       bytecode carries the same file names), and the shim's load() reads
+       the manifest. */
+    const manifest = {};
+    try {
+      for (const f of js3.scriptFiles(row)) {
+        const name = existsSync(join(js3.JS3, f.url)) ? f.url : f.path;
+        manifest[f.url] = execFileSync(
+          BCCACHE,
+          ["--qjsc", qjscFor(engine), name],
+          { cwd: js3.JS3, encoding: "utf8" },
+        ).trim();
+      }
+    } catch (e) {
+      return { error: `qjsc: ${String(e.message || e).slice(0, 200)}` };
+    }
+    mf = scratchFile(`js3-${row}`, ".json");
+    writeFileSync(mf, JSON.stringify(manifest));
+    tail = ["--"].concat(js3.shimArgs(), [`--js3-bc=${mf}`], driver);
+  }
   if (engine.kind === "qjs")
     argv = engine.extra.concat(
       ["--shell"],
@@ -558,6 +625,7 @@ function runJetStream3(suite, row, engine, args) {
     return { score, sub, ms: b.buildMs, bytes: b.bytes };
   } else return { error: `jetstream3 does not run on ${engine.kind}` };
   const p = launch(engine, argv, { cwd: js3.JS3, timeout: 1800000 });
+  if (mf) spawnSync("rm", [mf], { stdio: "ignore" });
   const out = (p.stdout || "") + "\n" + (p.stderr || "");
   for (const line of (p.stderr || "").split("\n"))
     if (line.startsWith("##MEM## "))
@@ -592,12 +660,16 @@ function runKernels(suite, row, engine, args) {
     `var CB_REPS = ${Math.max(1, args.reps)};`,
   );
   const wantMem = args.mem || engine.kind === "qjs";
-  const tmp = join(
-    tmpdir(),
-    `rnqjs-kernel-${process.pid}-${Math.random().toString(36).slice(2)}.js`,
-  );
+  const tmp = scratchFile("kernel", ".js");
   writeFileSync(tmp, text);
-  const argv = engine.extra.concat(wantMem ? ["--mem"] : [], [tmp]);
+  let input;
+  try {
+    input = toBytecode(engine, tmp);
+  } catch (e) {
+    spawnSync("rm", [tmp], { stdio: "ignore" });
+    return { error: `qjsc: ${String(e.message || e).slice(0, 200)}` };
+  }
+  const argv = engine.extra.concat(wantMem ? ["--mem"] : [], [input]);
   const p = launch(engine, argv, { timeout: 300000 });
   try {
     spawnSync("rm", [tmp], { stdio: "ignore" });
@@ -668,8 +740,18 @@ function runStartup(suite, row, engine, args, baselineIters) {
     return { error: "startup needs a bundle/file (--n <path>)" };
   let best = Infinity,
     stats = null;
+  /* An app loads its bundle as bytecode; --startup-source times compiling the
+     source instead. */
+  let input = args.n;
+  if (!args.startup_source) {
+    try {
+      input = toBytecode(engine, args.n);
+    } catch (e) {
+      return { error: `qjsc: ${String(e.message || e).slice(0, 200)}` };
+    }
+  }
   for (let i = 0; i < (args.reps > 1 ? args.reps : 5); i++) {
-    const argv = engine.extra.concat(["--stats"], [args.n]);
+    const argv = engine.extra.concat(["--stats"], [input]);
     const p = launch(engine, argv, { timeout: 120000 });
     if (p.status !== 0) continue;
     for (const line of (p.stderr || "").split("\n")) {

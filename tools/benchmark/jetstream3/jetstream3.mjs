@@ -123,6 +123,25 @@ function filesOf(b) {
   return out;
 }
 
+/* The scripts a workload's run loads (its `files`, not its preloaded
+ * resources), each as the name the driver passes to load() (a .z file by its
+ * uncompressed name) and the file that holds it: in the submodule, or the
+ * inflated copy under build/assets. bench.mjs precompiles these to qjsc
+ * bytecode for qjs-bench; preloaded resources are data and stay files. */
+export function scriptFiles(name) {
+  const b = plan().find((x) => x.name === name);
+  if (!b) throw new Error(`unknown jetstream3 workload ${name}`);
+  const out = [];
+  for (const x of b.subs || [b]) {
+    for (const f of x.files) {
+      const url = f.endsWith(".z") ? f.slice(0, -2) : f;
+      const inTree = join(JS3, url);
+      out.push({ url, path: existsSync(inTree) ? inTree : join(ASSETS, url) });
+    }
+  }
+  return out;
+}
+
 /* Inflates the .z resources the included workloads name into build/assets,
  * at the path the driver asks for (the name without .z). */
 export function prepareAssets({ quiet = false } = {}) {

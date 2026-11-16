@@ -7,9 +7,11 @@
 #                             first (different atom ids) => same digest
 #   3. content sensitive    - a one-token edit => different digest
 #
-# Usage: tools/aot/digest-test.sh [path/to/qjsprof]
+# Usage: tools/aot/digest-test.sh [path/to/qjsprof [path/to/qjsc]]
 # The binary must be a QJS_AOT_PROFILE build (e.g. the qjs-bench linked with
 # -DQJS_REGVM=1 -DQJS_AOT_PROFILE=1). Falls back to $QJS_AOT_PROF_BIN.
+# The profiled programs are qjsc bytecode, as every profile run loads: the
+# compiler is the second argument, $QJSC, or the qjsc beside the binary.
 
 set -euo pipefail
 
@@ -20,7 +22,9 @@ if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
     exit 2
 fi
 
-tmp="$(mktemp -d)"
+QJSC="${2:-${QJSC:-$(dirname "$BIN")/qjsc}}"
+[ -x "$QJSC" ] || { echo "$0: no qjsc at $QJSC" >&2; exit 2; }
+tmp="$(mktemp -d "$(dirname "$BIN")/digest-test.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 cat >"$tmp/base.js" <<'EOF'
@@ -44,7 +48,8 @@ EOF
 
 # Extract the digest of the F line whose name=foo.
 foo_digest() {
-    QJS_AOT_PROFILE_OUT="$tmp/out.qjsprof" "$BIN" "$1" >/dev/null 2>&1
+    "$QJSC" "$1" "$tmp/in.bc" >/dev/null
+    QJS_AOT_PROFILE_OUT="$tmp/out.qjsprof" "$BIN" "$tmp/in.bc" >/dev/null 2>&1
     awk '$1=="F" && $3=="name=foo"{print $2; exit}' "$tmp/out.qjsprof"
 }
 

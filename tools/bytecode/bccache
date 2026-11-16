@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# bccache -- compile JavaScript to qjsc bytecode once, and reuse it.
+#
+#   bccache [--qjsc PATH] [--dir DIR] [--flag QJSC_FLAG]... file.js...
+#
+# Prints one line per input: the path of its bytecode (an NSBCNGS container, as
+# qjsc writes it), compiling only on a miss. Benchmarks, profile runs and the
+# AOT generator load these files, so they all run the optimised program an app
+# ships and never compile the benchmark's source at run time.
+#
+# The key is the qjsc binary's content, the qjsc flags, the input's path as
+# given (qjsc compiles it into the bytecode's file names, which stack traces
+# print, so it is passed through unchanged) and its content. The
+# binary embeds the engine and its build flags and VM, so a changed engine,
+# define set or VM is a different key, uncommitted edits included.
+#
+#   --qjsc PATH   the compiler (default: $QJSC, else build-regvm/qjsc). Use the
+#                 qjsc linked with the same engine objects as the binary that
+#                 will load the bytecode: register code depends on the build.
+#   --dir DIR     the cache (default: bc-cache next to the compiler). Never /tmp.
+#   --flag F      pass F to qjsc (repeatable), e.g. --flag --strip-source.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+QJSC=${QJSC:-$ROOT/build-regvm/qjsc}
+DIR=
+FLAGS=()
+die() { printf 'bccache: %s\n' "$*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --qjsc) QJSC=$2; shift 2 ;;
+    --dir) DIR=$2; shift 2 ;;
+    --flag) FLAGS+=("$2"); shift 2 ;;
+    --) shift; break ;;
+    -*) die "unknown option $1" ;;
+    *) break ;;
+  esac
+done
+[ $# -gt 0 ] || die "usage: bccache [--qjsc PATH] [--dir DIR] [--flag F]... file.js..."
+[ -x "$QJSC" ] || die "no qjsc at $QJSC"
+QJSC=$(cd "$(dirname "$QJSC")" && pwd)/$(basename "$QJSC")
+[ -n "$DIR" ] || DIR=$(dirname "$QJSC")/bc-cache
+case $DIR in /tmp|/tmp/*) die "the cache must not be under /tmp" ;; esac
+mkdir -p "$DIR"
+
+tool=$( { sha256sum < "$QJSC" | cut -c1-64; printf '%s\n' "${FLAGS[@]+"${FLAGS[@]}"}"; } | sha256sum | cut -c1-64)
+for src in "$@"; do
+  [ -f "$src" ] || die "cannot read $src"
+  key=$( { printf '%s\n%s\n' "$tool" "$src"; sha256sum < "$src" | cut -c1-64; } | sha256sum | cut -c1-16)
+  out=$DIR/$(basename "$src" .js)-$key.bc
+  if [ ! -s "$out" ]; then
+    tmp=$out.$$.part
+    if ! "$QJSC" ${FLAGS[@]+"${FLAGS[@]}"} "$src" "$tmp" > "$tmp.log" 2>&1; then
+      cat "$tmp.log" >&2; rm -f "$tmp" "$tmp.log"
+      die "qjsc failed on $src"
+    fi
+    rm -f "$tmp.log"
+    mv -f "$tmp" "$out"
+  fi
+  printf '%s\n' "$out"
+done

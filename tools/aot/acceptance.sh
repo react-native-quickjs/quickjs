@@ -58,6 +58,14 @@ done
 "$CLANG" -o "$O/plain-run" "$O/obj/qjs-bench.o" \
   "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm || exit 1
 
+# Every arm loads qjsc bytecode, as an app does: a qjsc linked with this engine
+# compiles each script once (tools/bytecode/bccache, under $O/bc), and the
+# generator and both runs read that file.
+"$CLANG" -O2 $BASE -c tools/bytecode/qjsc.c -o "$O/obj/qjsc.o" || exit 1
+"$CLANG" -o "$O/qjsc" "$O/obj/qjsc.o" \
+  "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm || exit 1
+bcof() { tools/bytecode/bccache --qjsc "$O/qjsc" --dir "$O/bc" "$@"; }
+
 # ---- helpers ---------------------------------------------------------------
 # build_unit <tag> <js>  -> $O/<tag>.c, $O/obj/<tag>.o, $O/bench-<tag>
 build_unit() {
@@ -67,7 +75,7 @@ build_unit() {
   if [ "$tag" = box2d ] && [ -n "$PROFILE" ]; then
     pargs="--profile $PROFILE"; sargs=""
   fi
-  "$O/qjsaot" --out "$O/$tag.c" --layout-header "$O/$tag-layout.h" $sargs $pargs "$js" 2>"$O/$tag.census"
+  "$O/qjsaot" --out "$O/$tag.c" --layout-header "$O/$tag-layout.h" $sargs $pargs "$(bcof "$js")" 2>"$O/$tag.census"
   "$CLANG" $UNIT_OPT $BASE -I"$O" -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/$tag.c" -o "$O/obj/$tag.o" || return 1
   "$CLANG" -o "$O/bench-$tag" "$O/obj/qjs-bench.o" "$O/obj/$tag.o" \
     "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm || return 1
@@ -107,6 +115,7 @@ run_kernel() {
     jsrun="$O/kfast/$(basename "$js")"
   fi
   build_unit "$tag" "$js" || { ROWS+=("$label|build failed||||"); return; }
+  jsrun=$(bcof "$jsrun")
   "$O/plain-run" "$jsrun" > "$O/$tag-plain.out" 2>&1
   "$O/bench-$tag" "$jsrun" > "$O/$tag-aot.out" 2>&1
   checksums "$O/$tag-plain.out" "$O/$tag-plain.cs"
@@ -128,7 +137,7 @@ run_kernel abf "$K/aot_bench.js"      0 "aot_bench"
 # ---- box2d -----------------------------------------------------------------
 log "box2d"
 build_unit box2d "$BOX2D"
-QJS_AOT_STATS=1 "$O/bench-box2d" "$BOX2D" > "$O/box2d.out" 2>&1
+QJS_AOT_STATS=1 "$O/bench-box2d" "$(bcof "$BOX2D")" > "$O/box2d.out" 2>&1
 BOX=$(awk -F= '/box2d-checksum=/ {print $2}' "$O/box2d.out" | tail -1)
 BOXC=$(census_field "$O/box2d.census" functions); [ -z "$BOXC" ] && BOXC="?"
 BOXP=$(census_field "$O/box2d.census" "profiled ops"); [ -z "$BOXP" ] && BOXP="n/a (no profile)"
@@ -145,15 +154,18 @@ DIFF="not run (--full to include)"
 ASAN="not run (--full to include)"
 if [ "$FULL" = 1 ]; then
   log "test262 (--all, AOT harness unit)"
-  # The harness is a glob of files, so build the unit by hand.
-  "$O/qjsaot" --out "$O/t262.c" --layout-header "$O/t262-layout.h" --all \
+  # The harness is a glob of files, so build the unit by hand. run-test262
+  # compiles the harness from source for every test, so this arm opts in to
+  # the optimising compiler (-O) and the generator compiles the same sources
+  # itself (--from-source): both are explicit offline choices.
+  "$O/qjsaot" --from-source --out "$O/t262.c" --layout-header "$O/t262-layout.h" --all \
     $S/test262/harness/*.js "$BOX2D" 2>"$O/t262.census"
   "$CLANG" $UNIT_OPT $BASE -I"$O" -ffp-contract=off -DQJS_REGVM=1 -DQJS_AOT=1 -c "$O/t262.c" -o "$O/obj/t262.o"
   "$CLANG" -O2 $BASE -c $S/run-test262.c -o "$O/obj/run-test262.o"
   "$CLANG" -O2 $BASE -c $S/quickjs-libc.c -o "$O/obj/quickjs-libc.o"
   "$CLANG" -o "$O/aot-test262" "$O/obj/run-test262.o" "$O/obj/quickjs-libc.o" \
     "$O/obj/t262.o" "$O/obj/quickjs.o" "$O/obj/libregexp.o" "$O/obj/libunicode.o" "$O/obj/dtoa.o" -lm
-  ( cd $S && "$O/aot-test262" -m -t "${T262_THREADS:-3}" -c test262.conf -c test262-fast.conf -a > "$O/test262.out" 2>&1 )
+  ( cd $S && "$O/aot-test262" -O -m -t "${T262_THREADS:-3}" -c test262.conf -c test262-fast.conf -a > "$O/test262.out" 2>&1 )
   T262=$(grep -E '^Result:' "$O/test262.out" | tail -1)
 
   log "diff corpus"
@@ -181,7 +193,7 @@ if [ "$FULL" = 1 ]; then
   "$CLANG" -fsanitize=address,undefined -o "$O/aot-test262-asan" \
     "$O/obj/run-test262-asan.o" "$O/obj/quickjs-libc-asan.o" "$O/obj/t262-asan.o" \
     "$O/obj/quickjs-asan.o" "$O/obj/libregexp-asan.o" "$O/obj/libunicode-asan.o" "$O/obj/dtoa-asan.o" -lm
-  ( cd $S && "$O/aot-test262-asan" -m -t "${T262_THREADS:-3}" -c test262.conf -c test262-fast.conf -a > "$O/asan.out" 2>&1 )
+  ( cd $S && "$O/aot-test262-asan" -O -m -t "${T262_THREADS:-3}" -c test262.conf -c test262-fast.conf -a > "$O/asan.out" 2>&1 )
   T=$(grep -E '^Result:' "$O/asan.out" | tail -1)
   U=$(grep -c 'runtime error' "$O/asan.out")
   A=$(grep -c 'ERROR: AddressSanitizer' "$O/asan.out")

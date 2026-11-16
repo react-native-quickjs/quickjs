@@ -32,26 +32,9 @@
    and the selection are shared rather than copied. Emission mode therefore
    hands over to it; --verify-ir and --dump-ir stay here, where the IR lives. */
 int qjsaot_driver_main(int argc, char **argv);
-
-static char *read_file(const char *path, long *len_out) {
-  FILE *f = fopen(path, "rb");
-  long len;
-  char *buf;
-  if (!f) return NULL;
-  fseek(f, 0, SEEK_END);
-  len = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  buf = malloc((size_t)len + 1);
-  if (!buf || fread(buf, 1, (size_t)len, f) != (size_t)len) {
-    fclose(f);
-    free(buf);
-    return NULL;
-  }
-  buf[len] = 0;
-  fclose(f);
-  *len_out = len;
-  return buf;
-}
+/* driver.c: the input loader (qjsc bytecode, or source with --from-source). */
+extern int qjsaot_from_source;
+JSValue qjsaot_load_input(JSContext *ctx, const char *path);
 
 static int digest_cmp(const void *a, const void *b) {
   return memcmp(a, b, 16);
@@ -128,6 +111,10 @@ int main(int argc, char **argv) {
       profile = argv[++i];
       continue;
     }
+    if (strcmp(argv[i], "--from-source") == 0) {
+      qjsaot_from_source = 1;
+      continue;
+    }
     if (argv[i][0] == '-') {
       fprintf(stderr, "qjsaot: unknown option %s\n", argv[i]);
       return 2;
@@ -138,7 +125,7 @@ int main(int argc, char **argv) {
     fprintf(
         stderr,
         "usage: qjsaot --verify-ir|--dump-ir|--stats|--types "
-        "bundle.js ...\n");
+        "[--from-source] bundle.bc ...\n");
     return 2;
   }
 
@@ -164,8 +151,6 @@ int main(int argc, char **argv) {
   keep = malloc(sizeof(*keep) * (size_t)(ninputs > 0 ? ninputs : 1));
   if (!keep) return 2;
   for (i = 1; i < argc; i++) {
-    long len = 0;
-    char *src;
     JSValue v;
     if (argv[i][0] == '-') {
       /* Skip the value of a two-token option. This must know every such
@@ -176,31 +161,12 @@ int main(int argc, char **argv) {
         i++;
       continue;
     }
-    src = read_file(argv[i], &len);
-    if (!src) {
-      fprintf(stderr, "qjsaot: cannot read %s\n", argv[i]);
+    v = qjsaot_load_input(ctx, argv[i]);
+    if (JS_IsException(v)) {
       fails++;
       continue;
     }
-    v = JS_Eval(
-        ctx, src, (size_t)len, argv[i],
-        JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
-    if (JS_IsException(v)) {
-      JS_FreeValue(ctx, JS_GetException(ctx));
-      v = JS_Eval(
-          ctx, src, (size_t)len, argv[i],
-          JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    }
-    if (JS_IsException(v)) {
-      JSValue e = JS_GetException(ctx);
-      const char *s = JS_ToCString(ctx, e);
-      fprintf(stderr, "qjsaot: %s: %s\n", argv[i], s ? s : "(unprintable)");
-      JS_FreeCString(ctx, s);
-      JS_FreeValue(ctx, e);
-      fails++;
-    }
     keep[nkeep++] = v;
-    free(src);
   }
 
   nfuncs = js_aot_gen_collect(rt, &funcs);

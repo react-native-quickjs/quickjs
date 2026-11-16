@@ -8,11 +8,14 @@
 # `assert(list_empty(&rt->gc_obj_list))`. This runs scripts whose functions become garbage before the end of the
 # run, under the profiling engine, and requires each to exit 0.
 #
-#   tools/aot/prof-teardown-test.sh <qjsprof-binary>   (or QJS_AOT_PROF_BIN), a -DQJS_REGVM=1 -DQJS_AOT_PROFILE=1 runner
+#   tools/aot/prof-teardown-test.sh <qjsprof-binary> [qjsc]   (or QJS_AOT_PROF_BIN, QJSC), a -DQJS_REGVM=1 -DQJS_AOT_PROFILE=1 runner
+# The scripts run as qjsc bytecode, as every profile run loads; the compiler defaults to the qjsc beside the binary.
 set -u
 bin=${1:-${QJS_AOT_PROF_BIN:-}}
-[ -x "$bin" ] || { echo "usage: $0 <qjsprof-binary>   (or set QJS_AOT_PROF_BIN)"; echo "note: build with -DQJS_REGVM=1 -DQJS_AOT_PROFILE=1"; exit 2; }
-T=$(mktemp -d "${TMPDIR:-/tmp}/prof-teardown.XXXXXX") || exit 2
+[ -x "$bin" ] || { echo "usage: $0 <qjsprof-binary> [qjsc]   (or set QJS_AOT_PROF_BIN)"; echo "note: build with -DQJS_REGVM=1 -DQJS_AOT_PROFILE=1"; exit 2; }
+qjsc=${2:-${QJSC:-$(dirname "$bin")/qjsc}}
+[ -x "$qjsc" ] || { echo "$0: no qjsc at $qjsc"; exit 2; }
+T=$(mktemp -d "$(dirname "$bin")/prof-teardown.XXXXXX") || exit 2
 trap 'rm -rf "$T"' EXIT
 cat > "$T/collected-closure.js" <<'JS'
 (function () {
@@ -32,7 +35,8 @@ cat > "$T/collected-methods.js" <<'JS'
 JS
 fail=0
 for f in "$T"/*.js; do
-  QJS_AOT_PROFILE_OUT="$T/out.qjsprof" "$bin" "$f" > "$T/run.out" 2>&1
+  "$qjsc" "$f" "${f%.js}.bc" > "$T/qjsc.out" 2>&1 || { echo "FAIL $(basename "$f") (qjsc)"; fail=1; continue; }
+  QJS_AOT_PROFILE_OUT="$T/out.qjsprof" "$bin" "${f%.js}.bc" > "$T/run.out" 2>&1
   rc=$?
   if [ $rc -eq 0 ]; then echo "ok   $(basename "$f")"; else echo "FAIL $(basename "$f") (exit $rc): $(grep -a -m1 Assertion "$T/run.out")"; fail=1; fi
 done

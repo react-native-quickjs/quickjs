@@ -18,7 +18,7 @@
  *   node tests/differential/run.mjs --via-bytecode         # through qjsc-ng
  *   node tests/differential/run.mjs --corpus pending       # a sibling directory
  *   node tests/differential/run.mjs --leak-check           # also fail a file whose run leaves objects at teardown
- *   node tests/differential/run.mjs --qjs-arg --fast-compile  # pass an argument to the engine (repeatable)
+ *   node tests/differential/run.mjs --qjs-arg --optimize-compile  # pass an argument to the engine (repeatable)
  *
  * `--via-bytecode` compiles each file with qjsc-ng and runs the container
  * instead of the source. That is the path React Native actually ships, and it

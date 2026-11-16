@@ -9,7 +9,7 @@
 #
 # Environment:
 #   CC          compiler                    (default clang)
-#   WORK        build directory             (default /tmp/rv-gate)
+#   WORK        build directory             (default build-regvm-gate)
 #   REPS        timing repetitions          (default 4)
 #   FUZZ_N      promotion-fuzzer cases      (default 800)
 #   SUITE       differential suite script   (default tools/regvm/diff-suite/diff-suite.sh)
@@ -23,6 +23,16 @@
 #   HERMES      hermes binary, optional; when set the A/B includes it
 #   MONO        monolith register binary, optional; when set the A/B times it
 #               too: the threaded build has to beat the monolith
+#   MONO_QJSC, BASE_QJSC  the qjsc of the MONO / BASE build (default: the qjsc
+#               beside that binary): the timed runs load qjsc bytecode, and a
+#               build loads only the bytecode of a compiler with its own flags
+#
+# Every timed and checksummed run loads qjsc bytecode, as an app does: each VM
+# build gets its own qjsc, built with exactly its flags, and its inputs are
+# compiled once (tools/bytecode/bccache, under $WORK/bc-*). Compile speed is
+# measured separately (tools/bytecode/compile-bench.sh). The differential suite
+# and the promotion fuzzer run their runners on source as before, which the
+# register runner now compiles with the runtime's default, the fast mode.
 #   OBJDUMP     objdump for the static handler gates (default: the first of
 #               llvm-objdump, llvm-objdump-14, objdump that exists)
 #   SKIP_BUILD  1 to reuse $WORK
@@ -35,7 +45,7 @@
 set -e
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-WORK=${WORK:-/tmp/rv-gate}
+WORK=${WORK:-$ROOT/build-regvm-gate}
 CC=${CC:-clang}
 REPS=${REPS:-4}
 FUZZ_N=${FUZZ_N:-800}
@@ -73,6 +83,8 @@ REGFLAGS="-DQJS_REGVM=1 -DQJS_REGVM_VERIFY=1 -DQJS_REGVM_KNOBS=1 ${EXTRA:-}"
 
 mkdir -p "$WORK"
 fail=0
+# bc <qjsc> <tag> <file.js>: the file's bytecode for the build that qjsc belongs to.
+bc() { "$ROOT/tools/bytecode/bccache" --qjsc "$1" --dir "$WORK/bc-$2" "$3"; }
 note() { printf '%s\n' "$*"; }
 bad()  { printf 'FAIL: %s\n' "$*"; fail=1; }
 lt()   { [ "$(awk -v a="$1" -v b="$2" 'BEGIN{print (a<b)}')" = 1 ]; }
@@ -83,6 +95,10 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
     $CC $R $TALIGN $REGFLAGS -o "$WORK/bref"   "$ROOT/tools/benchmark/qjs-bench.c" $S -lm
     # shellcheck disable=SC2086
     $CC $R $TALIGN             -o "$WORK/bstk"   "$ROOT/tools/benchmark/qjs-bench.c" $S -lm
+    # shellcheck disable=SC2086
+    $CC $R $TALIGN $REGFLAGS -o "$WORK/qjsc-reg" "$ROOT/tools/bytecode/qjsc.c" $S -lm
+    # shellcheck disable=SC2086
+    $CC $R $TALIGN             -o "$WORK/qjsc-stk" "$ROOT/tools/bytecode/qjsc.c" $S -lm
     # shellcheck disable=SC2086
     $CC $R $REGFLAGS -o "$WORK/run1"   "$AUX/regvm-run.c" $S -lm
     # shellcheck disable=SC2086
@@ -149,7 +165,7 @@ case "$EXTRA" in
 esac
 
 note "== correctness: box2d checksum"
-got=$("$WORK/bref" "$CHECK" 2>/dev/null | grep -o 'box2d-checksum=[0-9.]*' | cut -d= -f2)
+got=$("$WORK/bref" "$(bc "$WORK/qjsc-reg" reg "$CHECK")" 2>/dev/null | grep -o 'box2d-checksum=[0-9.]*' | cut -d= -f2)
 if [ "$got" = "$CHECKSUM_WANT" ]; then
     note "   checksum $got OK"
 else
@@ -223,19 +239,22 @@ esac
 note "== cost: box2d fixed work, min of $REPS"
 run_ms() { "$1" "$2" 2>/dev/null | grep -o 'ms=[0-9.]*' | tail -1 | cut -d= -f2; }
 reg=""; stk=""; herm=""; mono=""
+BREG=$(bc "$WORK/qjsc-reg" reg "$BOX2D"); BSTK=$(bc "$WORK/qjsc-stk" stk "$BOX2D")
+[ -z "$MONO" ] || BMONO=$(bc "${MONO_QJSC:-$(dirname "$MONO")/qjsc}" mono "$BOX2D") || bad "no bytecode for MONO (set MONO_QJSC)"
+[ -z "$BASE" ] || BBASE=$(bc "${BASE_QJSC:-$(dirname "$BASE")/qjsc}" base "$BOX2D") || bad "no bytecode for BASE (set BASE_QJSC)"
 i=0
 while [ "$i" -lt "$REPS" ]; do
-    v=$(run_ms "$WORK/bref" "$BOX2D"); if [ -z "$reg" ] || lt "$v" "$reg"; then reg=$v; fi
-    v=$(run_ms "$WORK/bstk" "$BOX2D"); if [ -z "$stk" ] || lt "$v" "$stk"; then stk=$v; fi
+    v=$(run_ms "$WORK/bref" "$BREG"); if [ -z "$reg" ] || lt "$v" "$reg"; then reg=$v; fi
+    v=$(run_ms "$WORK/bstk" "$BSTK"); if [ -z "$stk" ] || lt "$v" "$stk"; then stk=$v; fi
     if [ -n "$HERMES" ]; then
         v=$(run_ms "$HERMES" "${BOX2D%.js}.hbc")
         if [ -z "$herm" ] || lt "$v" "$herm"; then herm=$v; fi
     fi
     if [ -n "$MONO" ]; then
-        v=$(run_ms "$MONO" "$BOX2D"); if [ -z "$mono" ] || lt "$v" "$mono"; then mono=$v; fi
+        v=$(run_ms "$MONO" "$BMONO"); if [ -z "$mono" ] || lt "$v" "$mono"; then mono=$v; fi
     fi
     if [ -n "$BASE" ]; then
-        v=$(run_ms "$BASE" "$BOX2D"); if [ -z "$base" ] || lt "$v" "$base"; then base=$v; fi
+        v=$(run_ms "$BASE" "$BBASE"); if [ -z "$base" ] || lt "$v" "$base"; then base=$v; fi
     fi
     i=$((i + 1))
 done
@@ -275,7 +294,9 @@ note "== cost: empty loop, min of $REPS"
 # wrong advance in one of them shows up here as a crash rather than as a wrong
 # number -- which is how the narrow `add_imm_self_branch_s` target width went
 # unnoticed while the suite, the fuzzer and the checksum all passed.
-got=$("$WORK/bref" "$LOOP" 2>/dev/null | grep -o 'checksum=[0-9]*' | cut -d= -f2)
+LREG=$(bc "$WORK/qjsc-reg" reg "$LOOP")
+[ -z "$MONO" ] || LMONO=$(bc "${MONO_QJSC:-$(dirname "$MONO")/qjsc}" mono "$LOOP") || bad "no bytecode for MONO (set MONO_QJSC)"
+got=$("$WORK/bref" "$LREG" 2>/dev/null | grep -o 'checksum=[0-9]*' | cut -d= -f2)
 if [ "$got" = "20000000" ]; then
     note "   checksum $got OK"
 else
@@ -284,9 +305,9 @@ fi
 lr=""; lm=""
 i=0
 while [ "$i" -lt "$REPS" ]; do
-    v=$(run_ms "$WORK/bref" "$LOOP"); if [ -z "$lr" ] || lt "$v" "$lr"; then lr=$v; fi
+    v=$(run_ms "$WORK/bref" "$LREG"); if [ -z "$lr" ] || lt "$v" "$lr"; then lr=$v; fi
     if [ -n "$MONO" ]; then
-        v=$(run_ms "$MONO" "$LOOP"); if [ -z "$lm" ] || lt "$v" "$lm"; then lm=$v; fi
+        v=$(run_ms "$MONO" "$LMONO"); if [ -z "$lm" ] || lt "$v" "$lm"; then lm=$v; fi
     fi
     i=$((i + 1))
 done

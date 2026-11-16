@@ -30,9 +30,12 @@ needs.
 
 Two conditions keep a profile's digests identical to what ships:
 
-- **the release JS bundle.** The profiled bundle must be the one that ships
-  (Metro `--dev false`, minified, `__DEV__` false). A development bundle is
-  different code and its digests match nothing.
+- **the shipped bytecode.** The app loads its release bundle as qjsc bytecode
+  (`qjsc bundle.js bundle.bc` from Metro `--dev false`, minified, `__DEV__`
+  false), and the profiled run and the generator read that same `bundle.bc`.
+  A development bundle is different code and its digests match nothing; so is
+  source the app compiles on the device (eval, `new Function`, a bundle loaded
+  as text), which the runtime compiles with the fast mode and no unit binds.
 - **no debugger attached while the code loads.** The parser emits a trap per
   statement only when a debugger is attached at parse time, and those traps
   change the register bytecode. The profiler marks such a function `dbg=1` on
@@ -57,13 +60,15 @@ Add a build step (this is what `cmake/quickjs.cmake` does when
 `-DQJS_AOT_UNIT=<path>` is set):
 
 ```
-qjsaot --out aot_unit.c --profile app.qjsprof --budget 1000000 bundle.js
+qjsaot --out aot_unit.c --profile app.qjsprof --budget 1000000 bundle.bc
 clang -c aot_unit.c -o aot_unit.o        # host or target triple
 ```
 
-and link `aot_unit.o` into the same binary as the engine. The unit exports
+`bundle.bc` is the qjsc output the app ships (`qjsaot --from-source
+bundle.js` compiles a source bundle itself instead, optimised as qjsc does). Link
+`aot_unit.o` into the same binary as the engine. The unit exports
 only `qjs_aot_table`, `qjs_aot_count` and `qjs_aot_abi`; the engine binds each
-function by digest when it is first compiled. `QJS_AOT_ABI` must match the
+function by digest when its bytecode is loaded. `QJS_AOT_ABI` must match the
 engine, or the whole unit is ignored at init.
 
 CMake:

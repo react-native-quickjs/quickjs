@@ -36,7 +36,7 @@ export function checkAdb() {
 function clang() {
   const prebuiltDir = join(NDK_HOME, 'toolchains/llvm/prebuilt');
   if (!existsSync(prebuiltDir)) throw new Error(`NDK not found at ${NDK_HOME}. Set ANDROID_NDK_HOME.`);
-  const host = 'darwin-x86_64';
+  const host = process.platform === 'darwin' ? 'darwin-x86_64' : 'linux-x86_64';
   return join(prebuiltDir, host, 'bin', `aarch64-linux-android${API}-clang`);
 }
 
@@ -49,7 +49,12 @@ export function crossBuild(engineDir) {
   const src = () => [engineDir + '/quickjs.c', engineDir + '/libregexp.c', engineDir + '/libunicode.c', engineDir + '/dtoa.c'];
   run(c, ['-O2', '-o', qjs, join(BENCH, 'qjs-bench.c'), ...src(), `-I${engineDir}`, '-lm', '-fPIE', '-pie']);
   run(c, ['-O2', '-o', calls, join(BENCH, 'calls.c'), ...src(), `-I${engineDir}`, '-lm', '-fPIE', '-pie']);
-  return { qjs, calls };
+  // The bytecode the device runs: a host qjsc built from the same engine sources with the same flags as the device
+  // qjs-bench (same VM, same defines), so its output is the program that binary would compile. Benchmarks push
+  // the .bc with the binary.
+  const qjsc = join(outDir, 'host-qjsc');
+  run(process.env.CC || 'cc', ['-O2', '-o', qjsc, join(ROOT, 'tools', 'bytecode', 'qjsc.c'), ...src(), `-I${engineDir}`, '-lm']);
+  return { qjs, calls, qjsc };
 }
 
 function run(cmd, args) {

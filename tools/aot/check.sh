@@ -105,13 +105,21 @@ build_rt() {
   "$CC" -O2 $BASE -c tools/benchmark/qjs-bench.c -o "$o/qjs-bench.o" || return 1
   "$CC" -o "$o/run" "$o/qjs-bench.o" "$o/quickjs.o" "$o/libregexp.o" \
     "$o/libunicode.o" "$o/dtoa.o" -lm $LDX || return 1
+  "$CC" -O2 $BASE -c tools/bytecode/qjsc.c -o "$o/qjsc.o" || return 1
+  "$CC" -o "$o/qjsc" "$o/qjsc.o" "$o/quickjs.o" "$o/libregexp.o" \
+    "$o/libunicode.o" "$o/dtoa.o" -lm $LDX || return 1
 }
+
+# The generator, the interpreter and every unit load qjsc bytecode, as an app
+# does: bcof prints each script's .bc, compiled once by the qjsc linked with the
+# runtime engine (tools/bytecode/bccache, under $WORK/bc).
+bcof() { tools/bytecode/bccache --qjsc "$WORK/eng/$ENG_HASH/rt/qjsc" --dir "$WORK/bc" "$@"; }
 
 # ---- one kernel ------------------------------------------------------------
 # unit_key <js> [flags...]: kernel content + generator + flags.
 unit_key() {
   local js=$1; shift
-  { cat "$js"; sha256sum "$BIN"; printf '%s\n' "$*"; } | sha256sum | cut -c1-24
+  { cat "$(bcof "$js")"; sha256sum "$BIN"; printf '%s\n' "$*"; } | sha256sum | cut -c1-24
 }
 
 # build_unit <key> <js> [flags...] -> $WORK/units/<key>.bin (cached)
@@ -119,7 +127,7 @@ build_unit() {
   local key=$1 js=$2; shift 2
   local u="$WORK/units/$key"
   [ -x "$u.bin" ] && return 0
-  "$BIN" --out "$u.c" --layout-header "$u-layout.h" "$@" "$js" \
+  "$BIN" --out "$u.c" --layout-header "$u-layout.h" "$@" "$(bcof "$js")" \
     > /dev/null 2> "$u.census" || { warn "generator failed on $js"; return 1; }
   "$CC" -fsyntax-only $BASE -DQJS_REGVM=1 -DQJS_AOT=1 "$u.c" || {
     warn "emitted C does not parse: $u.c"; return 1; }
@@ -154,15 +162,15 @@ run_pair() {
   if ! build_unit "$key" "$js" "$@"; then
     fail=$((fail + 1)); log "FAIL $name (build)"; return 1
   fi
-  "$o/run" "$js" > "$out/$name.plain" 2>&1
-  "$WORK/units/$key.bin" "$js" > "$out/$name.unit" 2>&1
+  "$o/run" "$(bcof "$js")" > "$out/$name.plain" 2>&1
+  "$WORK/units/$key.bin" "$(bcof "$js")" > "$out/$name.unit" 2>&1
   if ! diff -q "$out/$name.plain" "$out/$name.unit" > /dev/null; then
     fail=$((fail + 1)); log "FAIL $name (output differs)"
     diff "$out/$name.plain" "$out/$name.unit" | head -6
     return 1
   fi
   local st
-  st=$(QJS_AOT_STATS=1 "$WORK/units/$key.bin" "$js" 2>&1 > /dev/null | grep -m1 '^aot:')
+  st=$(QJS_AOT_STATS=1 "$WORK/units/$key.bin" "$(bcof "$js")" 2>&1 > /dev/null | grep -m1 '^aot:')
   log "ok   $name ${st:+[$st]}"
 }
 
@@ -180,7 +188,8 @@ run_kernels() { # [extra flags...]
 run_ir_verify() {
   local res
   [ -n "${GEN_IRBIN:-}" ] || return 0
-  if ! "${GEN_IRBIN:-$BIN}" --verify-ir "$@" > "$WORK/out/verify-ir.log" 2>&1; then
+  local bcs; mapfile -t bcs < <(bcof "$@") || return 1
+  if ! "${GEN_IRBIN:-$BIN}" --verify-ir "${bcs[@]}" > "$WORK/out/verify-ir.log" 2>&1; then
     fail=$((fail + 1)); log "FAIL --verify-ir $*"
     grep -v '^qjsaot: [0-9/]* functions' "$WORK/out/verify-ir.log" | head -5
     return 1
@@ -218,7 +227,7 @@ t0() {
     local k base
     for k in "$K2"/*.js; do
       base=$(basename "$k" .js)
-      "$BIN" --dump-ir "$k" 2>/dev/null > "$WORK/out/$base.ir"
+      "$BIN" --dump-ir "$(bcof "$k")" 2>/dev/null > "$WORK/out/$base.ir"
       if [ "${UPDATE_GOLDEN:-0}" = 1 ]; then
         cp "$WORK/out/$base.ir" "$GOLDEN/$base.ir"
       elif [ -f "$GOLDEN/$base.ir" ]; then
@@ -252,8 +261,8 @@ run_corpora() {
       fail=$((fail + 1)); rc=1; log "FAIL $k (build)"; continue
     fi
     local o="$WORK/eng/$ENG_HASH/rt"
-    "$o/run" "$fast" > "$WORK/out/$k.plain" 2>&1
-    "$WORK/units/$key.bin" "$fast" > "$WORK/out/$k.unit" 2>&1
+    "$o/run" "$(bcof "$fast")" > "$WORK/out/$k.plain" 2>&1
+    "$WORK/units/$key.bin" "$(bcof "$fast")" > "$WORK/out/$k.unit" 2>&1
     # The one known difference: a compiled frame carries the unit's return pc
     # rather than the bytecode pc, so `call.stack`'s checksum differs (the
     # acceptance report shows the same row as NO). Every other row must match.
@@ -286,7 +295,7 @@ run_box2d() {
     fail=$((fail + 1)); log "FAIL box2d (build)"; return 1
   fi
   local got
-  got=$(QJS_AOT_STATS=1 "$WORK/units/$key.bin" "$BOX2D" 2>&1 |
+  got=$(QJS_AOT_STATS=1 "$WORK/units/$key.bin" "$(bcof "$BOX2D")" 2>&1 |
         sed -n 's/.*box2d-checksum=\([0-9.]*\).*/\1/p' | tail -1)
   if [ "$got" = "546.1008391043414" ]; then
     log "ok   box2d ($got)"; return 0
@@ -314,8 +323,8 @@ run_sweep() {
       local key; key=$(unit_key "$k" --deopt-everywhere)
       build_unit "$key" "$k" --deopt-everywhere || { fail=$((fail + 1)); continue; }
       local o="$WORK/eng/$ENG_HASH/rt"
-      "$o/run" "$k" > "$WORK/out/$base.plain" 2>&1
-      QJS_AOT_SWEEP=all:$stride "$WORK/units/$key.bin" "$k" \
+      "$o/run" "$(bcof "$k")" > "$WORK/out/$base.plain" 2>&1
+      QJS_AOT_SWEEP=all:$stride "$WORK/units/$key.bin" "$(bcof "$k")" \
         > "$WORK/out/$base.sw$stride" 2>&1
       if diff -q "$WORK/out/$base.plain" "$WORK/out/$base.sw$stride" > /dev/null; then
         log "ok   $base sweep all:$stride"
@@ -387,8 +396,8 @@ t2() {
   : > "$WORK/out/empty.qjsprof"
   key=$(unit_key "$k" --profile "$WORK/out/empty.qjsprof")
   if build_unit "$key" "$k" --profile "$WORK/out/empty.qjsprof"; then
-    if diff -q <("$WORK/eng/$ENG_HASH/rt/run" "$k" 2>&1) \
-               <("$WORK/units/$key.bin" "$k" 2>&1) > /dev/null; then
+    if diff -q <("$WORK/eng/$ENG_HASH/rt/run" "$(bcof "$k")" 2>&1) \
+               <("$WORK/units/$key.bin" "$(bcof "$k")" 2>&1) > /dev/null; then
       log "ok   empty profile"
     else
       fail=$((fail + 1)); log "FAIL empty profile"
@@ -423,9 +432,9 @@ t3() {
       local key; key=$(unit_key "$js" "$UNIT_ARGS")
       build_unit "$key" "$js" "$UNIT_ARGS" || { fail=$((fail + 1)); continue; }
       local p u
-      p=$(timeout 900 "$WORK/eng/$ENG_HASH/rt/run" "$js" 2>/dev/null |
+      p=$(timeout 900 "$WORK/eng/$ENG_HASH/rt/run" "$(bcof "$js")" 2>/dev/null |
           awk '/^Score:/{print $2}')
-      u=$(timeout 900 "$WORK/units/$key.bin" "$js" 2>/dev/null |
+      u=$(timeout 900 "$WORK/units/$key.bin" "$(bcof "$js")" 2>/dev/null |
           awk '/^Score:/{print $2}')
       log "     $row: interpreter $p, unit $u"
     done
