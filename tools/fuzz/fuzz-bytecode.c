@@ -22,8 +22,8 @@
 #include "quickjs.h"
 
 static int fz_ticks;
-static int fz_interrupt(JSRuntime *rt, void *opaque) {
-  (void)rt;
+static int fz_interrupt(JSContext *ctx, void *opaque) {
+  (void)ctx;
   (void)opaque;
   return ++fz_ticks > 20000;
 }

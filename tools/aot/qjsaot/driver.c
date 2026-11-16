@@ -5045,7 +5045,7 @@ int qjsaot_driver_main(int argc, char **argv) {
         "((out_) = JS_VALUE_GET_INT(v_), 1) : q2_to_i32_float((v_), &(out_)))\n"
         /* The `undefined` word a native entry fills its frame with, as one
            static constant so the fill is a copy of a known word. */
-        "static const JSValue e_undefined_value = { { .int32 = 0 }, "
+        "static const JSValue e_undefined_value = { { .uint64 = 0 }, "
         "JS_TAG_UNDEFINED };\n"
         "static inline int q2_spec_fns_out(int fi);\n"
         "static inline int q2_spec_set_out(int fi);\n"

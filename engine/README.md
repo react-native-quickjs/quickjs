@@ -31,9 +31,9 @@ value per VM build, since the two builds write different function bodies:
 
 ```c
 #if QJS_REGVM
-#define BC_VERSION (0x80 + 20) /* register bytecode */
+#define BC_VERSION (0x80 + 21) /* register bytecode */
 #else
-#define BC_VERSION 28 /* stack bytecode */
+#define BC_VERSION 30 /* stack bytecode */
 #endif
 ```
 

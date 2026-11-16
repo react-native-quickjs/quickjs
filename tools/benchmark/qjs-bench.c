@@ -374,7 +374,8 @@ static int bench_irq_period, bench_irq_count;
    For profiling a benchmark without running it to the end; the interrupt is polled, so the stop is within a few milliseconds. */
 static double bench_deadline_ms;
 static int bench_capped;
-static int bench_interrupt_cb(JSRuntime *rt, void *opaque) {
+static int bench_interrupt_cb(JSContext *irq_ctx, void *opaque) {
+  JSRuntime *rt = JS_GetRuntime(irq_ctx);
   (void)opaque;
   if (bench_deadline_ms > 0 && now_ms() > bench_deadline_ms) { bench_capped = 1; return 1; }
   if (bench_irq_period > 0 && ++bench_irq_count % bench_irq_period == 0 &&

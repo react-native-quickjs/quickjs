@@ -412,7 +412,7 @@ class CompatRuntime final
             .count());
   }
 
-  static int onInterrupt(JSRuntime *, void *opaque) {
+  static int onInterrupt(JSContext *, void *opaque) {
     auto *self = static_cast<CompatRuntime *>(opaque);
     if (self->interrupt_.load(std::memory_order_relaxed)) return 1;
     const uint64_t deadline = self->deadline_.load(std::memory_order_relaxed);
