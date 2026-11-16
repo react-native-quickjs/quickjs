@@ -1141,10 +1141,13 @@ QuickJSRuntime::prepareJavaScript(
   // bytecode, so it has to be the name the debugger will look the script up by.
   sourceURL = effectiveSourceURL(data, size, sourceURL);
 
+  // Source prepared here is compiled on the device at run time, so it takes
+  // the runtime's compile mode (fast by default); optimised bytecode is what
+  // qjsc writes and the container branch above loads.
   const std::string owned(reinterpret_cast<const char *>(data), size);
   JSValue compiled = checkException(JS_Eval(
       context_, owned.c_str(), owned.size(), sourceURL.c_str(),
-      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_OPTIMIZE));
+      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY));
 
   size_t length = 0;
   uint8_t *bytes =
