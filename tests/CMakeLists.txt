@@ -65,6 +65,7 @@ endif()
 # Drives the C API on JSRuntime/JSContext directly rather than through JSI,
 # because that is the surface a debugger bridge sits on.
 qjs_add_test_suite(quickjs_debugger_tests debugger_test.cpp)
+qjs_add_test_suite(quickjs_private_symbol_tests private_symbol_test.cpp)
 
 qjs_add_test_suite(quickjs_module_tests modules_test.cpp)
 
