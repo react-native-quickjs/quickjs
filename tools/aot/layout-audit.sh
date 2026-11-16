@@ -14,8 +14,13 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 S=$ROOT/engine/quickjs-ng
 CC=${CC:-clang}
+QJSC=${QJSC:-$ROOT/build-regvm/qjsc}
+[ -x "$QJSC" ] || { echo "layout-audit: no qjsc at $QJSC (set QJSC)" >&2; exit 1; }
 W=$(mktemp -d "${TMPDIR:-/tmp}/qjs-layout-XXXXXX")
 trap 'rm -rf "$W"' EXIT
+# The generator reads qjsc bytecode, as benchmarks and apps do, not source.
+"$QJSC" "$ROOT/tools/aot/kernels2/01-arith.js" "$W/01-arith.bc" >/dev/null 2>&1 ||
+  { echo "layout-audit: qjsc failed" >&2; exit 1; }
 
 hash_for() {
   local defs=$1 dir=$W/$2
@@ -28,7 +33,7 @@ hash_for() {
     { echo "build failed ($2)" >&2; return 1; }
   "$dir/gen" --out "$dir/u.c" --layout-header "$dir/u-l.h" \
       --report "$dir/r.txt" --hot-cover 0.99 \
-      "$ROOT/tools/aot/kernels2/01-arith.js" >/dev/null 2>&1 ||
+      "$W/01-arith.bc" >/dev/null 2>&1 ||
     { echo "generation failed ($2)" >&2; return 1; }
   sed -n 's/^#define QJS_AOT_LAYOUT_HASH \([0-9]*\)u$/\1/p' "$dir/u-l.h"
 }
